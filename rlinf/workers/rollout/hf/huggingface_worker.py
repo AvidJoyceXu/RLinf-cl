@@ -54,7 +54,7 @@ class MultiStepRolloutWorker(Worker):
         with open_dict(self.cfg):
             self.cfg.actor.model.precision = original_precision
 
-        if self.cfg.actor.model.model_name in ["openvla", "openvla_oft"]:
+        if self.cfg.actor.model.model_name in ["openvla", "openvla_oft", "residual_sac"]:
             model_config, input_processor = get_vla_model_config_and_processor(
                 self.cfg.actor
             )

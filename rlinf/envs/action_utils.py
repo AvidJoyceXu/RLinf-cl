@@ -63,7 +63,8 @@ def prepare_actions_for_libero(
     model_name,
 ) -> np.ndarray:
     chunk_actions = raw_chunk_actions
-    if model_name == "openvla" or model_name == "openvla_oft":
+    # residual_sac uses openvla_oft as base model, so needs same gripper transformation
+    if model_name == "openvla" or model_name == "openvla_oft" or model_name == "residual_sac": # TODO: hardcode to assume residual sac use openvla
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
     return chunk_actions

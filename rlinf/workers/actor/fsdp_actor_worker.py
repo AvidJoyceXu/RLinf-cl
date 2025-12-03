@@ -26,6 +26,8 @@ from rlinf.algorithms.utils import (
     kl_penalty,
 )
 from rlinf.data.io_struct import RolloutResult
+from rlinf.data.replay_buffer import ReplayBuffer
+from rlinf.models.embodiment.sac_q_network import ResidualQNetwork
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
     FSDPModelManager,
 )
@@ -545,9 +547,125 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.stage_num = cfg.rollout.pipeline_stage_num
 
         self.channel = self.connect_channel(cfg.actor.channel.name)
+        
+        # SAC-specific initialization
+        self.is_sac = cfg.algorithm.get("loss_type", "").lower() == "sac"
+        if self.is_sac:
+            self._init_sac_components()
+
+    def _init_sac_components(self):
+        """Initialize SAC-specific components: replay buffer, Q-networks, etc."""
+        if not self.is_sac:
+            return
+        
+        # Get observation and action dimensions from config
+        # For embodied tasks, obs_dim is typically the flattened observation dimension
+        obs_dim = self.cfg.algorithm.get("obs_dim", None)  # Default for LIBERO
+        residual_action_dim = self.cfg.actor.model.get("action_dim", None)
+        base_action_dim = self.cfg.algorithm.get("base_action_dim", None)
+        critic_input = self.cfg.algorithm.get("critic_input", "res")  # 'res', 'sum', or 'concat'
+        
+        # Initialize replay buffer
+        buffer_size = self.cfg.algorithm.get("replay_buffer_size", 1000000)
+        obs_shape = (obs_dim,)
+        # Action shape depends on what we store
+        if critic_input == "res":
+            action_shape = (residual_action_dim,)
+        else:
+            # Store residual + base + base_next
+            action_shape = (residual_action_dim + base_action_dim * 2,)
+        
+        self.replay_buffer = ReplayBuffer(
+            capacity=buffer_size,
+            obs_shape=obs_shape,
+            action_shape=action_shape,
+            device=self.device,
+            n_envs=self.cfg.algorithm.get("num_group_envs", 64),
+        )
+        
+        # Initialize Q-networks (will be created in init_worker after model setup)
+        self.qf1 = None
+        self.qf2 = None
+        self.qf1_target = None
+        self.qf2_target = None
+        self.q_optimizer = None
+        
+        # SAC hyperparameters
+        self.sac_gamma = self.cfg.algorithm.get("gamma", 0.99)
+        self.sac_tau = self.cfg.algorithm.get("tau", 0.005)
+        self.sac_alpha = self.cfg.algorithm.get("alpha", 0.2)
+        self.sac_autotune = self.cfg.algorithm.get("autotune_alpha", False)
+        self.sac_target_update_freq = self.cfg.algorithm.get("target_update_freq", 1)
+        self.sac_policy_freq = self.cfg.algorithm.get("policy_freq", 2)
+        self.sac_utd_ratio = self.cfg.algorithm.get("utd_ratio", 1)  # Updates per data collection
+        self.sac_batch_size = self.cfg.algorithm.get("sac_batch_size", 256)
+        self.sac_learning_starts = self.cfg.algorithm.get("learning_starts", 1000)
+        
+        # Alpha (temperature) for automatic tuning
+        if self.sac_autotune:
+            self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
+            self.target_entropy = -torch.prod(
+                torch.Tensor([residual_action_dim]).to(self.device)
+            ).item()
+            self.alpha_optimizer = None  # Will be created in init_worker
+        
+        self.res_scale = self.cfg.algorithm.get("res_scale", 1.0)
+        self.critic_input = critic_input
+        self.residual_action_dim = residual_action_dim
+        self.base_action_dim = base_action_dim
 
     def init_worker(self):
         self.setup_model_and_optimizer()
+        
+        # Initialize SAC Q-networks if using SAC
+        if self.is_sac:
+            obs_dim = self.cfg.algorithm.get("obs_dim", 74)
+            residual_action_dim = self.cfg.actor.model.get("action_dim", 7)
+            base_action_dim = self.cfg.algorithm.get("base_action_dim", 7)
+            
+            self.qf1 = ResidualQNetwork(
+                obs_dim=obs_dim, 
+                residual_action_dim=residual_action_dim,
+                base_action_dim=base_action_dim,
+                critic_input=self.critic_input,
+            ).to(self.device)
+            
+            self.qf2 = ResidualQNetwork(
+                obs_dim=obs_dim,
+                residual_action_dim=residual_action_dim,
+                base_action_dim=base_action_dim,
+                critic_input=self.critic_input,
+            ).to(self.device)
+            
+            self.qf1_target = ResidualQNetwork(
+                obs_dim=obs_dim,
+                residual_action_dim=residual_action_dim,
+                base_action_dim=base_action_dim,
+                critic_input=self.critic_input,
+            ).to(self.device)
+            
+            self.qf2_target = ResidualQNetwork(
+                obs_dim=obs_dim,
+                residual_action_dim=residual_action_dim,
+                base_action_dim=base_action_dim,
+                critic_input=self.critic_input,
+            ).to(self.device)
+            
+            # Copy parameters to target networks
+            self.qf1_target.load_state_dict(self.qf1.state_dict())
+            self.qf2_target.load_state_dict(self.qf2.state_dict())
+            
+            # Create Q-network optimizer
+            q_lr = self.cfg.algorithm.get("q_lr", 3e-4)
+            self.q_optimizer = torch.optim.Adam(
+                list(self.qf1.parameters()) + list(self.qf2.parameters()),
+                lr=q_lr,
+            )
+            
+            # Create alpha optimizer if using automatic tuning
+            if self.sac_autotune:
+                alpha_lr = self.cfg.algorithm.get("alpha_lr", 3e-4)
+                self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
         if self.cfg.actor.get("enable_offload", False):
             self.offload_param_and_grad()
@@ -690,7 +808,67 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.model.eval()
         self.rollout_batch["logprob"] = self.rollout_batch["prev_logprobs"]
 
+    def _store_rollouts_in_replay_buffer(self):
+        """Store rollouts in replay buffer for SAC."""
+        if not self.is_sac:
+            return
+        
+        # Extract transitions from rollout_batch
+        # Shape: [n_chunk_steps, batch_size, num_action_chunks, ...]
+        rewards = self.rollout_batch["rewards"]  # [n_chunk_steps, batch_size, num_action_chunks]
+        dones = self.rollout_batch["dones"]  # [n_chunk_steps+1, batch_size, num_action_chunks]
+        prev_logprobs = self.rollout_batch["prev_logprobs"]  # [n_chunk_steps, batch_size, num_action_chunks, action_dim]
+        
+        # Get observations and actions from forward_inputs
+        # Note: This assumes forward_inputs contains obs and actions
+        forward_inputs = self.rollout_batch.get("forward_inputs", [])
+        
+        # Flatten to get individual transitions
+        n_chunk_steps, batch_size = rewards.shape[:2]
+        
+        for step in range(n_chunk_steps):
+            for batch_idx in range(batch_size):
+                # Extract transition data
+                # Note: This is a simplified version - actual implementation may need
+                # to handle the specific data structure from your rollout worker
+                obs = forward_inputs[step][batch_idx]["obs"] if forward_inputs else None
+                action = forward_inputs[step][batch_idx]["action"] if forward_inputs else None
+                reward = rewards[step, batch_idx].sum().item() if len(rewards.shape) > 2 else rewards[step, batch_idx].item()
+                done = dones[step + 1, batch_idx].any().item() if len(dones.shape) > 2 else dones[step + 1, batch_idx].item()
+                
+                # Get next observation
+                if step < n_chunk_steps - 1:
+                    next_obs = forward_inputs[step + 1][batch_idx]["obs"] if forward_inputs else None
+                else:
+                    # Last step - next obs might be in a different format
+                    next_obs = obs  # Placeholder
+                
+                if obs is not None and action is not None and next_obs is not None:
+                    # Flatten observations if needed
+                    if isinstance(obs, torch.Tensor):
+                        obs = obs.cpu().numpy().flatten()
+                    if isinstance(next_obs, torch.Tensor):
+                        next_obs = next_obs.cpu().numpy().flatten()
+                    if isinstance(action, torch.Tensor):
+                        action = action.cpu().numpy().flatten()
+                    
+                    # Store in replay buffer
+                    self.replay_buffer.add(
+                        obs=obs,
+                        next_obs=next_obs,
+                        action=action,
+                        reward=reward,
+                        done=done,
+                    )
+
     def compute_advantages_and_returns(self):
+        # For SAC, we don't compute advantages - skip this step
+        if self.is_sac:
+            # Just store rollouts in replay buffer
+            self._store_rollouts_in_replay_buffer()
+            rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+            return rollout_metrics
+        
         stage_num = self.cfg.rollout.pipeline_stage_num
         env_world_size = self._component_placement.get_world_size("env")
         actor_world_size = self._component_placement.get_world_size("actor")
@@ -729,7 +907,167 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         return rollout_metrics
 
+    def run_sac_training(self):
+        """SAC training loop: sample from replay buffer and train Q-networks and policy."""
+        if self.cfg.actor.get("enable_offload", False):
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+        
+        # Check if we have enough samples in replay buffer
+        if len(self.replay_buffer) < self.sac_learning_starts:
+            return {}
+        
+        self.model.train()
+        self.qf1.train()
+        self.qf2.train()
+        
+        metrics = {}
+        global_step = getattr(self, "global_step", 0)
+        
+        # Number of updates per training call (UTD ratio)
+        num_updates = self.sac_utd_ratio
+        
+        for update_step in range(num_updates):
+            # Sample batch from replay buffer
+            obs, next_obs, actions, rewards, dones = self.replay_buffer.sample(
+                self.sac_batch_size
+            )
+            
+            # Parse actions based on storage format
+            if self.critic_input == "res":
+                residual_actions = actions
+                base_actions = None
+                base_next_actions = None
+            else:
+                # Stored as [residual, base, base_next]
+                residual_actions = actions[:, :self.residual_action_dim]
+                base_actions = actions[:, self.residual_action_dim:self.residual_action_dim + self.base_action_dim]
+                base_next_actions = actions[:, self.residual_action_dim + self.base_action_dim:]
+            
+            with torch.no_grad():
+                # Get next state actions from policy
+                # Note: This requires the model to support action sampling
+                # For now, we'll use a simplified approach
+                next_state_residual_actions, next_state_log_pi = self._sample_action_from_policy(next_obs, base_next_actions)
+                
+                # Compute target Q-values
+                if self.critic_input == "res":
+                    next_state_actions = next_state_residual_actions
+                elif self.critic_input == "sum":
+                    next_state_actions = base_next_actions + self.res_scale * next_state_residual_actions
+                else:  # concat
+                    next_state_actions = torch.cat([next_state_residual_actions, base_next_actions], dim=-1)
+                
+                qf1_next_target = self.qf1_target(next_obs, next_state_residual_actions, base_next_actions, self.res_scale)
+                qf2_next_target = self.qf2_target(next_obs, next_state_residual_actions, base_next_actions, self.res_scale)
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.sac_alpha * next_state_log_pi
+                next_q_value = rewards + (1 - dones.float()) * self.sac_gamma * min_qf_next_target
+            
+            # Train Q-networks
+            qf1_a_values = self.qf1(obs, residual_actions, base_actions, self.res_scale)
+            qf2_a_values = self.qf2(obs, residual_actions, base_actions, self.res_scale)
+            
+            qf1_loss = torch.nn.functional.mse_loss(qf1_a_values, next_q_value)
+            qf2_loss = torch.nn.functional.mse_loss(qf2_a_values, next_q_value)
+            qf_loss = qf1_loss + qf2_loss
+            
+            self.q_optimizer.zero_grad()
+            qf_loss.backward()
+            self.q_optimizer.step()
+            
+            # Train policy network (less frequently)
+            if update_step % self.sac_policy_freq == 0:
+                # Sample actions from policy
+                pi_residual_actions, log_pi = self._sample_action_from_policy(obs, base_actions)
+                
+                # Compute Q-values for policy actions
+                if self.critic_input == "res":
+                    pi_actions = pi_residual_actions
+                elif self.critic_input == "sum":
+                    pi_actions = base_actions + self.res_scale * pi_residual_actions
+                else:  # concat
+                    pi_actions = torch.cat([pi_residual_actions, base_actions], dim=-1)
+                
+                qf1_pi = self.qf1(obs, pi_residual_actions, base_actions, self.res_scale)
+                qf2_pi = self.qf2(obs, pi_residual_actions, base_actions, self.res_scale)
+                min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                
+                # Actor loss: maximize Q - alpha * log_prob
+                actor_loss = (self.sac_alpha * log_pi - min_qf_pi).mean()
+                
+                self.optimizer.zero_grad()
+                actor_loss.backward()
+                self.optimizer.step()
+                
+                # Update alpha if using automatic tuning
+                if self.sac_autotune:
+                    with torch.no_grad():
+                        _, log_pi_new = self._sample_action_from_policy(obs, base_actions)
+                    alpha_loss = (-self.log_alpha.exp() * (log_pi_new + self.target_entropy)).mean()
+                    
+                    self.alpha_optimizer.zero_grad()
+                    alpha_loss.backward()
+                    self.alpha_optimizer.step()
+                    self.sac_alpha = self.log_alpha.exp().item()
+            
+            # Update target networks (soft update)
+            if update_step % self.sac_target_update_freq == 0:
+                for param, target_param in zip(self.qf1.parameters(), self.qf1_target.parameters()):
+                    target_param.data.copy_(
+                        self.sac_tau * param.data + (1 - self.sac_tau) * target_param.data
+                    )
+                for param, target_param in zip(self.qf2.parameters(), self.qf2_target.parameters()):
+                    target_param.data.copy_(
+                        self.sac_tau * param.data + (1 - self.sac_tau) * target_param.data
+                    )
+            
+            # Collect metrics
+            metrics_data = {
+                "sac/qf1_loss": qf1_loss.item(),
+                "sac/qf2_loss": qf2_loss.item(),
+                "sac/qf1_values": qf1_a_values.mean().item(),
+                "sac/qf2_values": qf2_a_values.mean().item(),
+                "sac/target_q_values": next_q_value.mean().item(),
+            }
+            if update_step % self.sac_policy_freq == 0:
+                metrics_data.update({
+                    "sac/actor_loss": actor_loss.item(),
+                    "sac/alpha": self.sac_alpha,
+                })
+                if self.sac_autotune:
+                    metrics_data["sac/alpha_loss"] = alpha_loss.item()
+            
+            append_to_dict(metrics, metrics_data)
+        
+        # Aggregate metrics
+        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        mean_metric_dict = all_reduce_dict(
+            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+        
+        return mean_metric_dict
+    
+    def _sample_action_from_policy(self, obs, base_actions=None):
+        """
+        Sample residual action from policy network.
+        
+        Args:
+            obs: Observations, shape [batch_size, obs_dim]
+            base_actions: Base actions (optional), shape [batch_size, base_action_dim]
+            
+        Returns:
+            residual_actions: Sampled residual actions, shape [batch_size, residual_action_dim]
+            log_pi: Log probabilities of sampled actions, shape [batch_size, 1]
+        """
+        residual_actor = self.model.residual_actor
+        residual_actions, log_pi, _ = residual_actor.get_action(obs)
+        return residual_actions, log_pi
+
     def run_training(self):
+        # Route to SAC training if using SAC
+        if self.is_sac:
+            return self.run_sac_training()
+        
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)

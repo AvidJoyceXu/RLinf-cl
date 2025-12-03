@@ -28,7 +28,15 @@ from rlinf.config import torch_dtype_from_precision
 
 
 def get_vla_model_config_and_processor(cfg: DictConfig):
-    if cfg.model.model_name == "openvla":
+    # For residual_sac, use base_model config
+    model_name = cfg.model.model_name
+    base_model_cfg = None
+    if model_name == "residual_sac":
+        assert hasattr(cfg.model, "base_model") and hasattr(cfg.model.base_model, "config")
+        base_model_cfg = cfg.model.base_model.config
+        model_name = base_model_cfg.model_name
+    
+    if model_name == "openvla":
         from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 
         from .embodiment.prismatic.processing_prismatic import (
@@ -63,7 +71,7 @@ def get_vla_model_config_and_processor(cfg: DictConfig):
             image_processor=image_processor,
             trust_remote_code=True,
         )
-    elif cfg.model.model_name == "openvla_oft":
+    elif model_name == "openvla_oft":
         from prismatic.extern.hf.configuration_prismatic import (
             OpenVLAConfig as OpenVLAOFTConfig,
         )
@@ -77,8 +85,10 @@ def get_vla_model_config_and_processor(cfg: DictConfig):
         AutoImageProcessor.register(OpenVLAOFTConfig, PrismaticImageProcessor)
         AutoProcessor.register(OpenVLAOFTConfig, PrismaticProcessorOFT)
 
+        # Use base_model config attributes if available (for residual_sac), otherwise use cfg.model
+        model_cfg = base_model_cfg if base_model_cfg is not None else cfg.model
         model_config = OpenVLAOFTConfig.from_pretrained(
-            cfg.tokenizer.tokenizer_model, center_crop=cfg.model.center_crop
+            cfg.tokenizer.tokenizer_model, center_crop=model_cfg.center_crop
         )
         image_processor = PrismaticImageProcessor.from_pretrained(
             cfg.tokenizer.tokenizer_model, trust_remote_code=True
@@ -155,7 +165,6 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
         if override_config_kwargs is not None:
             for key, val in override_config_kwargs.items():
                 setattr(actor_model_config, key, val)
-
         model = OpenVLAOFTForRLActionPrediction.from_pretrained(
             pretrained_model_name_or_path=model_path,
             torch_dtype=torch_dtype,
@@ -251,6 +260,49 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             cfg.hidden_dim,
             num_action_chunks=cfg.num_action_chunks,
             add_value_head=cfg.add_value_head,
+        )
+    elif cfg.model_name == "residual_sac":
+        # Residual SAC: base model + residual actor
+        from .embodiment.residual_actor import ResidualActor
+        from .embodiment.residual_sac_model import ResidualSACWrapper
+        
+        # Load base model
+        base_model_path = cfg.base_model.get("path", model_path)
+        base_model_cfg = cfg.base_model.config
+        base_model = get_model(base_model_path, base_model_cfg)
+        base_model.eval()
+        
+        # Create residual actor
+        obs_dim = cfg.get("obs_dim", 74)  # Default for LIBERO
+        action_dim = cfg.action_dim
+        hidden_dim = cfg.get("residual_hidden_dim", 512)
+        num_layers = cfg.get("residual_num_layers", 3)
+        num_action_chunks = cfg.get("num_action_chunks", 1)
+        
+        residual_actor = ResidualActor(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_action_chunks=num_action_chunks,
+        )
+        
+        # Convert residual_actor to match base_model dtype for FSDP compatibility
+        # FSDP requires uniform dtype when flattening parameters
+        base_model_dtype = next(base_model.parameters()).dtype
+        # Convert all parameters to match base_model dtype
+        for param in residual_actor.parameters():
+            param.data = param.data.to(dtype=base_model_dtype)
+        # Convert all buffers to match base_model dtype
+        for buffer in residual_actor.buffers():
+            buffer.data = buffer.data.to(dtype=base_model_dtype)
+        
+        # Create wrapper
+        res_scale = cfg.get("res_scale", 1.0)
+        model = ResidualSACWrapper(
+            base_model=base_model,
+            residual_actor=residual_actor,
+            res_scale=res_scale,
         )
     elif cfg.model_name == "gr00t":
         from pathlib import Path

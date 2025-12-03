@@ -44,6 +44,7 @@ SUPPORTED_MODEL_ARCHS = [
     "openpi",
     "mlp_policy",
     "gr00t",
+    "residual_sac",
 ]
 SUPPORTED_ROLLOUT_BACKENDS = ["sglang", "vllm"]
 SUPPORTED_TASK_TYPE = ["embodied", "reasoning", "coding_online_rl"]
@@ -878,11 +879,12 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
     elif cfg.actor.training_backend == "fsdp":
         cfg.actor = validate_fsdp_cfg(cfg.actor, cfg.runner.get("resume_dir", None))
 
-    if cfg.critic.use_critic_model and cfg.critic.training_backend == "megatron":
-        cfg.critic = validate_megatron_cfg(cfg.critic)
-        cfg.critic = validate_model_cfg_by_hf_config(cfg.critic, cfg.rollout.model_dir)
-    elif cfg.critic.use_critic_model and cfg.critic.training_backend == "fsdp":
-        cfg.critic = validate_fsdp_cfg(cfg.critic)
+    if not (cfg.actor.model.get("model_name", None) == "residual_sac"): # NOTE: residual SAC does not use critic model
+        if cfg.critic.use_critic_model and cfg.critic.training_backend == "megatron":
+            cfg.critic = validate_megatron_cfg(cfg.critic)
+            cfg.critic = validate_model_cfg_by_hf_config(cfg.critic, cfg.rollout.model_dir)
+        elif cfg.critic.use_critic_model and cfg.critic.training_backend == "fsdp":
+            cfg.critic = validate_fsdp_cfg(cfg.critic)
 
     return cfg
 

@@ -249,8 +249,43 @@ class FSDPModelManager:
     def get_model_state_dict(self) -> dict:
         """
         Get full model state dict.
+        For residual SAC models, filters to only include residual_actor parameters.
         """
         state_dict = self._strategy.get_model_state_dict(self.model)
+        
+        # Filter state_dict for residual SAC models (only sync residual_actor, not base_model)
+        # Check if the underlying module is ResidualSACWrapper
+        from rlinf.models.embodiment.residual_sac_model import ResidualSACWrapper
+        
+        # Get the underlying module (unwrap FSDP if needed)
+        underlying_module = self.model
+        if hasattr(self.model, 'module'):
+            underlying_module = self.model.module
+        
+        if isinstance(underlying_module, ResidualSACWrapper):
+            # Filter to only include residual_actor parameters
+            # FSDP keys may have prefixes like '_fsdp_wrapped_module.' or just be direct module paths
+            filtered_state_dict = {}
+            for key, value in state_dict.items():
+                # Remove FSDP wrapper prefix if present
+                clean_key = key
+                if '_fsdp_wrapped_module.' in clean_key:
+                    clean_key = clean_key.split('_fsdp_wrapped_module.', 1)[1]
+                
+                # Only include keys that belong to residual_actor
+                if clean_key.startswith('residual_actor.'):
+                    # Remove 'residual_actor.' prefix so keys match what residual_actor.load_state_dict() expects
+                    filtered_key = clean_key[len('residual_actor.'):]
+                    filtered_state_dict[filtered_key] = value
+                # Exclude base_model keys
+                elif not clean_key.startswith('base_model.'):
+                    # Include other keys (might be direct residual_actor params without prefix)
+                    # But check if they're actually residual_actor params by checking if they match residual_actor structure
+                    # For now, include them as-is (they should be residual_actor params if not base_model)
+                    filtered_state_dict[clean_key] = value
+            
+            return filtered_state_dict
+        
         return state_dict
 
     def load_checkpoint(self, load_path: str) -> None:

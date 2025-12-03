@@ -254,3 +254,141 @@ def compute_grpo_actor_loss_fn(**kwargs) -> tuple[torch.Tensor, dict]:
     metrics_data.update(actor_metrics_data)
 
     return actor_loss, metrics_data
+
+
+def compute_sac_q_loss(
+    q_values: torch.Tensor,
+    target_q_values: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+    loss_agg_func: Optional[Callable[..., torch.Tensor]] = masked_mean,
+    max_episode_steps: Optional[int] = None,
+    loss_mask_sum: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute SAC Q-network loss (MSE loss).
+
+    Args:
+        q_values (torch.Tensor): Q-value predictions. Shape: [bsz] or [bsz, chunk_steps]
+        target_q_values (torch.Tensor): Target Q-values. Shape: [bsz] or [bsz, chunk_steps]
+        loss_mask (Optional[torch.Tensor]): Mask for valid entries.
+        loss_agg_func (callable, optional): Aggregation function (e.g., masked_mean).
+        max_episode_steps (Optional[int]): Max episode length for normalization.
+        loss_mask_sum (Optional[torch.Tensor]): Sum of valid steps per episode.
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (q_loss, metrics_dict)
+    """
+    loss_mask_ratio = None
+
+    if (
+        max_episode_steps is not None
+        and loss_mask_sum is not None
+        and loss_mask is not None
+    ):
+        loss_mask_ratio = (loss_mask_sum * 1.0) / max_episode_steps
+        loss_agg_func = masked_mean_ratio
+
+    if loss_mask is None:
+        loss_mask = torch.ones_like(q_values).bool()
+
+    q_loss = (q_values - target_q_values).pow(2)
+    q_loss = loss_agg_func(q_loss, loss_mask, loss_mask_ratio)
+
+    metrics_data = {
+        "critic/q_loss": q_loss.detach().item(),
+        "critic/q_values": masked_mean(q_values.detach(), loss_mask).item(),
+        "critic/target_q_values": masked_mean(target_q_values.detach(), loss_mask).item(),
+    }
+    return q_loss, metrics_data
+
+
+def compute_sac_actor_loss(
+    logprobs: torch.Tensor,
+    q_values: torch.Tensor,
+    alpha: float,
+    loss_mask: Optional[torch.Tensor] = None,
+    loss_agg_func: Optional[Callable[..., torch.Tensor]] = masked_mean,
+    max_episode_steps: Optional[int] = None,
+    loss_mask_sum: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute SAC actor loss: (alpha * log_prob - min(Q1, Q2)).mean()
+
+    Args:
+        logprobs (torch.Tensor): Log probabilities of actions. Shape: [bsz] or [bsz, chunk_steps]
+        q_values (torch.Tensor): Q-value predictions (min of Q1 and Q2). Shape: [bsz] or [bsz, chunk_steps]
+        alpha (float): Temperature parameter for entropy regularization.
+        loss_mask (Optional[torch.Tensor]): Mask for valid entries.
+        loss_agg_func (callable, optional): Aggregation function (e.g., masked_mean).
+        max_episode_steps (Optional[int]): Max episode length for normalization.
+        loss_mask_sum (Optional[torch.Tensor]): Sum of valid steps per episode.
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: (actor_loss, metrics_dict)
+    """
+    loss_mask_ratio = None
+
+    if (
+        max_episode_steps is not None
+        and loss_mask_sum is not None
+        and loss_mask is not None
+    ):
+        loss_mask_ratio = (loss_mask_sum * 1.0) / max_episode_steps
+        loss_agg_func = masked_mean_ratio
+
+    if loss_mask is None:
+        loss_mask = torch.ones_like(logprobs).bool()
+
+    # SAC actor loss: maximize (Q - alpha * log_prob)
+    # which is equivalent to minimizing (alpha * log_prob - Q)
+    actor_loss = alpha * logprobs - q_values
+    actor_loss = loss_agg_func(actor_loss, loss_mask, loss_mask_ratio)
+
+    metrics_data = {
+        "actor/policy_loss": actor_loss.detach().item(),
+        "actor/log_prob": masked_mean(logprobs.detach(), loss_mask).item(),
+        "actor/q_values": masked_mean(q_values.detach(), loss_mask).item(),
+        "actor/alpha": alpha,
+    }
+    return actor_loss, metrics_data
+
+
+@register_policy_loss("sac")
+def compute_sac_loss(**kwargs) -> tuple[torch.Tensor, dict]:
+    """
+    Compute SAC (Soft Actor-Critic) loss.
+
+    Args:
+        logprobs (torch.Tensor): Log probabilities of actions
+        q_values (torch.Tensor): Q-value predictions (min of Q1 and Q2)
+        target_q_values (torch.Tensor): Target Q-values for Q-network training
+        alpha (float): Temperature parameter for entropy regularization
+        loss_mask (Optional[torch.Tensor]): Mask for valid entries
+        loss_agg_func (callable, optional): Aggregation function
+        max_episode_steps (Optional[int]): Max episode length for normalization
+        loss_mask_sum (Optional[torch.Tensor]): Sum of valid steps per episode
+        train_q (bool): Whether to train Q-network (default: True)
+        train_actor (bool): Whether to train actor (default: True)
+
+    Returns:
+        Tuple[torch.Tensor, Dict]: Loss and metrics dictionary
+    """
+    metrics_data = {}
+    train_q = kwargs.get("train_q", True)
+    train_actor = kwargs.get("train_actor", True)
+
+    total_loss = torch.tensor(0.0, device=kwargs.get("logprobs", kwargs.get("q_values")).device)
+
+    if train_q:
+        q_loss, q_metrics_data = compute_sac_q_loss(**kwargs)
+        total_loss = total_loss + q_loss
+        metrics_data.update(q_metrics_data)
+
+    if train_actor:
+        actor_loss, actor_metrics_data = compute_sac_actor_loss(**kwargs)
+        total_loss = total_loss + actor_loss
+        metrics_data.update(actor_metrics_data)
+
+    return total_loss, metrics_data

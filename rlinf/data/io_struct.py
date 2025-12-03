@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
+import numpy as np
 import torch
 from omegaconf import DictConfig
 
@@ -1107,12 +1108,30 @@ class EnvOutput:
             list(obs["task_descriptions"]) if "task_descriptions" in obs else None
         )
 
-        return {
+        result = {
             "images": image_tensor,
             "wrist_images": wrist_image_tensor,
             "states": states,
             "task_descriptions": task_descriptions,
         }
+        
+        # Preserve RL observations if present (for residual SAC)
+        # These are added by LiberoEnv._wrap_obs() when extracting RL observations
+        if "robot_proprio_state" in obs:
+            # Convert to tensor if numpy array
+            robot_proprio_state = obs["robot_proprio_state"]
+            if isinstance(robot_proprio_state, np.ndarray):
+                robot_proprio_state = torch.from_numpy(robot_proprio_state).float()
+            result["robot_proprio_state"] = robot_proprio_state
+        
+        if "object_to_robot_relations" in obs:
+            # Convert to tensor if numpy array
+            object_to_robot_relations = obs["object_to_robot_relations"]
+            if isinstance(object_to_robot_relations, np.ndarray):
+                object_to_robot_relations = torch.from_numpy(object_to_robot_relations).float()
+            result["object_to_robot_relations"] = object_to_robot_relations
+        
+        return result
 
     def to_dict(self):
         env_output_dict = {}

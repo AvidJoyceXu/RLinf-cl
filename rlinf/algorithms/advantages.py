@@ -184,3 +184,63 @@ def compute_reinpp_advantages(
     advantages = (advantages - mean) * rstd
 
     return advantages, None
+
+
+@register_advantage("sac")
+def compute_sac_advantages(
+    rewards: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+    values: Optional[torch.Tensor] = None,
+    gamma: float = 0.99,
+    **kwargs,
+):
+    """
+    Compute advantages for SAC (Soft Actor-Critic).
+    
+    SAC doesn't use advantages in the traditional sense, but this function
+    can compute returns using GAE if values are provided, or simply return
+    rewards for compatibility with the existing framework.
+
+    Args:
+        rewards (torch.Tensor): Rewards per timestep. Shape: [seq_len, bsz] or [bsz]
+        loss_mask (Optional[torch.Tensor]): Mask for valid entries.
+        values (Optional[torch.Tensor]): Value function estimates. Shape: [seq_len+1, bsz] or [bsz]
+        gamma (float): Discount factor. Defaults to 0.99.
+
+    Returns:
+        Tuple[torch.Tensor, Optional[torch.Tensor]]: (advantages, returns)
+        For SAC, advantages are typically None or equal to returns.
+    """
+    # If values are provided, use GAE-like computation
+    if values is not None:
+        # Use GAE computation similar to compute_gae_advantages_and_returns
+        # but adapted for SAC
+        dones = kwargs.get("dones", None)
+        gae_lambda = kwargs.get("gae_lambda", 1.0)
+        
+        if dones is None:
+            # Create dones tensor (assume episode ends at last step)
+            if rewards.ndim == 2:
+                dones = torch.zeros_like(rewards, dtype=torch.bool)
+                dones[-1] = True
+            else:
+                dones = torch.zeros(len(rewards) + 1, dtype=torch.bool)
+                dones[-1] = True
+        
+        advantages, returns = compute_gae_advantages_and_returns(
+            rewards=rewards,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            values=values,
+            normalize_advantages=False,
+            normalize_returns=False,
+            loss_mask=loss_mask,
+            dones=dones,
+        )
+        return advantages, returns
+    else:
+        # No values provided, just return rewards as returns
+        # SAC doesn't use advantages in the traditional sense
+        returns = rewards.clone()
+        advantages = returns.clone()
+        return advantages, returns
