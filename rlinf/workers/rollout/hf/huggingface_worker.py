@@ -121,7 +121,7 @@ class MultiStepRolloutWorker(Worker):
         self.buffer_list[i].dones.append(env_output["dones"].bool().cpu().contiguous())
 
         # Note: currently this is not correct for chunk-size>1 with partial reset
-        if env_output["dones"].any() and self.cfg.env.train.auto_reset:
+        if env_output["dones"].any() and self.cfg.env.train.auto_reset: # NOTE: false for "residual_sac"
             if hasattr(self.hf_model, "value_head"):
                 dones = env_output["dones"]
 
@@ -155,8 +155,24 @@ class MultiStepRolloutWorker(Worker):
                 for i in range(self.stage_num):
                     env_output = self.recv_env_output()
                     self.update_env_output(i, env_output)
-                    actions, result = self.predict(env_output["obs"])
-
+                    actions, result = self.predict(env_output["obs"]) # the "obs" is sent along with the results["forward_inputs"]!
+                    
+                    # Store the obs that was used to query actions (for replay buffer tracking)
+                    # This is the obs that conditions base_action and residual_action
+                    if "obs" in env_output:
+                        # Extract RL observation (robot_proprio_state + object_to_robot_relations)
+                        env_obs_dict = env_output["obs"]
+                        if "robot_proprio_state" in env_obs_dict and "object_to_robot_relations" in env_obs_dict:
+                            query_obs = torch.cat([
+                                env_obs_dict["robot_proprio_state"],
+                                env_obs_dict["object_to_robot_relations"]
+                            ], dim=-1)
+                            result["forward_inputs"]["query_obs"] = query_obs.cpu()
+                    
+                    # Store next_obs: first observation from chunk_step (result of executing first action)
+                    if "next_obs" in env_output and env_output["next_obs"] is not None:
+                        result["forward_inputs"]["next_obs"] = env_output["next_obs"].cpu()
+                    
                     self.buffer_list[i].append_result(result)
 
                     self.send_chunk_actions(actions)

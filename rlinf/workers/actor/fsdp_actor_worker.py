@@ -202,6 +202,9 @@ class FSDPActor(FSDPModelManager, Worker):
 
     @torch.no_grad()
     def inference_step(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        if self.is_sac:
+            raise NotImplementedError("SAC is not supported yet")
+            
         self.model.eval()
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
@@ -561,19 +564,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # Get observation and action dimensions from config
         # For embodied tasks, obs_dim is typically the flattened observation dimension
         obs_dim = self.cfg.algorithm.get("obs_dim", None)  # Default for LIBERO
+        self.obs_dim = obs_dim
+
         residual_action_dim = self.cfg.actor.model.get("action_dim", None)
         base_action_dim = self.cfg.algorithm.get("base_action_dim", None)
         critic_input = self.cfg.algorithm.get("critic_input", "res")  # 'res', 'sum', or 'concat'
-        
+
         # Initialize replay buffer
         buffer_size = self.cfg.algorithm.get("replay_buffer_size", 1000000)
         obs_shape = (obs_dim,)
-        # Action shape depends on what we store
-        if critic_input == "res":
+        # NOTE: [critic input mode] and [actor input mode] determine the action shape
+        if critic_input == "concat" or self.cfg.actor.model.get("obs_use_base_action", False):
+            action_shape = (residual_action_dim + 2 * base_action_dim,)
+        elif critic_input == "res" or critic_input == "sum":
             action_shape = (residual_action_dim,)
         else:
-            # Store residual + base + base_next
-            action_shape = (residual_action_dim + base_action_dim * 2,)
+            raise ValueError(f"Unknown critic_input mode: {critic_input}")
         
         self.replay_buffer = ReplayBuffer(
             capacity=buffer_size,
@@ -809,57 +815,99 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.rollout_batch["logprob"] = self.rollout_batch["prev_logprobs"]
 
     def _store_rollouts_in_replay_buffer(self):
-        """Store rollouts in replay buffer for SAC."""
+        """Store rollouts in replay buffer for SAC.
+        
+        Stores tuples (obs, next_obs, base_action, residual_action, base_next_action) where:
+        - obs: observation used to query chunk_actions
+        - next_obs: first observation from chunk_step (result of executing first action)
+        - base_action: first chunk of base_actions (base_actions[:, 0, :])
+        - residual_action: first chunk of residual_actions (residual_actions[:, 0, :])
+        - base_next_action: next base action (base_actions[:, 1, :] or first chunk of next query)
+        """
         if not self.is_sac:
             return
         
         # Extract transitions from rollout_batch
-        # Shape: [n_chunk_steps, batch_size, num_action_chunks, ...]
-        rewards = self.rollout_batch["rewards"]  # [n_chunk_steps, batch_size, num_action_chunks]
-        dones = self.rollout_batch["dones"]  # [n_chunk_steps+1, batch_size, num_action_chunks]
-        prev_logprobs = self.rollout_batch["prev_logprobs"]  # [n_chunk_steps, batch_size, num_action_chunks, action_dim]
+        # NOTE: rollout_batch keys include base_actions, residual_actions, query_obs, next_obs from forward_inputs
         
-        # Get observations and actions from forward_inputs
-        # Note: This assumes forward_inputs contains obs and actions
-        forward_inputs = self.rollout_batch.get("forward_inputs", [])
+        # Extract query_obs: observation used to query actions
+        # Shape: [n_chunk_steps, batch_size, obs_dim]: [64, 32, 74]
+        query_obs_tensor = self.rollout_batch.get("query_obs", None)
         
-        # Flatten to get individual transitions
-        n_chunk_steps, batch_size = rewards.shape[:2]
+        # Extract next_obs: first observation from chunk_step (after executing first action)
+        # Shape: [n_chunk_steps, batch_size, obs_dim]: [63, 32, 74]
+        next_obs_tensor = self.rollout_batch.get("next_obs", None)
         
-        for step in range(n_chunk_steps):
+        # Extract base_actions and residual_actions from rollout_batch
+        # Shape: [n_chunk_steps, batch_size, num_action_chunks, action_dim]: [64, 32, 4, 7]
+        base_actions_tensor = self.rollout_batch.get("base_actions", None)
+        residual_actions_tensor = self.rollout_batch.get("residual_actions", None)
+        
+        # Extract rewards and dones
+        rewards = self.rollout_batch["rewards"] # [n_chunk_steps, batch_size, num_action_chunks]
+        dones = self.rollout_batch["dones"] # [n_chunk_steps+1, batch_size, num_action_chunks]
+    
+        # Get dimensions
+        if query_obs_tensor is not None:
+            n_chunk_steps, batch_size = query_obs_tensor.shape[:2]
+        elif next_obs_tensor is not None:
+            n_chunk_steps, batch_size = next_obs_tensor.shape[:2]
+        else:
+            # Fallback: use rewards shape
+            n_chunk_steps, batch_size = rewards.shape[:2]
+        
+        # Get num_action_chunks from base_actions or residual_actions
+        num_action_chunks = 1
+        if base_actions_tensor is not None and len(base_actions_tensor.shape) >= 3:
+            num_action_chunks = base_actions_tensor.shape[2]
+        elif residual_actions_tensor is not None and len(residual_actions_tensor.shape) >= 3:
+            num_action_chunks = residual_actions_tensor.shape[2]
+        
+        for step in range(n_chunk_steps - 1): # NOTE: we don't store the last step
             for batch_idx in range(batch_size):
-                # Extract transition data
-                # Note: This is a simplified version - actual implementation may need
-                # to handle the specific data structure from your rollout worker
-                obs = forward_inputs[step][batch_idx]["obs"] if forward_inputs else None
-                action = forward_inputs[step][batch_idx]["action"] if forward_inputs else None
-                reward = rewards[step, batch_idx].sum().item() if len(rewards.shape) > 2 else rewards[step, batch_idx].item()
-                done = dones[step + 1, batch_idx].any().item() if len(dones.shape) > 2 else dones[step + 1, batch_idx].item()
+                # Extract obs: observation that was used to query chunk_actions
+                if query_obs_tensor is None:
+                    continue  # Skip if no query_obs available
+                obs = query_obs_tensor[step, batch_idx]  # [obs_dim]
                 
-                # Get next observation
-                if step < n_chunk_steps - 1:
-                    next_obs = forward_inputs[step + 1][batch_idx]["obs"] if forward_inputs else None
+                # Extract next_obs: observation after executing actions[step]
+                next_obs = next_obs_tensor[step, batch_idx]  # [obs_dim]
+                
+                base_action = base_actions_tensor[step, batch_idx, 0]
+                # NOTE: treat the second chunk as base policy's action on the **next observation**
+                base_next_action = base_actions_tensor[step, batch_idx, 1] 
+                residual_action = residual_actions_tensor[step, batch_idx, 0]
+                
+                # Extract reward (use first chunk reward)
+                if len(rewards.shape) >= 3:
+                    reward = rewards[step, batch_idx, 0].item()  # First chunk reward
                 else:
-                    # Last step - next obs might be in a different format
-                    next_obs = obs  # Placeholder
+                    reward = rewards[step, batch_idx].item()
                 
-                if obs is not None and action is not None and next_obs is not None:
-                    # Flatten observations if needed
-                    if isinstance(obs, torch.Tensor):
-                        obs = obs.cpu().numpy().flatten()
-                    if isinstance(next_obs, torch.Tensor):
-                        next_obs = next_obs.cpu().numpy().flatten()
-                    if isinstance(action, torch.Tensor):
-                        action = action.cpu().numpy().flatten()
-                    
-                    # Store in replay buffer
-                    self.replay_buffer.add(
-                        obs=obs,
-                        next_obs=next_obs,
-                        action=action,
-                        reward=reward,
-                        done=done,
-                    )
+                # Extract done flag (check first chunk of next step)
+                if len(dones.shape) >= 3:
+                    done = dones[step + 1, batch_idx, 0].item() if step + 1 < len(dones) else False
+                else:
+                    done = dones[step + 1, batch_idx].item() if step + 1 < len(dones) else False
+                
+                # Determine what action to store based on critic_input
+                if self.critic_input == "concat" or self.cfg.actor.model.get("obs_use_base_action", False):
+                    action = torch.cat([residual_action, base_action, base_next_action], dim=-1)
+                else:
+                    action = residual_action
+                
+                # Convert to numpy and flatten
+                obs_np = obs.cpu().numpy().flatten()
+                next_obs_np = next_obs.cpu().numpy().flatten()
+                action_np = action.cpu().numpy().flatten()
+
+                self.replay_buffer.add(
+                    obs=obs_np,
+                    next_obs=next_obs_np,
+                    action=action_np,
+                    reward=reward,
+                    done=done,
+                )
 
     def compute_advantages_and_returns(self):
         # For SAC, we don't compute advantages - skip this step
@@ -914,8 +962,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.load_optimizer(self.device)
         
         # Check if we have enough samples in replay buffer
-        if len(self.replay_buffer) < self.sac_learning_starts:
-            return {}
+        buffer_size = len(self.replay_buffer)
+        if buffer_size < self.sac_learning_starts:
+            return
         
         self.model.train()
         self.qf1.train()
@@ -924,43 +973,56 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics = {}
         global_step = getattr(self, "global_step", 0)
         
-        # Number of updates per training call (UTD ratio)
-        num_updates = self.sac_utd_ratio
+        # Number of updates per training call
+        # utd_ratio means "updates per data collection", so we use it directly
+        num_updates = int(self.sac_utd_ratio)
         
         for update_step in range(num_updates):
             # Sample batch from replay buffer
             obs, next_obs, actions, rewards, dones = self.replay_buffer.sample(
                 self.sac_batch_size
             )
+            # obs: [batch_size, obs_dim]
+            # next_obs: [batch_size, obs_dim]
+            # actions: [batch_size, action_dim]
+            # rewards: [batch_size]
+            # dones: [batch_size]
             
             # Parse actions based on storage format
-            if self.critic_input == "res":
+            if self.critic_input == "concat" or self.cfg.actor.model.get("obs_use_base_action", False):
+                residual_actions = actions[:, :self.residual_action_dim]
+                base_actions = actions[:, self.residual_action_dim:self.residual_action_dim + self.base_action_dim]
+                base_next_actions = actions[:, self.residual_action_dim + self.base_action_dim:]
+            elif self.critic_input == "res" or self.critic_input == "sum":
                 residual_actions = actions
                 base_actions = None
                 base_next_actions = None
             else:
-                # Stored as [residual, base, base_next]
-                residual_actions = actions[:, :self.residual_action_dim]
-                base_actions = actions[:, self.residual_action_dim:self.residual_action_dim + self.base_action_dim]
-                base_next_actions = actions[:, self.residual_action_dim + self.base_action_dim:]
+                raise ValueError(f"Unknown critic_input mode: {critic_input}")
             
-            with torch.no_grad():
-                # Get next state actions from policy
-                # Note: This requires the model to support action sampling
-                # For now, we'll use a simplified approach
-                next_state_residual_actions, next_state_log_pi = self._sample_action_from_policy(next_obs, base_next_actions)
+            with torch.no_grad(): 
+                # NOTE: Get next state actions from policy
+                next_state_residual_actions, next_state_log_pi = self.model(
+                    sample_action=True,
+                    obs=next_obs,
+                    base_actions=base_next_actions,
+                    obs_use_base_action=self.cfg.actor.model.get("obs_use_base_action", False),
+                )
+                # next_obs: [256, 74], base_next_actions: [256, 7]
                 
                 # Compute target Q-values
                 if self.critic_input == "res":
                     next_state_actions = next_state_residual_actions
                 elif self.critic_input == "sum":
                     next_state_actions = base_next_actions + self.res_scale * next_state_residual_actions
-                else:  # concat
+                elif self.critic_input == "concat":  # concat
                     next_state_actions = torch.cat([next_state_residual_actions, base_next_actions], dim=-1)
-                
+                else:
+                    raise ValueError(f"Unknown critic_input mode: {self.critic_input}")
+
                 qf1_next_target = self.qf1_target(next_obs, next_state_residual_actions, base_next_actions, self.res_scale)
                 qf2_next_target = self.qf2_target(next_obs, next_state_residual_actions, base_next_actions, self.res_scale)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.sac_alpha * next_state_log_pi
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - self.sac_alpha * next_state_log_pi # [batch_size]
                 next_q_value = rewards + (1 - dones.float()) * self.sac_gamma * min_qf_next_target
             
             # Train Q-networks
@@ -973,12 +1035,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             
             self.q_optimizer.zero_grad()
             qf_loss.backward()
+            
+            # Compute Q-network gradient norms before clipping
+            qf1_grad_norm = torch.nn.utils.clip_grad_norm_(self.qf1.parameters(), self.cfg.algorithm.get("max_grad_norm", float('inf')))
+            qf2_grad_norm = torch.nn.utils.clip_grad_norm_(self.qf2.parameters(), self.cfg.algorithm.get("max_grad_norm", float('inf')))
+            
             self.q_optimizer.step()
             
             # Train policy network (less frequently)
             if update_step % self.sac_policy_freq == 0:
                 # Sample actions from policy
-                pi_residual_actions, log_pi = self._sample_action_from_policy(obs, base_actions)
+                pi_residual_actions, log_pi = self.model(
+                    sample_action=True,
+                    obs=obs,
+                    base_actions=base_actions,
+                    obs_use_base_action=self.cfg.actor.model.get("obs_use_base_action", False),
+                )
                 
                 # Compute Q-values for policy actions
                 if self.critic_input == "res":
@@ -997,12 +1069,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 
                 self.optimizer.zero_grad()
                 actor_loss.backward()
+                
+                # Compute actor gradient norm before clipping
+                actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.model.residual_actor.parameters(), self.cfg.algorithm.get("max_grad_norm", float('inf')))
+                
                 self.optimizer.step()
                 
                 # Update alpha if using automatic tuning
                 if self.sac_autotune:
                     with torch.no_grad():
-                        _, log_pi_new = self._sample_action_from_policy(obs, base_actions)
+                        _, log_pi_new = self.model(
+                            obs=obs,
+                            base_actions=base_actions,
+                            obs_use_base_action=self.cfg.actor.model.get("obs_use_base_action", False),
+                        )
                     alpha_loss = (-self.log_alpha.exp() * (log_pi_new + self.target_entropy)).mean()
                     
                     self.alpha_optimizer.zero_grad()
@@ -1021,19 +1101,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         self.sac_tau * param.data + (1 - self.sac_tau) * target_param.data
                     )
             
-            # Collect metrics
+            # Collect comprehensive metrics
             metrics_data = {
                 "sac/qf1_loss": qf1_loss.item(),
                 "sac/qf2_loss": qf2_loss.item(),
                 "sac/qf1_values": qf1_a_values.mean().item(),
                 "sac/qf2_values": qf2_a_values.mean().item(),
                 "sac/target_q_values": next_q_value.mean().item(),
+                "sac/qf1_grad_norm": qf1_grad_norm.item(),
+                "sac/qf2_grad_norm": qf2_grad_norm.item(),
+                "sac/rewards_mean": rewards.mean().item(),
+                "sac/rewards_std": rewards.std().item(),
             }
             if update_step % self.sac_policy_freq == 0:
                 metrics_data.update({
                     "sac/actor_loss": actor_loss.item(),
                     "sac/alpha": self.sac_alpha,
                 })
+                if actor_grad_norm is not None:
+                    metrics_data["sac/actor_grad_norm"] = actor_grad_norm.item()
                 if self.sac_autotune:
                     metrics_data["sac/alpha_loss"] = alpha_loss.item()
             
@@ -1046,22 +1132,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         
         return mean_metric_dict
-    
-    def _sample_action_from_policy(self, obs, base_actions=None):
-        """
-        Sample residual action from policy network.
-        
-        Args:
-            obs: Observations, shape [batch_size, obs_dim]
-            base_actions: Base actions (optional), shape [batch_size, base_action_dim]
-            
-        Returns:
-            residual_actions: Sampled residual actions, shape [batch_size, residual_action_dim]
-            log_pi: Log probabilities of sampled actions, shape [batch_size, 1]
-        """
-        residual_actor = self.model.residual_actor
-        residual_actions, log_pi, _ = residual_actor.get_action(obs)
-        return residual_actions, log_pi
 
     def run_training(self):
         # Route to SAC training if using SAC

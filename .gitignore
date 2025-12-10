@@ -1,3 +1,5 @@
+*.md
+libero-sac
 __pycache__
 .vscode
 *.log
@@ -16,3 +18,5 @@ logs/*
 .venv
 uv.lock
 rlinf/envs/maniskill/assets
+
+History

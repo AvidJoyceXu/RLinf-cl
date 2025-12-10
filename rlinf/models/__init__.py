@@ -285,6 +285,7 @@ def get_model(model_path, cfg: DictConfig, override_config_kwargs=None):
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             num_action_chunks=num_action_chunks,
+            obs_use_base_action=cfg.obs_use_base_action,
         )
         
         # Convert residual_actor to match base_model dtype for FSDP compatibility

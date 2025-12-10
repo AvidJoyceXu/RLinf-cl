@@ -445,24 +445,35 @@ class LiberoEnv(gym.Env):
             to_tensor(truncations),
             infos,
         )
-
+        
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
 
         chunk_rewards = []
-
         raw_chunk_terminations = []
         raw_chunk_truncations = []
-        for i in range(chunk_size):
+        
+        # Execute first step and capture the observation (for replay buffer)
+        first_actions = chunk_actions[:, 0]
+        first_extracted_obs, first_step_reward, first_terminations, first_truncations, infos = self.step(
+            first_actions, auto_reset=False
+        )
+        chunk_rewards.append(first_step_reward)
+        raw_chunk_terminations.append(first_terminations)
+        raw_chunk_truncations.append(first_truncations)
+        
+        # Execute remaining steps
+        last_extracted_obs = first_extracted_obs
+        for i in range(1, chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
                 actions, auto_reset=False
             )
-
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
             raw_chunk_truncations.append(truncations)
+            last_extracted_obs = extracted_obs  # Track last observation
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
@@ -476,9 +487,11 @@ class LiberoEnv(gym.Env):
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
+        # Handle auto_reset - update final observation if needed
+        final_extracted_obs = last_extracted_obs
         if past_dones.any() and self.auto_reset:
-            extracted_obs, infos = self._handle_auto_reset(
-                past_dones.cpu().numpy(), extracted_obs, infos
+            final_extracted_obs, infos = self._handle_auto_reset(
+                past_dones.cpu().numpy(), final_extracted_obs, infos
             )
 
         if self.auto_reset or self.ignore_terminations:
@@ -490,12 +503,14 @@ class LiberoEnv(gym.Env):
         else:
             chunk_terminations = raw_chunk_terminations.clone()
             chunk_truncations = raw_chunk_truncations.clone()
+        
         return (
-            extracted_obs,
-            chunk_rewards,
-            chunk_terminations,
+            first_extracted_obs,  # First observation from chunk_step (result of executing first action)
+            chunk_rewards, # [num_envs, chunk_steps]
+            chunk_terminations, 
             chunk_truncations,
-            infos,
+            infos, 
+            final_extracted_obs,  # Final observation (last step or after auto_reset)
         )
 
     def _handle_auto_reset(self, dones, _final_obs, infos):

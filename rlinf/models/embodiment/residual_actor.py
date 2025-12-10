@@ -33,6 +33,7 @@ class ResidualActor(nn.Module):
         hidden_dim: int = 512,
         num_layers: int = 3,
         num_action_chunks: int = 1,
+        obs_use_base_action: bool = False,
     ):
         """
         Initialize residual actor.
@@ -45,14 +46,17 @@ class ResidualActor(nn.Module):
             num_action_chunks: Number of action chunks (usually 1 for residual)
         """
         super().__init__()
-        
+        self.obs_use_base_action = obs_use_base_action
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.num_action_chunks = num_action_chunks
         
         # Build network layers
         layers = []
-        layers.append(layer_init(nn.Linear(obs_dim, hidden_dim)))
+        if obs_use_base_action:
+            layers.append(layer_init(nn.Linear(self.obs_dim + action_dim, hidden_dim)))
+        else:
+            layers.append(layer_init(nn.Linear(self.obs_dim, hidden_dim)))
         layers.append(nn.ReLU())
         
         for _ in range(num_layers - 2):
@@ -79,8 +83,8 @@ class ResidualActor(nn.Module):
             log_std: Action log std, shape [batch_size, action_dim]
         """
         # Convert obs to match network dtype (e.g., bf16 to match base_model)
-        network_dtype = next(self.network.parameters()).dtype
-        obs = obs.to(dtype=network_dtype)
+        network_dtype = (next(self.parameters()).dtype)
+        obs = obs.to(dtype=network_dtype) # [batch_size, obs_dim]
         x = self.network(obs)
         mean, log_std = x.chunk(2, dim=-1)
         
@@ -102,7 +106,7 @@ class ResidualActor(nn.Module):
             log_prob: Log probabilities, shape [batch_size, 1]
             mean: Action means, shape [batch_size, action_dim]
         """
-        mean, log_std = self(obs)
+        mean, log_std = self.forward(obs)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
         
@@ -114,7 +118,7 @@ class ResidualActor(nn.Module):
         # Compute log probability with tanh correction
         log_prob = normal.log_prob(x_t)
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(1, keepdim=True)
+        log_prob = log_prob.sum(1, keepdim=False)  # Return [batch_size] instead of [batch_size, 1]
         
         mean_action = torch.tanh(mean) * self.action_scale + self.action_bias
         
@@ -144,61 +148,59 @@ class ResidualActor(nn.Module):
         Returns:
             obs: Processed observations, shape [batch_size, obs_dim]
         """
-        # Use utility function for LIBERO to get proper RL observations
-        from rlinf.envs.libero.rl_obs_utils import flatten_libero_rl_observation
-        
-        obs_np = flatten_libero_rl_observation(env_obs)
+        obs_np = np.concatenate([env_obs["robot_proprio_state"], env_obs["object_to_robot_relations"]], -1)
        
         # Convert to tensor
         obs = torch.from_numpy(obs_np).float()
         
         return obs
     
-    def forward_training(
-        self,
-        data: dict,
-        compute_logprobs: bool = True,
-        compute_entropy: bool = False,
-        compute_values: bool = False,
-        **kwargs,
-    ) -> dict:
-        """
-        Forward pass for training (compatible with RLinf interface).
+    # def forward_training(
+    #     self,
+    #     data: dict,
+    #     compute_logprobs: bool = True,
+    #     compute_entropy: bool = False,
+    #     compute_values: bool = False,
+    #     **kwargs,
+    # ) -> dict:
+    #     """
+    #     Forward pass for training (compatible with RLinf interface).
         
-        Args:
-            data: Dict containing 'obs' and 'action'
-            compute_logprobs: Whether to compute log probabilities
-            compute_entropy: Whether to compute entropy
-            compute_values: Not used (residual actor doesn't have value head)
+    #     Args:
+    #         data: Dict containing 'obs' and 'action'
+    #         compute_logprobs: Whether to compute log probabilities
+    #         compute_entropy: Whether to compute entropy
+    #         compute_values: Not used (residual actor doesn't have value head)
             
-        Returns:
-            Dict with logprobs and optionally entropy
-        """
-        obs = data["obs"]
-        action = data["action"]
+    #     Returns:
+    #         Dict with logprobs and optionally entropy
+    #     """
+    #     obs = data["obs"]
+    #     action = data["action"]
         
-        # Call the tensor-based forward method
-        mean, log_std = self.forward(obs)
-        std = log_std.exp()
-        normal = torch.distributions.Normal(mean, std)
+    #     # Call the tensor-based forward method
+    #     mean, log_std = self.forward(obs)
+    #     std = log_std.exp()
+    #     normal = torch.distributions.Normal(mean, std)
         
-        ret_dict = {}
-        if compute_logprobs:
-            # Compute log prob with tanh correction
-            x_t = torch.atanh(torch.clamp((action - self.action_bias) / self.action_scale, -0.999, 0.999))
-            log_prob = normal.log_prob(x_t)
-            log_prob -= torch.log(self.action_scale * (1 - torch.tanh(x_t).pow(2)) + 1e-6)
-            ret_dict["logprobs"] = log_prob
+    #     ret_dict = {}
+    #     if compute_logprobs:
+    #         # Compute log prob with tanh correction
+    #         x_t = torch.atanh(torch.clamp((action - self.action_bias) / self.action_scale, -0.999, 0.999))
+    #         log_prob = normal.log_prob(x_t)
+    #         log_prob -= torch.log(self.action_scale * (1 - torch.tanh(x_t).pow(2)) + 1e-6)
+    #         ret_dict["logprobs"] = log_prob
         
-        if compute_entropy:
-            entropy = normal.entropy()
-            ret_dict["entropy"] = entropy
+    #     if compute_entropy:
+    #         entropy = normal.entropy()
+    #         ret_dict["entropy"] = entropy
         
-        return ret_dict
+    #     return ret_dict
     
     def predict_action_batch(
         self,
-        env_obs: dict,
+        env_obs, 
+        base_actions: np.ndarray = None,
         calulate_logprobs: bool = True,
         calulate_values: bool = False,
         **kwargs,
@@ -210,6 +212,7 @@ class ResidualActor(nn.Module):
             env_obs: Environment observations dict
             calulate_logprobs: Whether to compute log probabilities
             calulate_values: Not used (residual actor doesn't have value head)
+            base_actions: Base actions, shape [batch_size, num_action_chunks, action_dim] 
             
         Returns:
             chunk_actions: numpy array [batch_size, num_action_chunks, action_dim]
@@ -217,30 +220,55 @@ class ResidualActor(nn.Module):
         """
         obs = self.preprocess_obs(env_obs)
         device = next(self.parameters()).device
-        obs = obs.to(device)
+        obs = obs.to(device) # [batch_size, obs_dim]
         
-        if calulate_logprobs:
-            actions, log_probs, means = self.get_action(obs)
-        else:
-            actions = self.get_eval_action(obs)
-            log_probs = torch.zeros(obs.shape[0], 1, device=device)
-        
-        # Reshape to match expected format
         batch_size = obs.shape[0]
+        
+        if self.obs_use_base_action:
+            base_actions_tensor = torch.from_numpy(base_actions).to(device).float()
+            
+            # # Reshape base_actions for batch processing: [batch_size * num_action_chunks, action_dim]
+            base_actions_flat = base_actions_tensor.view(-1, self.action_dim) # [batch_size * num_action_chunks, action_dim]
+            
+            # # Repeat obs for each chunk: [batch_size * num_action_chunks, obs_dim]
+            obs_repeated = obs.repeat_interleave(self.num_action_chunks, dim=0)
+            
+            # # Concatenate obs with base action: [batch_size * num_action_chunks, obs_dim + action_dim]
+            obs_with_base_flat = torch.cat([obs_repeated, base_actions_flat], dim=-1)
+            
+            # Get residual actions for all chunks in one batch operation
+            if calulate_logprobs:
+                actions_flat, log_probs_flat, _ = self.get_action(obs_with_base_flat)
+            else:
+                actions_flat = self.get_eval_action(obs_with_base_flat)
+                log_probs_flat = torch.zeros(batch_size * self.num_action_chunks, 1, device=device)
+            
+            # Reshape back to chunk format: [batch_size, num_action_chunks, action_dim]
+            actions = actions_flat.view(batch_size, self.num_action_chunks, self.action_dim)
+            log_probs = log_probs_flat.view(batch_size, self.num_action_chunks, 1)
+            chunk_obs_with_base = obs_with_base_flat.view(batch_size, self.num_action_chunks, self.obs_dim + self.action_dim)
+        
+        else:
+            if calulate_logprobs:
+                actions_single, log_probs_single, _ = self.get_action(obs)
+            else:
+                actions_single = self.get_eval_action(obs)
+                log_probs_single = torch.zeros(batch_size, 1, device=device)
+            
+            # Reshape to match expected format: repeat single action for all chunks
+            actions = actions_single.unsqueeze(1).repeat(1, self.num_action_chunks, 1)
+            log_probs = log_probs_single.unsqueeze(1).repeat(1, self.num_action_chunks, 1)
+        
+        # Convert to numpy
         # NOTE: Convert to float32 before numpy conversion (numpy doesn't support bf16)
         actions_float = actions.float() if actions.dtype == torch.bfloat16 else actions
-        # chunk_actions = actions_float.reshape(batch_size, self.num_action_chunks, self.action_dim).cpu().numpy()
-        chunk_actions = actions_float.reshape(batch_size, 1, self.action_dim).cpu().numpy().repeat(self.num_action_chunks, axis=1)
-        
-        # Expand log_probs to match action shape
+        chunk_actions = actions_float.cpu().numpy()
         log_probs_float = log_probs.float() if log_probs.dtype == torch.bfloat16 else log_probs
-        # chunk_logprobs = log_probs_float.unsqueeze(-1).expand(-1, self.num_action_chunks, self.action_dim)
-        chunk_logprobs = log_probs_float.unsqueeze(-1).expand(-1, 1, self.action_dim).repeat(1, self.num_action_chunks, 1)
         
         result = {
-            "prev_logprobs": chunk_logprobs,
+            "prev_logprobs": log_probs_float,
             "prev_values": None,  # Residual actor doesn't have value head
-            "forward_inputs": {"obs": obs, "action": actions},
+            "forward_inputs": {"obs": obs},  # NOTE: store the obs that was used to query actions
         }
         
         return chunk_actions, result

@@ -249,7 +249,7 @@ class EnvWorker(Worker):
         )
         env_info = {}
 
-        extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
+        first_extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos, final_extracted_obs = (
             self.simulator_list[stage_id].chunk_step(chunk_actions)
         )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
@@ -272,10 +272,9 @@ class EnvWorker(Worker):
 
         env_output = EnvOutput(
             simulator_type=self.cfg.env.train.simulator_type,
-            obs=extracted_obs,
-            final_obs=infos["final_observation"]
-            if "final_observation" in infos
-            else None,
+            obs=final_extracted_obs,
+            next_obs=first_extracted_obs,  # First observation from chunk_step (result of executing first action)
+            final_obs=infos["final_observation"] if "final_observation" in infos else None,
             rewards=chunk_rewards,
             dones=chunk_dones,
         )
@@ -429,6 +428,7 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_interact_step(
                         raw_chunk_actions, stage_id
                     )
+
                     self.send_env_batch(env_output.to_dict())
                     env_output_list[stage_id] = env_output
                     for key, value in env_info.items():

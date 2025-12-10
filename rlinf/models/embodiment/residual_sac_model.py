@@ -91,6 +91,7 @@ class ResidualSACWrapper(nn.Module):
         residual_actions, residual_result = self.residual_actor.predict_action_batch(
             env_obs=env_obs,
             calulate_logprobs=calulate_logprobs,
+            base_actions=base_actions,
             calulate_values=False,  # Residual actor doesn't have value head
             **kwargs
         )
@@ -102,63 +103,64 @@ class ResidualSACWrapper(nn.Module):
         # Include base_actions in forward_inputs for replay buffer storage
         forward_inputs = residual_result["forward_inputs"].copy()
         
-        # Convert base_actions to tensor and store in forward_inputs
+        # Convert base_actions to tensor for storage
         # base_actions is numpy array [batch_size, num_action_chunks, action_dim]
         device = residual_result["forward_inputs"]["obs"].device
         base_actions_tensor = torch.from_numpy(base_actions).to(device)
         residual_actions_tensor = torch.from_numpy(residual_actions).to(device)
         
-        # Reshape to [batch_size, action_dim] if needed (remove num_action_chunks dim)
-        if base_actions_tensor.dim() == 3:
-            # [batch_size, num_action_chunks, action_dim] -> [batch_size, num_action_chunks * action_dim]
-            batch_size = base_actions_tensor.shape[0]
-            base_actions_tensor = base_actions_tensor.reshape(batch_size, -1)
-            residual_actions_tensor = residual_actions_tensor.reshape(batch_size, -1)
+        # Store base_actions and residual_actions in forward_inputs so they flow through
+        # EmbodiedRolloutResult.append_result() which only stores result["forward_inputs"]
+        # Shape: [batch_size, num_action_chunks, action_dim]
+        forward_inputs["base_actions"] = base_actions_tensor.cpu()
+        forward_inputs["residual_actions"] = residual_actions_tensor.cpu()
         
-        forward_inputs["base_actions"] = base_actions_tensor
-        forward_inputs["residual_actions"] = residual_actions_tensor
+        # Store the observation that was used to query actions
+        # This is needed to track (obs, next_obs, base_action, residual_action, base_next_action)
+        # The obs here is the one used to query chunk_actions
+        if "obs" in forward_inputs:
+            # Store the obs that queries actions (for replay buffer)
+            forward_inputs["query_obs"] = forward_inputs["obs"].cpu()
         
         result = {
             "prev_logprobs": residual_result["prev_logprobs"],  # Use residual logprobs
             "prev_values": base_result.get("prev_values"),  # Use base values if available
             "forward_inputs": forward_inputs,
-            # Store for reference/debugging (numpy arrays)
-            "base_actions": base_actions,
-            "residual_actions": residual_actions,
         }
         
         return final_actions, result
     
     def forward(
         self,
-        data: dict,
-        compute_logprobs: bool = True,
-        compute_entropy: bool = False,
-        compute_values: bool = False,
+        obs: torch.Tensor,
+        base_actions: torch.Tensor = None,
+        obs_use_base_action: bool = False,
         **kwargs,
-    ) -> dict:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass for training (used by actor worker).
-        Only residual actor is trained.
+        Return: action, log_prob
         
         Args:
-            data: Dict containing model inputs
-            compute_logprobs: Whether to compute log probabilities
-            compute_entropy: Whether to compute entropy
-            compute_values: Not used (residual actor doesn't have value head)
-            
-        Returns:
-            Dict with logprobs and optionally entropy
+            obs: Observations, shape [batch_size, obs_dim]
+            base_actions: Base actions (optional), shape [batch_size, base_action_dim]
+            obs_use_base_action: Whether to concatenate base_actions to obs
         """
-        # Only forward through residual actor
-        return self.residual_actor.forward_training(
-            data=data,
-            compute_logprobs=compute_logprobs,
-            compute_entropy=compute_entropy,
-            compute_values=False,  # Residual actor doesn't have value head
-            **kwargs
-        )
-    
+        # Prepare observation
+        if obs_use_base_action and base_actions is not None:
+            obs = torch.cat([obs, base_actions], dim=-1)
+        
+        action, log_prob, mean_action = self.residual_actor.get_action(obs)
+        
+        return action, log_prob
+
+        # return self.residual_actor.forward_training(
+        #     data=data,
+        #     compute_logprobs=compute_logprobs,
+        #     compute_entropy=compute_entropy,
+        #     compute_values=False,  # Residual actor doesn't have value head
+        #     **kwargs
+        # )
+        
     def load_state_dict(self, state_dict: dict, strict: bool = False):
         """
         Load state dict (only residual actor).

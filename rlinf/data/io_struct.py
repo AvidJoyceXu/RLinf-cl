@@ -1051,12 +1051,16 @@ def put_tensor_cpu(data_dict):
 class EnvOutput:
     simulator_type: str
     obs: dict[str, Any]
+    next_obs: Optional[dict[str, Any]] = None  # First observation from chunk_step (result of executing first action)
     final_obs: Optional[dict[str, Any]] = None
     dones: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
 
     def __post_init__(self):
         self.obs = put_tensor_cpu(self.obs)
+        self.next_obs = (
+            put_tensor_cpu(self.next_obs) if self.next_obs is not None else None
+        )
         self.final_obs = (
             put_tensor_cpu(self.final_obs) if self.final_obs is not None else None
         )
@@ -1133,10 +1137,57 @@ class EnvOutput:
         
         return result
 
+    def prepare_single_obs(self, obs: dict[str, Any]) -> Optional[torch.Tensor]:
+        """
+        Prepare single timestep observation for RL training.
+        Extracts and concatenates robot_proprio_state and object_to_robot_relations.
+        
+        Args:
+            obs: Observation dict with robot_proprio_state and object_to_robot_relations
+            
+        Returns:
+            Concatenated observation tensor [num_envs, obs_dim] or None
+        """
+        if obs is None:
+            return None
+        
+        robot_proprio_state = None
+        object_to_robot_relations = None
+        
+        if "robot_proprio_state" in obs:
+            robot_proprio_state = obs["robot_proprio_state"]
+            if isinstance(robot_proprio_state, np.ndarray):
+                robot_proprio_state = torch.from_numpy(robot_proprio_state).float()
+        
+        if "object_to_robot_relations" in obs:
+            object_to_robot_relations = obs["object_to_robot_relations"]
+            if isinstance(object_to_robot_relations, np.ndarray):
+                object_to_robot_relations = torch.from_numpy(object_to_robot_relations).float()
+        
+        # Concatenate RL observations if both are present
+        if robot_proprio_state is not None and object_to_robot_relations is not None:
+            # Concatenate along last dimension: [num_envs, dim1+dim2]
+            return torch.cat([robot_proprio_state, object_to_robot_relations], dim=-1)
+        elif robot_proprio_state is not None:
+            return robot_proprio_state
+        elif object_to_robot_relations is not None:
+            return object_to_robot_relations
+        
+        return None
+
     def to_dict(self):
         env_output_dict = {}
 
         env_output_dict["obs"] = self.prepare_observations(self.obs)
+
+        # Prepare next_obs: first observation from chunk_step (for replay buffer)
+        # NOTE: only in `env_interact_step` will the returned dictionary includes "next_obs"
+        if self.next_obs is not None:
+            next_obs_prepared = self.prepare_single_obs(self.next_obs)
+            env_output_dict["next_obs"] = next_obs_prepared
+        else:
+            env_output_dict["next_obs"] = None
+            
         env_output_dict["final_obs"] = (
             self.prepare_observations(self.final_obs)
             if self.final_obs is not None
@@ -1231,9 +1282,14 @@ class EmbodiedRolloutResult:
                     merged_forward_inputs[k] = [v]
         for k in merged_forward_inputs.keys():
             assert k not in ["dones", "rewards", "prev_logprobs", "prev_values"]
-            rollout_result_dict[k] = (
-                torch.stack(merged_forward_inputs[k], dim=0).cpu().contiguous()
-            )
+            # Filter out None values before stacking
+            non_none_values = [v for v in merged_forward_inputs[k] if v is not None]
+            if len(non_none_values) == 0:
+                rollout_result_dict[k] = None
+            else:
+                rollout_result_dict[k] = (
+                    torch.stack(non_none_values, dim=0).cpu().contiguous()
+                )
 
         return rollout_result_dict
 

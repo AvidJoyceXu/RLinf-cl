@@ -71,10 +71,10 @@ actor:
 
     # SAC specific
     model_name: "residual_sac"
-    obs_dim: 74  # LIBERO RL observation dimension
+    obs_dim: 74 # LIBERO RL observation dimension (do not include the action dim, we will calculate it according to `obs_use_base_action`)
+    obs_use_base_action: True
     residual_hidden_dim: 512
     residual_num_layers: 3
-    # res_scale: 1.0
     res_scale: 0.05
     
     base_model:
@@ -158,7 +158,7 @@ algorithm:
   adv_type: None # NOTE: residual SAC does not use any advantage type
   auto_reset: False
   ignore_terminations: False
-  max_episode_steps: 240
+  max_episode_steps: 256
   reward_coef: 5.0 # TODO
   group_size: 8
   use_ordered_reset_state_ids: True
@@ -174,7 +174,7 @@ algorithm:
   # NOTE: n_chunk_steps calculation assumes num_action_chunks matches base model (8)
   n_chunk_steps: ${int_div:${env.train.max_episode_steps}, ${actor.model.num_action_chunks}}
   n_eval_chunk_steps: ${int_div:${env.train.max_episode_steps}, ${actor.model.num_action_chunks}}
-  rollout_epoch: 16
+  rollout_epoch: 4
   
   # Sampling parameters for rollout
   sampling_params:
@@ -197,26 +197,29 @@ algorithm:
   rewards_lower_bound: 0.5
   rewards_upper_bound: 4.5
   
-  # SAC hyperparameters
-  gamma: 0.99
-  tau: 0.005
+  # SAC hyperparameters (aligned with residual_sac_config.yaml)
+  gamma: 0.97  # Changed from 0.99 to match working config
+  tau: 0.01  # Changed from 0.005 to match working config
   alpha: 0.2
-  autotune_alpha: false
-  target_update_freq: 1
-  policy_freq: 2
+  autotune_alpha: true  # Changed from false to match working config
+  target_update_freq: 1  # target_network_frequency in working config
+  policy_freq: 1  # Changed from 2 to match working config (policy_frequency: 1)
   utd_ratio: 1
   sac_batch_size: 256
-  learning_starts: 1000
+  learning_starts: 100  # Changed from 1000 to match working config
   
   # Q-network config
-  q_lr: 3e-4
-  alpha_lr: 3e-4
-  critic_input: "concat"  # "res", "sum", or "concat"
+  q_lr: 0.0001  # Changed from 3e-4 to match working config
+  alpha_lr: 0.0001  # Changed from 3e-4 to match working config
+  critic_input: "concat"  # NOTE: "res" or "concat"
   
   # Replay buffer
   replay_buffer_size: 1000000
   base_action_dim: 7
   obs_dim: 74
+  
+  # Gradient clipping (aligned with working config)
+  max_grad_norm: 50
 
 env:
   group_name: "EnvGroup"

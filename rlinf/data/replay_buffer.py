@@ -1,17 +1,3 @@
-# Copyright 2025 The RLinf Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import numpy as np
 import torch
 from typing import Optional, Tuple
@@ -121,6 +107,18 @@ class ReplayBuffer:
         actions = torch.FloatTensor(self.actions[idx]).to(self.device)
         rewards = torch.FloatTensor(self.rewards[idx]).to(self.device)
         dones = torch.BoolTensor(self.dones[idx]).to(self.device)
+
+        # Ensure batch dimension is preserved (important when batch_size=1)
+        if obs.ndim == 1:
+            obs = obs.unsqueeze(0)
+        if next_obs.ndim == 1:
+            next_obs = next_obs.unsqueeze(0)
+        if actions.ndim == 1:
+            actions = actions.unsqueeze(0)
+        if rewards.ndim == 0:
+            rewards = rewards.unsqueeze(0)
+        if dones.ndim == 0:
+            dones = dones.unsqueeze(0)
         
         return obs, next_obs, actions, rewards, dones
     
