@@ -532,6 +532,9 @@ class LiberoEnv(gym.Env):
         return obs, infos
 
     def _calc_step_reward(self, terminations):
+        # NOTE: hardcode forresidual sac
+        # terminations = terminations - 1.0
+
         reward = self.cfg.reward_coef * terminations
         reward_diff = reward - self.prev_step_reward
         self.prev_step_reward = reward

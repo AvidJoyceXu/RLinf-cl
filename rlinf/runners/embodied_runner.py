@@ -87,10 +87,15 @@ class EmbodiedRunner:
         actor_futures = self.actor.recv_rollout_batch()
         env_results = env_futures.wait()
         actor_futures.wait()
-        rollout_futures.wait()
+        rollout_metrics_list = rollout_futures.wait()
 
         env_results_list = [results for results in env_results if results is not None]
         env_metrics = compute_evaluate_metrics(env_results_list)
+        
+        # Merge rollout metrics into env_metrics
+        rollout_metrics = rollout_metrics_list[0]
+        env_metrics.update(rollout_metrics)
+        
         return env_metrics
 
     def evaluate(self):

@@ -14,6 +14,7 @@
 
 import gc
 
+import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
@@ -145,6 +146,13 @@ class MultiStepRolloutWorker(Worker):
         if self.cfg.rollout.get("enable_offload", False):
             self.reload_model()
         self.buffer_list = [EmbodiedRolloutResult() for _ in range(self.stage_num)]
+        
+        # Collect metrics for progressive exploration
+        rollout_metrics = {
+            "res_norm_ratio": [],
+            "res_norm_ratio_enabled": [],
+            "res_ratio": [],
+        }
 
         for _ in tqdm(
             range(self.cfg.algorithm.rollout_epoch),
@@ -156,6 +164,14 @@ class MultiStepRolloutWorker(Worker):
                     env_output = self.recv_env_output()
                     self.update_env_output(i, env_output)
                     actions, result = self.predict(env_output["obs"]) # the "obs" is sent along with the results["forward_inputs"]!
+                    
+                    # Collect metrics from result if available
+                    if "res_norm_ratio" in result:
+                        rollout_metrics["res_norm_ratio"].append(result["res_norm_ratio"])
+                    if "res_norm_ratio_enabled" in result:
+                        rollout_metrics["res_norm_ratio_enabled"].append(result["res_norm_ratio_enabled"])
+                    if "res_ratio" in result:
+                        rollout_metrics["res_ratio"].append(result["res_ratio"])
                     
                     # Store the obs that was used to query actions (for replay buffer tracking)
                     # This is the obs that conditions base_action and residual_action
@@ -191,6 +207,14 @@ class MultiStepRolloutWorker(Worker):
 
         if self.cfg.rollout.get("enable_offload", False):
             self.offload_model()
+        
+        # Compute mean metrics
+        mean_metrics = {}
+        for key, values in rollout_metrics.items():
+            if values:
+                mean_metrics[key] = np.mean(values)
+        
+        return mean_metrics
 
     def evaluate(self):
         if self.cfg.rollout.get("enable_offload", False):

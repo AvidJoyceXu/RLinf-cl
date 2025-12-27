@@ -159,7 +159,7 @@ algorithm:
   auto_reset: False
   ignore_terminations: False
   max_episode_steps: 256
-  reward_coef: 5.0 # TODO
+  reward_coef: 1.0 
   group_size: 8
   use_ordered_reset_state_ids: True
   use_fixed_reset_state_ids: True
@@ -208,9 +208,9 @@ algorithm:
   sac_batch_size: 256
   learning_starts: 100  # Changed from 1000 to match working config
   
-  # Q-network config
-  q_lr: 0.0001  # Changed from 3e-4 to match working config
-  alpha_lr: 0.0001  # Changed from 3e-4 to match working config
+  # Q-network config 
+  q_lr: 0.0005  
+  alpha_lr: 0.0001  
   critic_input: "concat"  # NOTE: "res" or "concat"
   
   # Replay buffer
@@ -220,6 +220,10 @@ algorithm:
   
   # Gradient clipping (aligned with working config)
   max_grad_norm: 50
+  
+  # Progressive exploration for residual SAC
+  prog_explore: 600  # res_ratio = min(global_step / prog_explore, 1)
+  prog_explore_threshold: 150  # Disable residual actions for first 100 steps
 
 env:
   group_name: "EnvGroup"

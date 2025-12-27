@@ -54,6 +54,11 @@ class ResidualSACWrapper(nn.Module):
         self.action_dim = getattr(residual_actor, "action_dim", 7)
         self.num_action_chunks = getattr(residual_actor, "num_action_chunks", 1)
         
+        # Progressive exploration parameters (will be set via setup_config_and_processor)
+        self.prog_explore = None
+        self.prog_explore_threshold = None
+        self.global_step = 0
+        
         # Dummy config attribute for FSDP compatibility (some FSDP utilities access module.config)
         # Create a simple namespace object
         from types import SimpleNamespace
@@ -96,6 +101,54 @@ class ResidualSACWrapper(nn.Module):
             **kwargs
         )
         
+        # Progressive exploration: mask residual actions based on global_step
+        batch_size = base_actions.shape[0]
+        enable_res_masks = np.ones(batch_size, dtype=bool)  # Default: all enabled
+        
+        res_norm_ratio_enabled = 0.0
+        res_norm_ratio_all = 0.0
+        
+        if self.prog_explore is not None and self.prog_explore > 0:
+            # Calculate res_ratio (epsilon) based on global_step
+            res_ratio = min(self.global_step / self.prog_explore, 1.0)
+            # Apply threshold: disable all residual actions if below threshold
+            if self.global_step <= self.prog_explore_threshold:
+                enable_res_masks = np.zeros(batch_size, dtype=bool)
+                res_norm_ratio_enabled = 0.0
+                res_norm_ratio_all = 0.0
+            else:
+                # Sample which environments should use residual actions
+                enable_res_masks = np.random.rand(batch_size) < res_ratio
+        
+                # Flatten actions for norm calculation: [batch_size * num_action_chunks, action_dim]
+                residual_actions_flat = residual_actions.reshape(-1, residual_actions.shape[-1])
+                base_actions_flat = base_actions.reshape(-1, base_actions.shape[-1])
+                
+                # Compute norms per action chunk
+                res_norm = np.linalg.norm(residual_actions_flat, axis=1)  # [batch_size * num_action_chunks]
+                base_norm = np.linalg.norm(base_actions_flat, axis=1)  # [batch_size * num_action_chunks]
+                
+                # Reshape back to [batch_size, num_action_chunks] and take mean over chunks
+                res_norm = res_norm.reshape(batch_size, -1).mean(axis=1)  # [batch_size]
+                base_norm = base_norm.reshape(batch_size, -1).mean(axis=1)  # [batch_size]
+                
+                # 1. res_norm_ratio_enabled: only consider enabled environments
+                if np.any(enable_res_masks):
+                    enabled_res_norms = res_norm[enable_res_masks]
+                    enabled_base_norms = base_norm[enable_res_masks]
+                    res_norm_ratio_enabled = np.mean(enabled_res_norms / (enabled_base_norms + 1e-8))
+                else:
+                    res_norm_ratio_enabled = 0.0
+                
+                # 2. res_norm_ratio_all: consider all environments (including masked ones)
+                res_norm_ratio_all = np.mean(res_norm / (base_norm + 1e-8))
+            
+            # Apply masking: set residual actions to zero for disabled environments
+            # Expand enable_res_masks to match action shape: [batch_size, num_action_chunks, action_dim]
+            mask_shape = (batch_size, 1, 1) if len(residual_actions.shape) == 3 else (batch_size, 1)
+            enable_res_masks_expanded = enable_res_masks.reshape(mask_shape)
+            residual_actions = residual_actions * enable_res_masks_expanded
+        
         # Combine: base + scaled residual
         final_actions = base_actions + self.res_scale * residual_actions
         
@@ -127,6 +180,13 @@ class ResidualSACWrapper(nn.Module):
             "prev_values": base_result.get("prev_values"),  # Use base values if available
             "forward_inputs": forward_inputs,
         }
+        
+        # Store metrics for logging
+        if self.prog_explore is not None and self.prog_explore > 0:
+            res_ratio = min(self.global_step / self.prog_explore, 1.0)
+            result["res_norm_ratio"] = res_norm_ratio_all
+            result["res_norm_ratio_enabled"] = res_norm_ratio_enabled
+            result["res_ratio"] = res_ratio  # epsilon value
         
         return final_actions, result
     
@@ -196,6 +256,20 @@ class ResidualSACWrapper(nn.Module):
         # Forward setup to base_model (which needs attributes like max_prompt_length)
         if hasattr(self.base_model, 'setup_config_and_processor'):
             self.base_model.setup_config_and_processor(model_config, cfg, input_processor)
+        
+        # Store progressive exploration parameters from algorithm config
+        if hasattr(cfg, 'algorithm'):
+            self.prog_explore = cfg.algorithm.get("prog_explore", None)
+            self.prog_explore_threshold = cfg.algorithm.get("prog_explore_threshold", 0)
+    
+    def set_global_step(self, global_step: int):
+        """
+        Set the global step for progressive exploration.
+        
+        Args:
+            global_step: Current global training step
+        """
+        self.global_step = global_step
     
     # Note: We do NOT override state_dict() here because FSDP needs access to all parameters
     # (both base_model and residual_actor) when wrapping. The state_dict will be filtered
