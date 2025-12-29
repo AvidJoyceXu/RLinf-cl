@@ -23,7 +23,7 @@ runner:
     experiment_name: "test_openvla"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 5000
   max_steps: -1
 
   only_eval: False
@@ -209,7 +209,7 @@ algorithm:
   learning_starts: 100  # Changed from 1000 to match working config
   
   # Q-network config 
-  q_lr: 0.0005  
+  q_lr: 0.001 # 0.0005  
   alpha_lr: 0.0001  
   critic_input: "concat"  # NOTE: "res" or "concat"
   
@@ -223,7 +223,7 @@ algorithm:
   
   # Progressive exploration for residual SAC
   prog_explore: 600  # res_ratio = min(global_step / prog_explore, 1)
-  prog_explore_threshold: 150  # Disable residual actions for first 100 steps
+  prog_explore_threshold: 100  # Disable residual actions for first 100 steps
 
 env:
   group_name: "EnvGroup"

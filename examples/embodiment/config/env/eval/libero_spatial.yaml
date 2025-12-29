@@ -5,7 +5,7 @@ auto_reset: True
 ignore_terminations: True
 max_episode_steps: ${algorithm.max_episode_steps}
 
-use_rel_reward: True
+use_rel_reward: False
 reward_coef: ${algorithm.reward_coef}
 only_eval: True
 

@@ -5,7 +5,7 @@ auto_reset: ${algorithm.auto_reset}
 ignore_terminations: ${algorithm.ignore_terminations}
 max_episode_steps: ${algorithm.max_episode_steps}
 
-use_rel_reward: True
+use_rel_reward: False  # 改为False，使用绝对reward [0, 1]，避免负数reward导致Q-values为负
 reward_coef: ${algorithm.reward_coef}
 only_eval: False
 
