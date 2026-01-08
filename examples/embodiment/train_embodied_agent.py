@@ -24,6 +24,7 @@ from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+from rlinf.workers.rollout.hf.residual_rollout_worker import ResidualRolloutWorker
 
 mp.set_start_method("spawn", force=True)
 
@@ -41,22 +42,34 @@ def main(cfg) -> None:
     # Create actor worker group
     actor_placement = component_placement.get_strategy("actor")
 
+    # Check if residual policy is enabled
+    use_residual = cfg.get("residual_policy", {}).get("enabled", False)
+    
     if cfg.algorithm.loss_type == "embodied_sac":
-        from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
-
-        actor_worker_cls = EmbodiedSACFSDPPolicy
+        if use_residual:
+            from rlinf.workers.actor.residual_fsdp_sac_policy_worker import ResidualSACFSDPPolicy
+            actor_worker_cls = ResidualSACFSDPPolicy
+        else:
+            from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
+            actor_worker_cls = EmbodiedSACFSDPPolicy
     else:
         from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
-
         actor_worker_cls = EmbodiedFSDPActor
+    
     actor_group = actor_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement
     )
+    
     # Create rollout worker group
     rollout_placement = component_placement.get_strategy("rollout")
-    rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
-        cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
-    )
+    if use_residual:
+        rollout_group = ResidualRolloutWorker.create_group(cfg).launch(
+            cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        )
+    else:
+        rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+            cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        )
 
     # Create env worker group
     env_placement = component_placement.get_strategy("env")
