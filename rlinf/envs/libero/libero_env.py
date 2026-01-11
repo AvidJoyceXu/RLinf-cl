@@ -268,11 +268,59 @@ class LiberoEnv(gym.Env):
             ),
         }
 
+    def _extract_rl_observations(self, obs):
+        """
+        Extract RL observations: robot_proprio_state and object_to_robot_relations.
+        
+        Args:
+            obs: Raw observation dict from LIBERO environment
+            
+        Returns:
+            dict with 'robot_proprio_state' and 'object_to_robot_relations'
+        """
+        # Extract robot proprioceptive state
+        if 'robot0_proprio-state' in obs:
+            robot_proprio_state = obs['robot0_proprio-state'].flatten()
+        else:
+            robot_proprio_state = np.concatenate(
+                [
+                    obs['robot0_joint_pos'],
+                    obs['robot0_joint_vel'] if 'robot0_joint_vel' in obs else np.zeros(7),
+                    obs['robot0_eef_pos'],
+                    obs['robot0_eef_quat'] if 'robot0_eef_quat' in obs else np.zeros(4),
+                    obs['robot0_gripper_qpos'],
+                    obs['robot0_gripper_qvel'] if 'robot0_gripper_qvel' in obs else np.zeros(2),
+                ]
+            )
+        
+        # Extract object-to-robot relations
+        # Collect all keys ending with '_to_robot0_eef_pos' or '_to_robot0_eef_quat'
+        relations = []
+        for key, value in obs.items():
+            if key.endswith('_to_robot0_eef_pos') or key.endswith('_to_robot0_eef_quat'):
+                relations.append(value.flatten())
+        
+        if relations:
+            object_to_robot_relations = np.concatenate(relations)
+        else:
+            # If no relations found, use empty array
+            object_to_robot_relations = np.array([])
+        
+        return {
+            "robot_proprio_state": robot_proprio_state,
+            "object_to_robot_relations": object_to_robot_relations,
+        }
+
     def _wrap_obs(self, obs_list):
         images_and_states_list = []
+        rl_obs_list = []
+
         for obs in obs_list:
             images_and_states = self._extract_image_and_state(obs)
             images_and_states_list.append(images_and_states)
+
+            rl_obs = self._extract_rl_observations(obs)
+            rl_obs_list.append(rl_obs)
 
         images_and_states = to_tensor(
             list_of_dict_to_dict_of_list(images_and_states_list)
@@ -285,6 +333,9 @@ class LiberoEnv(gym.Env):
             [value.clone() for value in images_and_states["wrist_image"]]
         )
 
+        robot_proprio_states = to_tensor(np.stack([r["robot_proprio_state"] for r in rl_obs_list]))
+        object_to_robot_relations = to_tensor(np.stack([r["object_to_robot_relations"] for r in rl_obs_list]))
+
         states = images_and_states["state"]
 
         obs = {
@@ -292,6 +343,8 @@ class LiberoEnv(gym.Env):
             "wrist_images": wrist_image_tensor,
             "states": states,
             "task_descriptions": self.task_descriptions,
+            "robot_proprio_state": robot_proprio_states,
+            "object_to_robot_relations": object_to_robot_relations,
         }
         return obs
 

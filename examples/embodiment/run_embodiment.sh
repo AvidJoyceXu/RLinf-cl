@@ -1,4 +1,6 @@
 #! /bin/bash
+# NOTE: fix mujoco egl error
+export NVIDIA_DRIVER_CAPABILITIES="all"
 
 export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))

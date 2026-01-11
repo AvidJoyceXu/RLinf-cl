@@ -64,19 +64,21 @@ class ResidualPolicy(BasePolicy):
                 obs_dim, hidden_sizes=(256, 256, 256), activation="tanh"
             )
         if add_q_head:
+            # Q-head needs to handle chunk actions: [B, num_chunks * action_dim]
+            chunk_action_dim = num_action_chunks * action_dim
             if q_head_type == "default":
                 self.q_head = MultiQHead(
                     hidden_size=obs_dim,
                     hidden_dims=[256, 256, 256],
                     num_q_heads=2,
-                    action_feature_dim=action_dim,
+                    action_feature_dim=chunk_action_dim,
                 )
             elif q_head_type == "crossq":
                 self.q_head = MultiCrossQHead(
                     hidden_size=obs_dim,
                     hidden_dims=[256, 256, 256],
                     num_q_heads=2,
-                    action_feature_dim=action_dim,
+                    action_feature_dim=chunk_action_dim,
                 )
             else:
                 raise ValueError(f"Invalid q_head_type: {q_head_type}")
@@ -85,10 +87,11 @@ class ResidualPolicy(BasePolicy):
         act = get_act_func(activation)
 
         # Determine input dimension based on actor_input mode
+        # Note: base_action is chunk action: [B, num_chunks * action_dim]
         if actor_input == "obs":
             input_dim = obs_dim
         elif actor_input == "obs_base_action":
-            input_dim = obs_dim + action_dim
+            input_dim = obs_dim + num_action_chunks * action_dim
         else:
             raise ValueError(f"Invalid actor_input: {actor_input}")
 
@@ -119,8 +122,21 @@ class ResidualPolicy(BasePolicy):
         )
 
     def preprocess_env_obs(self, env_obs):
+        """Preprocess environment observation for residual policy.
+        
+        Args:
+            env_obs: Raw environment observation dict
+            
+        Returns:
+            Processed observation dict with states on the correct device
+        """
         device = next(self.parameters()).device
-        return {"states": env_obs["states"].to(device)}
+        processed_obs = {}
+        if isinstance(env_obs["rl_flatten_obs"], torch.Tensor):
+            processed_obs["rl_flatten_obs"] = env_obs["rl_flatten_obs"].to(device)
+        else:
+            processed_obs["rl_flatten_obs"] = torch.from_numpy(env_obs["rl_flatten_obs"]).to(device)
+        return processed_obs
 
     def forward(self, forward_type="default_forward", **kwargs):
         if forward_type == "sac_forward":
@@ -136,32 +152,19 @@ class ResidualPolicy(BasePolicy):
         else:
             raise NotImplementedError
 
-    def sac_forward(self, obs, base_action=None, **kwargs):
+    def _compute_action_distribution(self, input_feat):
         """
-        Forward pass for SAC training.
+        Compute action distribution from input features.
         
         Args:
-            obs: Observation dict with "states" key, shape [B, obs_dim]
-            base_action: Base action (only needed if actor_input == "obs_base_action")
-                        shape [B, num_action_chunks * action_dim]
+            input_feat: Input features tensor [B, input_dim]
         
         Returns:
-            residual_action: [B, num_action_chunks * action_dim]
-            chunk_logprobs: [B, num_action_chunks, action_dim]
-            shared_feature: None (for compatibility)
+            action_mean: [B, num_action_chunks, action_dim]
+            action_logstd: [B, num_action_chunks, action_dim]
+            probs: Normal distribution
+            B: Batch size
         """
-        # Build input based on actor_input mode
-        if self.actor_input == "obs":
-            if base_action is not None:
-                raise ValueError("base_action should not be provided when actor_input=='obs'")
-            input_feat = obs["states"]
-        elif self.actor_input == "obs_base_action":
-            if base_action is None:
-                raise ValueError("base_action must be provided when actor_input=='obs_base_action'")
-            input_feat = torch.cat([obs["states"], base_action], dim=-1)
-        else:
-            raise ValueError(f"Invalid actor_input: {self.actor_input}")
-
         # Forward through backbone
         feat = self.backbone(input_feat)
         
@@ -174,14 +177,47 @@ class ResidualPolicy(BasePolicy):
         action_logstd = self.logstd_range[0] + 0.5 * (
             self.logstd_range[1] - self.logstd_range[0]
         ) * (action_logstd + 1)
-
+        
         # Reshape for chunk processing
         B = action_mean.shape[0]
         action_mean = action_mean.reshape(B, self.num_action_chunks, self.action_dim)
         action_logstd = action_logstd.reshape(B, self.num_action_chunks, self.action_dim)
         
+        # Compute distribution
         action_std = torch.exp(action_logstd)
         probs = Normal(action_mean, action_std)
+        
+        return action_mean, action_logstd, probs, B
+
+    def sac_forward(self, obs, base_action=None, **kwargs):
+        """
+        Forward pass for SAC training.
+        
+        Args:
+            obs: Observation dict with "rl_flatten_obs" key, shape [B, obs_dim]
+            base_action: Base action (only needed if actor_input == "obs_base_action")
+                        shape [B, num_action_chunks * action_dim]
+        
+        Returns:
+            residual_action: [B, num_action_chunks * action_dim]
+            chunk_logprobs: [B, num_action_chunks, action_dim]
+            shared_feature: None (for compatibility)
+        """
+        # Build input based on actor_input mode
+        rl_flatten_obs = obs["rl_flatten_obs"]
+        if self.actor_input == "obs":
+            if base_action is not None:
+                raise ValueError("base_action should not be provided when actor_input=='obs'")
+            input_feat = rl_flatten_obs
+        elif self.actor_input == "obs_base_action":
+            if base_action is None:
+                raise ValueError("base_action must be provided when actor_input=='obs_base_action'")
+            input_feat = torch.cat([rl_flatten_obs, base_action], dim=-1)
+        else:
+            raise ValueError(f"Invalid actor_input: {self.actor_input}")
+
+        # Compute action distribution
+        _, _, probs, B = self._compute_action_distribution(input_feat)
         raw_action = probs.rsample()  # [B, num_action_chunks, action_dim]
 
         # Apply tanh transformation
@@ -220,23 +256,9 @@ class ResidualPolicy(BasePolicy):
         else:
             raise ValueError(f"Invalid actor_input: {self.actor_input}")
 
-        feat = self.backbone(input_feat)
-        action_mean = self.actor_mean(feat)
-        action_logstd = self.actor_logstd(feat)
-        
-        # Reshape for processing
-        B = action_mean.shape[0]
-        action_mean = action_mean.reshape(B, self.num_action_chunks, self.action_dim)
-        action_logstd = action_logstd.reshape(B, self.num_action_chunks, self.action_dim)
+        # Compute action distribution
+        _, _, probs, B = self._compute_action_distribution(input_feat)
         action = action.reshape(B, self.num_action_chunks, self.action_dim)
-        
-        action_logstd = torch.tanh(action_logstd)
-        action_logstd = self.logstd_range[0] + 0.5 * (
-            self.logstd_range[1] - self.logstd_range[0]
-        ) * (action_logstd + 1)
-        
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
 
         output_dict = {}
         if compute_logprobs:
@@ -276,32 +298,18 @@ class ResidualPolicy(BasePolicy):
             result: dict with prev_logprobs, prev_values, forward_inputs
         """
         # Build input
+        rl_flatten_obs = env_obs["rl_flatten_obs"]
         if self.actor_input == "obs":
-            input_feat = env_obs["states"]
+            input_feat = rl_flatten_obs
         elif self.actor_input == "obs_base_action":
             if base_action is None:
                 raise ValueError("base_action must be provided when actor_input=='obs_base_action'")
-            input_feat = torch.cat([env_obs["states"], base_action], dim=-1)
+            input_feat = torch.cat([rl_flatten_obs, base_action], dim=-1)
         else:
             raise ValueError(f"Invalid actor_input: {self.actor_input}")
 
-        feat = self.backbone(input_feat)
-        action_mean = self.actor_mean(feat)
-        action_logstd = self.actor_logstd(feat)
-
-        # Reshape for chunk processing
-        B = action_mean.shape[0]
-        action_mean = action_mean.reshape(B, self.num_action_chunks, self.action_dim)
-        action_logstd = action_logstd.reshape(B, self.num_action_chunks, self.action_dim)
-
-        # Apply tanh and scale
-        action_logstd = torch.tanh(action_logstd)
-        action_logstd = self.logstd_range[0] + 0.5 * (
-            self.logstd_range[1] - self.logstd_range[0]
-        ) * (action_logstd + 1)
-
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
+        # Compute action distribution
+        action_mean, _, probs, B = self._compute_action_distribution(input_feat)
 
         if mode == "train":
             raw_action = probs.sample()
@@ -322,14 +330,15 @@ class ResidualPolicy(BasePolicy):
 
         chunk_actions = residual_action.cpu().numpy()
 
+        rl_flatten_obs = env_obs["rl_flatten_obs"]
         if hasattr(self, "value_head") and calulate_values:
-            chunk_values = self.value_head(env_obs["states"])
+            chunk_values = self.value_head(rl_flatten_obs)
         else:
             chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
 
         forward_inputs = {"action": residual_action.reshape(B, -1)}
         if return_obs:
-            forward_inputs["obs"] = env_obs["states"]
+            forward_inputs["obs"] = rl_flatten_obs
 
         result = {
             "prev_logprobs": chunk_logprobs,
@@ -340,7 +349,8 @@ class ResidualPolicy(BasePolicy):
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
         """Q network forward for residual actions."""
-        return self.q_head(obs["states"], actions)
+        rl_flatten_obs = obs["rl_flatten_obs"]
+        return self.q_head(rl_flatten_obs, actions)
 
     def crossq_q_forward(
         self,
@@ -353,9 +363,9 @@ class ResidualPolicy(BasePolicy):
     ):
         """CrossQ forward for residual actions."""
         return self.q_head(
-            obs["states"],
+            obs["rl_flatten_obs"],
             actions,
-            next_state_features=next_obs["states"] if next_obs is not None else None,
+            next_state_features=next_obs["rl_flatten_obs"] if next_obs is not None else None,
             next_action_features=next_actions,
         )
 

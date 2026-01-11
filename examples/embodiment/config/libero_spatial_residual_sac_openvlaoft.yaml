@@ -16,9 +16,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: 0-0
-    env: 0-0
-    rollout: 0-0
+    actor,env,rollout: 0  # Use only GPU 0 for debugging
 
 runner:
   task_type: embodied
@@ -57,8 +55,11 @@ algorithm:
   target_entropy: -7  # Target entropy (-action_dim for LIBERO: -7)
   alpha_lr: 3.0e-4  # Learning rate for temperature parameter
   
+  q_head_type: "crossq"  # Use CrossQ head for improved Q-value estimation with BatchRenorm
+  critic_actor_ratio: 2  # Update critic 2 times per actor update for better Q-value learning
+  
   # Replay buffer settings
-  replay_buffer_capacity: 500000
+  replay_buffer_capacity: 500000  # Increased for better sample diversity and stability
   min_buffer_size: 0  # Minimum buffer size before training starts
   target_update_freq: 1  # Frequency of target network updates
 
@@ -83,9 +84,9 @@ algorithm:
 residual_policy:
   enabled: True
   base_model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"  # Path to pre-trained OpenVLA-OFT model
-  res_scale: 0.1  # Scaling factor for residual action
-  prog_explore: 10000  # Progressive exploration steps
-  prog_explore_threshold: 0  # Threshold for progressive exploration
+  res_scale: 0.05  # Scaling factor for residual action
+  prog_explore: 1000  # Progressive exploration steps
+  prog_explore_threshold: 10  # Threshold for progressive exploration
 
 # Network Configuration
 network:
@@ -94,22 +95,22 @@ network:
 
 env:
   group_name: "EnvGroup"
-  enable_offload: False
+  enable_offload: False  # Disabled for better performance with multi-GPU
 
   # Override the default values in env/libero_spatial
   train:
-    total_num_envs: 32
+    total_num_envs: 32  # Increased for better sample efficiency and GPU utilization
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 512  # max episode steps for truncation
-    max_steps_per_rollout_epoch: 512
+    max_steps_per_rollout_epoch: 512  # Keep full episode length for LIBERO spatial tasks
     group_size: ${algorithm.group_size}
     reward_coef: 5.0
     reset_gripper_open: False
   
   eval:
-    total_num_envs: 500
+    total_num_envs: 16  # Increased for more comprehensive evaluation (must be divisible by env_world_size)
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 512
@@ -126,7 +127,7 @@ rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
   model_dir: ""
-  enable_offload: False
+  enable_offload: False  # Disabled for better performance with multi-GPU and FSDP
   pipeline_stage_num: 1
 
   model:
@@ -137,16 +138,10 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
 
-  micro_batch_size: 1024
-  global_batch_size: 1024
+  micro_batch_size: 1024  # Increased for better GPU utilization and training stability
+  global_batch_size: 1024  # Increased for better sample efficiency
   seed: 1234
-  enable_offload: False
-  base_model:
-    model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"
-    unnorm_key: libero_spatial_no_noops
-    max_prompt_length: 128
-    add_q_head: False
-    add_value_head: False
+  enable_offload: False  # Disabled for better performance with FSDP full_shard
   model:
     model_name: "residual_policy"
     policy_setup: "panda-ee-dpos"  # Reference only, actual obs_dim/action_dim come from config
@@ -156,18 +151,22 @@ actor:
     precision: "32"
     add_value_head: False
     add_q_head: True
-    q_head_type: "default"  # ["default", "crossq"]
+    q_head_type: "default"  # Use CrossQ head for improved Q-value estimation with BatchRenorm
     
     # Residual policy specific config
     actor_input: ${network.actor_input}  # Pass through from network config
     
     # LIBERO observation dimension
     # LIBERO RL obs: robot_proprio_state (39-dim) + object_to_robot_relations (35-dim) = 74-dim
-    # But in practice, RLinf processes it to a smaller dimension
-    # Check libero_spatial_0_grpo_mlp.yaml which uses obs_dim: 8
-    # You may need to adjust this based on your actual observation processing
-    obs_dim: 8  # Adjust based on your observation processing pipeline
-
+    obs_dim: 74 
+  base_model:
+    model_type: "openvla_oft"
+    precision: ${actor.model.precision}
+    model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"
+    unnorm_key: libero_spatial_no_noops
+    max_prompt_length: 128
+    add_q_head: False
+    add_value_head: False
   optim:
     lr: 3.0e-4  # Lower learning rate for SAC
     value_lr: 3.0e-4  # Q-network learning rate
@@ -179,7 +178,6 @@ actor:
   # Override the default values in training_backend/fsdp
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "no_shard"
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}

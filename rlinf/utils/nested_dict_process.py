@@ -22,6 +22,13 @@ def copy_dict_tensor(next_extracted_obs: dict):
             ret[key] = value.clone()
         elif isinstance(value, dict):
             ret[key] = copy_dict_tensor(value)
+        elif value is None:
+            # Support None values (e.g., extra_view_images may be None)
+            ret[key] = None
+        elif isinstance(value, (list, tuple)):
+            # Support list/tuple values (e.g., task_descriptions)
+            # Create a shallow copy of the list
+            ret[key] = value.copy() if isinstance(value, list) else tuple(value)
         else:
             raise ValueError(f"{key=}, {type(value)} is not supported.")
     return ret

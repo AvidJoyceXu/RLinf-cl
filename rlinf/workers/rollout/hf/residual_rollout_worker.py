@@ -80,14 +80,6 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             
             # Create base model config (OpenVLA)
             base_model_config = copy.deepcopy(self.cfg.actor.base_model)
-            with open_dict(base_model_config):
-                base_model_config.model_type = "openvla_oft"
-                base_model_config.path = base_model_path
-                base_model_config.precision = self.cfg.rollout.model.precision
-                # Base model doesn't need Q head
-                base_model_config.add_q_head = False
-                base_model_config.add_value_head = False
-            
             self.base_model = get_model(base_model_config)
             self.base_model.eval()
             self.base_model_config = base_model_config
@@ -103,14 +95,15 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         if self.enable_offload:
             self.offload_model()
 
-    def predict(self, env_obs, mode="train", global_step=None):
+    def predict(self, env_obs, mode="train", global_step=None, raw_env_obs=None):
         """
         Predict actions with residual policy support.
         
         Args:
-            env_obs: Environment observation
+            env_obs: Preprocessed environment observation (for residual policy)
             mode: "train" or "eval"
             global_step: Current global step for progressive exploration
+            raw_env_obs: Raw environment observation (for base model)
         
         Returns:
             actions: Final actions [B, num_action_chunks, action_dim]
@@ -123,14 +116,25 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             # Fallback to standard prediction
             return super().predict(env_obs, mode)
         
+        # Use raw_env_obs for base model if provided, otherwise use env_obs
+        # Base model needs raw env_obs with task_descriptions
+        base_env_obs = raw_env_obs if raw_env_obs is not None else env_obs
+        # Prepare sampling parameters for base model
+        base_kwargs = (
+            self._train_sampling_params
+            if mode == "train"
+            else self._eval_sampling_params
+        )
+        base_kwargs = base_kwargs.copy()
+        base_kwargs["calulate_logprobs"] = False
+        base_kwargs["calulate_values"] = False
+        base_kwargs["return_obs"] = False
+        
         # Get base action from base model
         with torch.no_grad():
             base_chunk_actions, base_result = self.base_model.predict_action_batch(
-                env_obs=env_obs,
-                calulate_logprobs=False,
-                calulate_values=False,
-                return_obs=False,
-                mode=mode,
+                env_obs=base_env_obs,
+                **base_kwargs,
             )
         
         # Convert base actions to tensor and flatten
@@ -188,7 +192,7 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         # Convert residual actions to tensor
         residual_actions_tensor = torch.from_numpy(residual_chunk_actions).to(self.device)
         
-        # Apply progressive exploration mask
+        # NOTE: Apply progressive exploration mask
         if mode == "train":
             residual_actions_tensor = residual_actions_tensor * torch.from_numpy(
                 enable_res_masks.reshape(-1, 1, 1)
@@ -225,7 +229,17 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         self, env_output: dict[str, torch.Tensor], extracted_obs: dict[str, Any]
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, Any] | None]:
         """
-        Get dones and rewards, with support for computing base_next_action.
+        Get dones and rewards from environment batch, with support for computing base_next_action.
+        
+        Overrides parent method to handle residual policy's need for raw env_obs (with task_descriptions)
+        when calling predict() for bootstrap value computation.
+        
+        Args:
+            env_output: Environment batch containing dones, rewards, and optionally final_obs
+            extracted_obs: Preprocessed observation (residual policy format)
+        
+        Returns:
+            Tuple of (dones, rewards, real_extracted_obs). dones and rewards are tensors.
         """
         # First step: no rewards yet, only dones
         real_extracted_obs = None
@@ -242,6 +256,7 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         rewards = env_output["rewards"].cpu().contiguous()
 
         # Handle auto_reset: add bootstrap value to rewards for done episodes
+        # Note: currently this is not correct for chunk-size>1 with partial reset
         if dones.any() and self.cfg.env.train.auto_reset:
             if hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head"):
                 final_obs = env_output["final_obs"]
@@ -249,21 +264,41 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                     final_extracted_obs = self.hf_model.preprocess_env_obs(final_obs)
                     if hasattr(self.hf_model, "q_head"):
                         real_extracted_obs = init_real_obs(final_extracted_obs)
-                    actions, result = self.predict(final_extracted_obs, global_step=self.global_step)
+                    # For residual policy, predict() needs raw final_obs (with task_descriptions) for base model
+                    if self.use_residual:
+                        actions, result = self.predict(
+                            env_obs=final_extracted_obs,
+                            mode="train",
+                            global_step=self.global_step,
+                            raw_env_obs=final_obs  # Pass raw final_obs for base model
+                        )
+                    else:
+                        actions, result = self.predict(final_extracted_obs)
                     if "prev_values" in result:
                         _final_values = result["prev_values"]
                     else:
                         _final_values = torch.zeros_like(actions[:, 0])
-                final_values = torch.zeros_like(_final_values[:, 0])  # [bsz, ]
-                last_step_dones = dones[:, -1]  # [bsz, ]
-
-                final_values[last_step_dones] = _final_values[:, 0][last_step_dones]
-
-                # Add bootstrap value to the last step of done episodes
-                rewards[:, -1] += self.cfg.algorithm.gamma * final_values.cpu()
+                    # Handle different shapes of _final_values
+                    # _final_values can be [B, num_chunks, 1] or [B, num_chunks]
+                    if _final_values.ndim == 3:
+                        _final_values = _final_values[:, 0, :]  # [B, 1] or [B, action_dim]
+                    elif _final_values.ndim == 2:
+                        _final_values = _final_values[:, 0]  # [B]
+                    # Ensure _final_values is 1D [B]
+                    if _final_values.ndim > 1:
+                        _final_values = _final_values.squeeze(-1)  # [B]
+                    
+                    final_values = torch.zeros_like(_final_values)  # [bsz, ]
+                    last_step_dones = dones[:, -1]  # [bsz, ]
+                    
+                    final_values[last_step_dones] = _final_values[last_step_dones]
+                    
+                    # Add bootstrap value to the last step of done episodes
+                    rewards[:, -1] += self.cfg.algorithm.gamma * final_values.cpu()
 
         if real_extracted_obs is None and hasattr(self.hf_model, "q_head"):
             real_extracted_obs = init_real_obs(extracted_obs)
+
         return dones, rewards, real_extracted_obs
 
     async def generate(
@@ -303,35 +338,50 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                             env_output, last_forward_inputs[stage_id]
                         )
 
-                    extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                    residual_extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                    # Use residual_extracted_obs for get_dones_and_rewards (same as original codebase)
+                    # This ensures compatibility with init_real_obs which expects residual policy format
                     dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
-                        env_output, extracted_obs
+                        env_output, residual_extracted_obs
                     )
                     
                     # Predict actions with residual policy
-                    actions, result = self.predict(extracted_obs, mode="train", global_step=self.global_step)
+                    # Pass raw env_output["obs"] for base model, residual_extracted_obs for residual policy
+                    actions, result = self.predict(
+                        env_obs=residual_extracted_obs,
+                        mode="train",
+                        global_step=self.global_step,
+                        raw_env_obs=env_output["obs"]  # Raw obs with task_descriptions for base model
+                    )
                     
                     # Compute base_next_action if needed for storage
-                    # Use next_obs (real_extracted_obs) to compute next base action
-                    if self.use_residual and self.critic_input != "res" and real_extracted_obs is not None:
+                    # Use current step's env_output["obs"] as next step's raw observation for base model
+                    # base_next_action should be added to last_forward_inputs (previous step's forward_inputs)
+                    if self.use_residual and self.critic_input != "res" and env_output["obs"] is not None:
+                        # Prepare sampling parameters for base model (use train params for next action prediction)
+                        next_base_kwargs = self._train_sampling_params.copy()
+                        next_base_kwargs["calulate_logprobs"] = False
+                        next_base_kwargs["calulate_values"] = False
+                        next_base_kwargs["return_obs"] = False
+                        
                         with torch.no_grad():
+                            # Use raw env_output["obs"] (with task_descriptions, images) for base model
                             next_base_chunk_actions, _ = self.base_model.predict_action_batch(
-                                env_obs=real_extracted_obs,
-                                calulate_logprobs=False,
-                                calulate_values=False,
-                                return_obs=False,
-                                mode="train",
+                                env_obs=env_output["obs"],
+                                **next_base_kwargs,
                             )
                             next_base_actions_tensor = torch.from_numpy(next_base_chunk_actions).to(self.device)
                             B, num_chunks, action_dim = next_base_actions_tensor.shape
                             next_base_actions_flat = next_base_actions_tensor.reshape(B, -1)
                             
-                            # Add base_next_action to forward_inputs
-                            if "base_action" in result["forward_inputs"]:
-                                result["forward_inputs"]["base_next_action"] = next_base_actions_flat.cpu()
+                            # Add base_next_action to last_forward_inputs (previous step's forward_inputs)
+                            if last_forward_inputs[stage_id] is not None and "base_action" in last_forward_inputs[stage_id]:
+                                last_forward_inputs[stage_id]["base_next_action"] = next_base_actions_flat.cpu()
                     
-                    # Use forward_inputs from current step (not last step)
-                    forward_inputs_to_store = result["forward_inputs"]
+                    # Use forward_inputs from last step (same as huggingface_worker.py)
+                    # This ensures the first step (reset step) doesn't store forward_inputs,
+                    # which matches the removal of first step's dones/truncations/terminations
+                    forward_inputs_to_store = last_forward_inputs[stage_id]
                     
                     chunk_step_result = ChunkStepResult(
                         prev_logprobs=result["prev_logprobs"],
@@ -349,7 +399,7 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                         self.buffer_list[stage_id].add_transition(
                             last_extracted_obs[stage_id], real_extracted_obs
                         )
-                    last_extracted_obs[stage_id] = extracted_obs
+                    last_extracted_obs[stage_id] = residual_extracted_obs
                     last_forward_inputs[stage_id] = result["forward_inputs"]
 
                     self.send_chunk_actions(output_channel, actions)
@@ -377,7 +427,13 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                     put_tensor_device(last_forward_inputs[stage_id], "cpu")
                 )
 
-                actions, result = self.predict(extracted_obs, mode="train", global_step=self.global_step)
+                # For residual policy, predict() needs raw env_output["obs"] (with task_descriptions) for base model
+                actions, result = self.predict(
+                    env_obs=extracted_obs,
+                    mode="train",
+                    global_step=self.global_step,
+                    raw_env_obs=env_output["obs"]  # Raw obs with task_descriptions for base model
+                )
                 if "prev_values" in result:
                     self.buffer_list[stage_id].prev_values.append(
                         result["prev_values"].cpu().contiguous()
@@ -389,6 +445,39 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
 
         for i in range(self.num_pipeline_stages):
             self.send_rollout_batch(actor_channel, i)
+
+        if self.enable_offload:
+            self.offload_model()
+
+    async def evaluate(self, input_channel: Channel, output_channel: Channel):
+        """Evaluate with residual policy support."""
+        if self.enable_offload:
+            self.reload_model()
+
+        n_chunk_steps = (
+            self.cfg.env.eval.max_steps_per_rollout_epoch
+            // self.cfg.actor.model.num_action_chunks
+        )
+        for _ in tqdm(
+            range(self.cfg.algorithm.eval_rollout_epoch),
+            desc="Evaluating Rollout Epochs",
+            disable=(self._rank != 0),
+        ):
+            for _ in range(n_chunk_steps):
+                for _ in range(self.num_pipeline_stages):
+                    env_output = await self.recv_env_output(input_channel, mode="eval")
+                    extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                    # For residual policy, predict() needs raw env_output["obs"] (with task_descriptions) for base model
+                    if self.use_residual:
+                        actions, _ = self.predict(
+                            env_obs=extracted_obs,
+                            mode="eval",
+                            global_step=self.global_step,
+                            raw_env_obs=env_output["obs"]  # Raw obs with task_descriptions for base model
+                        )
+                    else:
+                        actions, _ = self.predict(extracted_obs, mode="eval")
+                    self.send_chunk_actions(output_channel, actions, mode="eval")
 
         if self.enable_offload:
             self.offload_model()

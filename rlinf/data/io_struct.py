@@ -1213,6 +1213,10 @@ class EnvOutput:
         task_descriptions = (
             list(obs["task_descriptions"]) if "task_descriptions" in obs else None
         )
+        robot_proprio_state = obs["robot_proprio_state"]
+        object_to_robot_relations = obs["object_to_robot_relations"]
+
+        rl_flatten_obs = torch.cat([robot_proprio_state, object_to_robot_relations], dim=-1)
 
         return {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
@@ -1220,6 +1224,7 @@ class EnvOutput:
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
+            "rl_flatten_obs": rl_flatten_obs,  # [N_ENV, N_ROBOT_PROP_STATE + N_OBJECT_TO_ROBOT_RELATIONS]
         }
 
     def to_dict(self):

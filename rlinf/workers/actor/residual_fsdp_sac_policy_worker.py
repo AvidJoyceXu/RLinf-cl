@@ -162,7 +162,12 @@ class ResidualSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             else:
                 raise ValueError(f"Invalid actor_input: {self.actor_input}")
             
-            next_state_log_pi = next_state_log_pi.sum(dim=-1, keepdim=True)
+            # Sum over both action_dim and num_action_chunks dimensions
+            # chunk_logprobs shape: [B, num_action_chunks, action_dim]
+            # Reshape to [B, num_action_chunks * action_dim] then sum to [B, 1]
+            num_action_chunks = self.cfg.actor.model.num_action_chunks
+            action_dim = self.cfg.actor.model.action_dim
+            next_state_log_pi = next_state_log_pi.reshape(-1, num_action_chunks * action_dim).sum(dim=-1, keepdim=True)
             
             # Build next state action for Q evaluation
             _, _, next_base_action = self._extract_actions_from_batch(batch)
@@ -290,7 +295,12 @@ class ResidualSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         else:
             raise ValueError(f"Invalid actor_input: {self.actor_input}")
         
-        log_pi = log_pi.sum(dim=-1, keepdim=True)  # sum over the chunk dimension
+        # Sum over both action_dim and num_action_chunks dimensions
+        # chunk_logprobs shape: [B, num_action_chunks, action_dim]
+        # Reshape to [B, num_action_chunks * action_dim] then sum to [B, 1]
+        num_action_chunks = self.cfg.actor.model.num_action_chunks
+        action_dim = self.cfg.actor.model.action_dim
+        log_pi = log_pi.reshape(-1, num_action_chunks * action_dim).sum(dim=-1, keepdim=True)
         
         # Build action for Q evaluation
         pi_action = self._build_action_for_critic(pi_residual, base_action)
@@ -348,7 +358,12 @@ class ResidualSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             else:
                 raise ValueError(f"Invalid actor_input: {self.actor_input}")
             
-            log_pi = log_pi.sum(dim=-1, keepdim=True)
+            # Sum over both action_dim and num_action_chunks dimensions
+            # chunk_logprobs shape: [B, num_action_chunks, action_dim]
+            # Reshape to [B, num_action_chunks * action_dim] then sum to [B, 1]
+            num_action_chunks = self.cfg.actor.model.num_action_chunks
+            action_dim = self.cfg.actor.model.action_dim
+            log_pi = log_pi.reshape(-1, num_action_chunks * action_dim).sum(dim=-1, keepdim=True)
 
         alpha = self.compute_alpha()
         alpha_loss = -alpha * (log_pi.mean() + self.target_entropy)
