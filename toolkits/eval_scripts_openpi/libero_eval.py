@@ -271,7 +271,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_trials_per_task",
         type=int,
-        default=50,
+        default=1, # NOTE: override to be 1
         help="Number of rollouts per task",
     )
     parser.add_argument(

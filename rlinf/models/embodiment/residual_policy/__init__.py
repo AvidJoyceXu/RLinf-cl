@@ -17,6 +17,10 @@ from omegaconf import DictConfig
 
 from rlinf.models.embodiment.residual_policy.residual_policy import ResidualPolicy
 from rlinf.models.embodiment.residual_policy.lora_residual_policy import LoRAResidualPolicy
+from rlinf.models.embodiment.residual_policy.merge_lora_actors import (
+    RobustMergeLoRA,
+    RobustMergeLoRAOptimized
+)
 
 
 def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
@@ -56,4 +60,10 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     return model
 
 
-__all__ = ["ResidualPolicy", "LoRAResidualPolicy", "get_model"]
+__all__ = [
+    "ResidualPolicy",
+    "LoRAResidualPolicy",
+    "get_model",
+    "RobustMergeLoRA",
+    "RobustMergeLoRAOptimized"
+]
