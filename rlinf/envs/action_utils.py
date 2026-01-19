@@ -69,6 +69,7 @@ def prepare_actions_for_libero(
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
         SupportedModel.RESIDUAL_POLICY,
+        SupportedModel.LORA_RESIDUAL_POLICY,
     ]:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
@@ -87,7 +88,8 @@ def prepare_actions_for_isaaclab(
     if SupportedModel(model_type) in [
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
-        SupportedModel.RESIDUAL_POLICY
+        SupportedModel.RESIDUAL_POLICY,
+        SupportedModel.LORA_RESIDUAL_POLICY,
     ]:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = torch.sign(chunk_actions[..., -1]) * -1.0

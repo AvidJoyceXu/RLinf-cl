@@ -55,6 +55,7 @@ class SupportedModel(Enum):
     GR00T = ("gr00t", "embodied")
     CNN_POLICY = ("cnn_policy", "embodied")
     RESIDUAL_POLICY = ("residual_policy", "embodied")
+    LORA_RESIDUAL_POLICY = ("lora_residual_policy", "embodied")
 
     def __new__(cls, value, category):
         obj = object.__new__(cls)

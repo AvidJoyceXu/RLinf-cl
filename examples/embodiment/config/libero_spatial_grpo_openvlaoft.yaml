@@ -31,7 +31,7 @@ runner:
   only_eval: False
   eval_policy_path: null # Optional: .pt file or None, if None, will use the checkpoint in rollout.model.model_path
   val_check_interval: -1
-  save_interval: 25
+  save_interval: -1
 
   resume_dir: null
 
@@ -113,7 +113,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-spatial-traj1/"
+    model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"
     precision: ${actor.model.precision}
 
 actor:
@@ -126,7 +126,7 @@ actor:
 
   # Override the default values in model/openvla_oft
   model:
-    model_path: "/path/to/model/Openvla-oft-SFT-libero-spatial-traj1/"
+    model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"
     model_type: "openvla_oft"
 
     unnorm_key: libero_spatial_no_noops

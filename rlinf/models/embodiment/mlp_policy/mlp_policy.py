@@ -99,9 +99,22 @@ class MLPPolicy(BasePolicy):
         else:
             self.action_scale = None
 
+    def _get_obs(self, env_obs):
+        """
+        Get observation from env_obs, preferring rl_flatten_obs if available,
+        otherwise falling back to states for backward compatibility.
+        """
+        if "rl_flatten_obs" in env_obs and env_obs["rl_flatten_obs"] is not None:
+            return env_obs["rl_flatten_obs"]
+        elif "states" in env_obs:
+            return env_obs["states"]
+        else:
+            raise KeyError("env_obs must contain either 'rl_flatten_obs' or 'states'")
+
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
-        return {"states": env_obs["states"].to(device)}
+        obs = self._get_obs(env_obs)
+        return {"states": obs.to(device)}
 
     def forward(self, forward_type="default_forward", **kwargs):
         if forward_type == "sac_forward":
@@ -118,7 +131,8 @@ class MLPPolicy(BasePolicy):
             raise NotImplementedError
 
     def sac_forward(self, obs, **kwargs):
-        feat = self.backbone(obs["states"])
+        obs_tensor = self._get_obs(obs)
+        feat = self.backbone(obs_tensor)
         action_mean = self.actor_mean(feat)
         action_logstd = self.actor_logstd(feat)
         action_logstd = torch.tanh(action_logstd)
@@ -185,7 +199,8 @@ class MLPPolicy(BasePolicy):
         mode="train",
         **kwargs,
     ):
-        feat = self.backbone(env_obs["states"])
+        obs_tensor = self._get_obs(env_obs)
+        feat = self.backbone(obs_tensor)
         action_mean = self.actor_mean(feat)
 
         if self.independent_std:
@@ -225,13 +240,13 @@ class MLPPolicy(BasePolicy):
         chunk_actions = chunk_actions.cpu().numpy()
 
         if hasattr(self, "value_head") and calulate_values:
-            chunk_values = self.value_head(env_obs["states"])
+            chunk_values = self.value_head(obs_tensor)
         else:
             chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
 
         forward_inputs = {"action": action}
         if return_obs:
-            forward_inputs["obs"] = env_obs["states"]
+            forward_inputs["obs"] = obs_tensor
 
         result = {
             "prev_logprobs": chunk_logprobs,
@@ -241,7 +256,8 @@ class MLPPolicy(BasePolicy):
         return chunk_actions, result
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
-        return self.q_head(obs["states"], actions)
+        obs_tensor = self._get_obs(obs)
+        return self.q_head(obs_tensor, actions)
 
     def crossq_q_forward(
         self,
@@ -252,10 +268,12 @@ class MLPPolicy(BasePolicy):
         shared_feature=None,
         detach_encoder=False,
     ):
+        obs_tensor = self._get_obs(obs)
+        next_obs_tensor = self._get_obs(next_obs) if next_obs is not None else None
         return self.q_head(
-            obs["states"],
+            obs_tensor,
             actions,
-            next_state_features=next_obs["states"] if next_obs is not None else None,
+            next_state_features=next_obs_tensor,
             next_action_features=next_actions,
         )
 

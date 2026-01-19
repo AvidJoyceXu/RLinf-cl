@@ -1,10 +1,12 @@
 defaults:
-  - env/libero_spatial@env.train
-  - env/libero_spatial@env.eval
-  - model/residual_policy@actor.model
+  - env/libero_spatial_task0@env.train
+  - env/libero_spatial_task0@env.eval
+  - model/lora_residual_policy@actor.model
   - model/openvla_oft@actor.base_model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
+
+# env will be override later 
 
 hydra:
   run:
@@ -16,25 +18,26 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0  # Use only GPU 0 for debugging
+    actor,env,rollout: all
 
-runner:
+runner: 
+  eval_policy_path: "/workspace/RLinf/logs/20260117-15:07:09-libero_spatial_task3_lora_residual_sac_openvlaoft/libero_spatial_task3_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model"
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_residual_sac_openvlaoft"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    experiment_name: "libero_spatial_task3_no_offload_rand_trials_lora_residual_sac_openvlaoft"
+    logger_backends: ["wandb"] # wandb, swanlab
 
-  max_epochs: 8000
+  max_epochs: 20000
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 200
-  save_interval: -1
+  val_check_interval: 100
+  save_interval: 1000
 
 algorithm:
-  update_epoch: 32
+  update_epoch: 64  # 每个global step更新64次
   use_fixed_reset_state_ids: False
   group_size: 1
   agg_q: min
@@ -55,7 +58,7 @@ algorithm:
   target_entropy: -7  # Target entropy (-action_dim for LIBERO: -7)
   alpha_lr: 3.0e-4  # Learning rate for temperature parameter
   
-  q_head_type: "crossq"  # Use CrossQ head for improved Q-value estimation with BatchRenorm
+  q_head_type: "default" 
   critic_actor_ratio: 2  # Update critic 2 times per actor update for better Q-value learning
   
   # Replay buffer settings
@@ -85,36 +88,46 @@ residual_policy:
   enabled: True
   base_model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"  # Path to pre-trained OpenVLA-OFT model
   res_scale: 0.05  # Scaling factor for residual action
-  prog_explore: 1000  # Progressive exploration steps
-  prog_explore_threshold: 10  # Threshold for progressive exploration
+  prog_explore: 500 # Progressive exploration steps
+  prog_explore_threshold: 100  # Threshold for progressive exploration
 
 # Network Configuration
-network:
+network: # NOTE: 和libero-sac对齐
   actor_input: "obs"  # ["obs", "obs_base_action"] - Input mode for residual policy
-  critic_input: "res"  # ["res", "sum", "concat"] - Action construction mode for Q network
+  critic_input: "sum"  # ["res", "sum", "concat"] - Action construction mode for Q network
 
 env:
   group_name: "EnvGroup"
-  enable_offload: False  # Disabled for better performance with multi-GPU
+  enable_offload: False # NOTE: RuntimeError: Environment class LiberoEnv does not support offload
 
   # Override the default values in env/libero_spatial
+  # Target: 4:1 ratio (transitions collected : network updates)
+  # Calculation: transitions = total_num_envs * num_action_chunks * n_chunk_steps
+  #              where n_chunk_steps = max_steps_per_rollout_epoch / num_action_chunks
+  # Current config: 32 envs * 8 chunks * 1 step = 256 transitions per global step
+  #                 update_epoch = 64
+  #                 Ratio: 256 / 64 = 4:1 ✓
+  # Note: max_steps_per_rollout_epoch must be divisible by num_action_chunks (8)
+  # Alternative: For longer rollouts, use total_num_envs=64, max_steps_per_rollout_epoch=16, update_epoch=256
   train:
-    total_num_envs: 32  # Increased for better sample efficiency and GPU utilization
+    specific_reset_id: 3
+    total_num_envs: 32  # Adjusted to achieve 4:1 ratio (256 transitions per global step)
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False
-    max_episode_steps: 512  # max episode steps for truncation
-    max_steps_per_rollout_epoch: 512  # Keep full episode length for LIBERO spatial tasks
+    max_episode_steps: 240  # max episode steps for truncation
+    max_steps_per_rollout_epoch: 16  # NOTE: n_chunk_steps = max_steps_per_rollout_epoch / num_action_chunks
     group_size: ${algorithm.group_size}
     reward_coef: 5.0
     reset_gripper_open: False
   
   eval:
-    total_num_envs: 16  # Increased for more comprehensive evaluation (must be divisible by env_world_size)
+    specific_reset_id: 3
+    total_num_envs: 32 # Increased for more comprehensive evaluation (must be divisible by env_world_size)
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 512
-    max_steps_per_rollout_epoch: 512
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
     use_fixed_reset_state_ids: True
     group_size: 1
     reset_gripper_open: False
@@ -127,7 +140,7 @@ rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
   model_dir: ""
-  enable_offload: False  # Disabled for better performance with multi-GPU and FSDP
+  enable_offload: False 
   pipeline_stage_num: 1
 
   model:
@@ -138,8 +151,9 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
 
-  micro_batch_size: 1024  # Increased for better GPU utilization and training stability
-  global_batch_size: 1024  # Increased for better sample efficiency
+  # Aligned with target config: batch_size=256 per update
+  micro_batch_size: 64  # Aligned with target batch_size=256
+  global_batch_size: 1024  # Aligned with target batch_size=256
   seed: 1234
   enable_offload: False  # Disabled for better performance with FSDP full_shard
   model:
@@ -148,10 +162,10 @@ actor:
     action_dim: 7  
     num_action_chunks: 8
     
-    precision: "32"
+    precision: "bf16"
     add_value_head: False
     add_q_head: True
-    q_head_type: "default"  # Use CrossQ head for improved Q-value estimation with BatchRenorm
+    q_head_type: "default" 
     
     # Residual policy specific config
     actor_input: ${network.actor_input}  # Pass through from network config
@@ -188,4 +202,3 @@ reward:
 
 critic:
   use_critic_model: False
-

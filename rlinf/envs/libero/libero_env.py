@@ -53,6 +53,7 @@ class LiberoEnv(gym.Env):
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.specific_reset_id = cfg.get("specific_reset_id", None)
+        self.max_trials_per_task = cfg.get("max_trials_per_task", None)
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -146,10 +147,17 @@ class LiberoEnv(gym.Env):
         )
 
     def _get_random_reset_state_ids(self, num_reset_states):
-        if self.specific_reset_id is not None:
-            reset_state_ids = self.specific_reset_id * np.ones(
-                (num_reset_states,), dtype=int
+        if self.specific_reset_id is not None: # NOTE：task_id指定为specific_reset_id, trial_id随机选择
+            task_id = self.specific_reset_id
+            num_trials = self.trial_id_bins[task_id]
+            # 如果设置了max_trials_per_task，限制trial选择范围
+            if self.max_trials_per_task is not None:
+                num_trials = min(num_trials, self.max_trials_per_task)
+            trial_ids = self._generator.integers(
+                low=0, high=num_trials, size=(num_reset_states,)
             )
+            start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+            reset_state_ids = start_pivot + trial_ids
         else:
             reset_state_ids = self._generator.integers(
                 low=0, high=self.total_num_group_envs, size=(num_reset_states,)
@@ -157,7 +165,14 @@ class LiberoEnv(gym.Env):
         return reset_state_ids
 
     def get_reset_state_ids_all(self):
-        reset_state_ids = np.arange(self.total_num_group_envs)
+        # 如果指定了task和max_trials_per_task，只包含该task的前N个trials
+        if self.specific_reset_id is not None and self.max_trials_per_task is not None:
+            task_id = self.specific_reset_id
+            num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
+            start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+            reset_state_ids = np.arange(start_pivot, start_pivot + num_trials)
+        else:
+            reset_state_ids = np.arange(self.total_num_group_envs)
         valid_size = len(reset_state_ids) - (
             len(reset_state_ids) % self.total_num_processes
         )
@@ -168,9 +183,18 @@ class LiberoEnv(gym.Env):
 
     def _get_ordered_reset_state_ids(self, num_reset_states):
         if self.specific_reset_id is not None:
-            reset_state_ids = self.specific_reset_id * np.ones(
-                (self.num_group,), dtype=int
-            )
+            # 如果设置了max_trials_per_task，从该task的前N个trials中按顺序选择
+            if self.max_trials_per_task is not None:
+                task_id = self.specific_reset_id
+                num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
+                start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                # 按顺序选择trials，循环使用
+                trial_ids = np.arange(num_reset_states) % num_trials
+                reset_state_ids = start_pivot + trial_ids
+            else:
+                reset_state_ids = self.specific_reset_id * np.ones(
+                    (self.num_group,), dtype=int
+                )
         else:
             if self.start_idx + num_reset_states > len(self.reset_state_ids_all[0]):
                 self.reset_state_ids_all = self.get_reset_state_ids_all()
@@ -193,7 +217,6 @@ class LiberoEnv(gym.Env):
                     trial_ids.append(reset_state_id - start_pivot)
                     break
                 start_pivot = end_pivot
-
         return np.array(task_ids), np.array(trial_ids)
 
     def _get_reset_states(self, env_idx):
@@ -333,7 +356,7 @@ class LiberoEnv(gym.Env):
             [value.clone() for value in images_and_states["wrist_image"]]
         )
 
-        robot_proprio_states = to_tensor(np.stack([r["robot_proprio_state"] for r in rl_obs_list]))
+        robot_proprio_states = to_tensor(np.stack([r["robot_proprio_state"] for r in rl_obs_list])) # [num_envs, robot_proprio_state_dim]
         object_to_robot_relations = to_tensor(np.stack([r["object_to_robot_relations"] for r in rl_obs_list]))
 
         states = images_and_states["state"]

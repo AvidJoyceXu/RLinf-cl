@@ -14,8 +14,11 @@
 
 import copy
 import gc
+import glob
+import os
 from typing import Any
 
+import safetensors.torch
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
@@ -63,7 +66,39 @@ class MultiStepRolloutWorker(Worker):
             self.offload_model()
 
     def load_checkpoint(self, load_path):
-        model_dict = torch.load(load_path)
+        """
+        Load checkpoint from either a file (.pt/.pth) or a directory containing safetensors files.
+        
+        Args:
+            load_path: Path to checkpoint file or directory containing safetensors files.
+                      If directory, will look for *.safetensors files or huggingface_model subdirectory.
+                      For FSDP checkpoints, can point to checkpoint directory (will find actor/huggingface_model).
+        """
+        if os.path.isdir(load_path):
+            # Check if there's a huggingface_model subdirectory
+            hf_model_dir = os.path.join(load_path, "huggingface_model")
+            if os.path.isdir(hf_model_dir):
+                load_path = hf_model_dir
+            else:
+                # Check if there's an actor/huggingface_model subdirectory (FSDP checkpoint structure)
+                actor_hf_model_dir = os.path.join(load_path, "actor", "huggingface_model")
+                if os.path.isdir(actor_hf_model_dir):
+                    load_path = actor_hf_model_dir
+            
+            # Load from safetensors files in the directory
+            safetensor_files = sorted(glob.glob(os.path.join(load_path, "*.safetensors")))
+            if safetensor_files:
+                model_dict = {}
+                for safetensor_file in safetensor_files:
+                    model_dict.update(safetensors.torch.load_file(safetensor_file))
+            else:
+                raise FileNotFoundError(
+                    f"No safetensors files found in checkpoint directory: {load_path}"
+                )
+        else:
+            # Load from a single file (.pt/.pth)
+            model_dict = torch.load(load_path)
+        
         self.hf_model.load_state_dict(model_dict)
 
     def setup_sample_params(self):

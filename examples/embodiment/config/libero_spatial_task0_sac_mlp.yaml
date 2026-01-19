@@ -1,6 +1,6 @@
 defaults:
-  - env/maniskill_pick_cube@env.train
-  - env/maniskill_pick_cube@env.eval
+  - env/libero_spatial_task0@env.train
+  - env/libero_spatial_task0@env.eval
   - model/mlp_policy@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
@@ -22,10 +22,10 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "sac_mlp_maniskill"
+    experiment_name: "sac_mlp_libero_spatial_task0"
     logger_backends: ["wandb"] # wandb, swanlab
 
-  max_epochs: 8000
+  max_epochs: 20000
   max_steps: -1
 
   only_eval: False
@@ -51,7 +51,7 @@ algorithm:
   auto_entropy_tuning: True  # Enable automatic entropy tuning
   alpha_type: softplus
   initial_alpha: 0.01  # Initial temperature value
-  target_entropy: -4  # Target entropy (-action_dim)
+  target_entropy: -7  # Target entropy (-action_dim)
   alpha_lr: 3.0e-4  # Learning rate for temperature parameter
   
   # Replay buffer settings
@@ -83,15 +83,15 @@ env:
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False
-    max_episode_steps: 50 # max episode steps for truncation
-    max_steps_per_rollout_epoch: 2
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
   
   eval:
     total_num_envs: 16
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 50
-    max_steps_per_rollout_epoch: 50
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
     use_fixed_reset_state_ids: True
     group_size: 1
     video_cfg:
@@ -107,6 +107,8 @@ rollout:
 
   model:
     model_path: ""
+    obs_dim: 74
+    action_dim: 7
     precision: ${actor.model.precision}
 
 actor:
@@ -121,8 +123,8 @@ actor:
   model:
     model_name: "mlp_policy"
     policy_setup: "panda-ee-dpos"
-    action_dim: 4
-    
+    obs_dim: 74
+    action_dim: 7
     precision: "32"
     add_value_head: False
     add_q_head: True

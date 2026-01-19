@@ -14,6 +14,7 @@
 
 import math
 
+import numpy as np
 import torch
 import torch.distributed
 
@@ -96,6 +97,32 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
             "returns_min": -min_ret,
         }
         rollout_metrics.update(returns_metrics)
+
+    # Compute residual policy metrics if available
+    if "res_norm_ratio" in data_buffer and data_buffer["res_norm_ratio"] is not None:
+        # res_norm_ratio is now a tensor [n_steps, B], flatten and compute mean
+        res_norm_ratio_tensor = data_buffer["res_norm_ratio"].clone()  # [n_steps, B]
+        res_norm_ratio_flat = res_norm_ratio_tensor.flatten()  # [n_steps * B]
+        mean_res_norm_ratio = torch.mean(res_norm_ratio_flat).to(torch.cuda.current_device())
+        torch.distributed.all_reduce(mean_res_norm_ratio, op=torch.distributed.ReduceOp.AVG)
+        
+        rollout_metrics["res_norm_ratio_mean"] = mean_res_norm_ratio.item()
+    
+    if "res_norm_ratio_enabled" in data_buffer and data_buffer["res_norm_ratio_enabled"] is not None:
+        # res_norm_ratio_enabled is now a tensor [n_steps, 1], compute mean
+        res_norm_ratio_enabled_tensor = data_buffer["res_norm_ratio_enabled"].clone()  # [n_steps, 1]
+        mean_res_norm_ratio_enabled = torch.mean(res_norm_ratio_enabled_tensor).to(torch.cuda.current_device())
+        torch.distributed.all_reduce(mean_res_norm_ratio_enabled, op=torch.distributed.ReduceOp.AVG)
+        
+        rollout_metrics["res_norm_ratio_enabled_mean"] = mean_res_norm_ratio_enabled.item()
+    
+    if "res_enabled_ratio" in data_buffer and data_buffer["res_enabled_ratio"] is not None:
+        # res_enabled_ratio is now a tensor [n_steps, 1], compute mean
+        res_enabled_ratio_tensor = data_buffer["res_enabled_ratio"].clone()  # [n_steps, 1]
+        mean_res_enabled_ratio = torch.mean(res_enabled_ratio_tensor).to(torch.cuda.current_device())
+        torch.distributed.all_reduce(mean_res_enabled_ratio, op=torch.distributed.ReduceOp.AVG)
+        
+        rollout_metrics["res_enabled_ratio_mean"] = mean_res_enabled_ratio.item()
 
     return rollout_metrics
 

@@ -227,11 +227,21 @@ class SACReplayBuffer:
         Handles flattening [T, B, ...] -> [T*B, ...] and circular insertion.
         """
         # 1. Flatten the batch: [n-chunk-steps, actor-bsz, ...] -> [num_samples, ...]
+        # Create a copy to avoid modifying the original rollout_batch (needed for metrics computation)
+        rollout_batch = rollout_batch.copy()
 
+        # Remove fields that are only for logging/metrics, not needed for replay buffer
         if "prev_logprobs" in rollout_batch:
             rollout_batch.pop("prev_logprobs")
         if "prev_values" in rollout_batch:
             rollout_batch.pop("prev_values")
+        # Remove residual policy metrics (only for logging)
+        if "res_norm_ratio" in rollout_batch:
+            rollout_batch.pop("res_norm_ratio")
+        if "res_norm_ratio_enabled" in rollout_batch:
+            rollout_batch.pop("res_norm_ratio_enabled")
+        if "res_enabled_ratio" in rollout_batch:
+            rollout_batch.pop("res_enabled_ratio")
 
         if extra_preprocess:
             flattened_batch, num_to_add = self._preprocess_rollout_batch(rollout_batch)

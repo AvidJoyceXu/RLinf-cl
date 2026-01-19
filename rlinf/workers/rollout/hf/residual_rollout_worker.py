@@ -165,6 +165,7 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             SupportedModel.GR00T,
             SupportedModel.CNN_POLICY,
             SupportedModel.RESIDUAL_POLICY,
+            SupportedModel.LORA_RESIDUAL_POLICY,
         ]:
             kwargs = {"mode": mode}
         
@@ -202,6 +203,26 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         final_actions = base_actions_tensor + self.res_scale * residual_actions_tensor
         final_actions_np = final_actions.cpu().numpy()
         
+        # Compute residual action metrics for logging
+        # 1. Residual action norm ratio (contribution to final action)
+        res_norm = torch.norm(residual_actions_tensor.reshape(B, -1), dim=1)  # [B]
+        base_norm = torch.norm(base_actions_flat, dim=1)  # [B]
+        res_norm_ratio = res_norm / (base_norm + 1e-8)  # [B]
+        
+        # 2. Residual action enabled ratio (probability of enabling residual)
+        if mode == "train":
+            res_enabled_ratio = enable_res_masks.astype(np.float32).mean()  # scalar
+        else:
+            res_enabled_ratio = 1.0  # Always enabled in eval
+        
+        # 3. Residual norm ratio for enabled samples only
+        if mode == "train" and np.any(enable_res_masks):
+            enabled_res_norm = res_norm[torch.from_numpy(enable_res_masks).to(self.device)]
+            enabled_base_norm = base_norm[torch.from_numpy(enable_res_masks).to(self.device)]
+            res_norm_ratio_enabled = (enabled_res_norm / (enabled_base_norm + 1e-8)).mean().item()
+        else:
+            res_norm_ratio_enabled = res_norm_ratio.mean().item() if mode == "eval" else 0.0
+        
         # Prepare forward_inputs based on critic_input mode
         forward_inputs = residual_result["forward_inputs"].copy()
         
@@ -210,17 +231,19 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             # Only store residual action
             forward_inputs["action"] = residual_result["forward_inputs"]["action"]
         else:
-            # Store [residual_action, base_action, base_next_action]
-            # Note: base_next_action will be computed in the next step
             forward_inputs["residual_action"] = residual_result["forward_inputs"]["action"]
             forward_inputs["base_action"] = base_actions_flat.cpu()
-            # base_next_action will be added later when we have next_obs
+            # TODO: base_next_action will be added later when we have next_obs
         
         # Use residual policy's logprobs and values
         result = {
             "prev_logprobs": residual_result["prev_logprobs"],
             "prev_values": residual_result["prev_values"],
             "forward_inputs": forward_inputs,
+            # Add residual metrics for logging
+            "res_norm_ratio": res_norm_ratio.cpu(),  # [B] tensor
+            "res_norm_ratio_enabled": res_norm_ratio_enabled,  # scalar
+            "res_enabled_ratio": res_enabled_ratio,  # scalar
         }
         
         return final_actions_np, result
@@ -354,34 +377,15 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                         raw_env_obs=env_output["obs"]  # Raw obs with task_descriptions for base model
                     )
                     
-                    # Compute base_next_action if needed for storage
-                    # Use current step's env_output["obs"] as next step's raw observation for base model
-                    # base_next_action should be added to last_forward_inputs (previous step's forward_inputs)
-                    if self.use_residual and self.critic_input != "res" and env_output["obs"] is not None:
-                        # Prepare sampling parameters for base model (use train params for next action prediction)
-                        next_base_kwargs = self._train_sampling_params.copy()
-                        next_base_kwargs["calulate_logprobs"] = False
-                        next_base_kwargs["calulate_values"] = False
-                        next_base_kwargs["return_obs"] = False
-                        
-                        with torch.no_grad():
-                            # Use raw env_output["obs"] (with task_descriptions, images) for base model
-                            next_base_chunk_actions, _ = self.base_model.predict_action_batch(
-                                env_obs=env_output["obs"],
-                                **next_base_kwargs,
-                            )
-                            next_base_actions_tensor = torch.from_numpy(next_base_chunk_actions).to(self.device)
-                            B, num_chunks, action_dim = next_base_actions_tensor.shape
-                            next_base_actions_flat = next_base_actions_tensor.reshape(B, -1)
-                            
-                            # Add base_next_action to last_forward_inputs (previous step's forward_inputs)
-                            if last_forward_inputs[stage_id] is not None and "base_action" in last_forward_inputs[stage_id]:
-                                last_forward_inputs[stage_id]["base_next_action"] = next_base_actions_flat.cpu()
+                    # NOTE: base_next_action should be added to last_forward_inputs (previous step's forward_inputs)
+                    if last_forward_inputs[stage_id] is not None and self.use_residual and self.critic_input != "res":
+                        last_forward_inputs[stage_id]["base_next_action"] = result["forward_inputs"]["base_action"] 
                     
-                    # Use forward_inputs from last step (same as huggingface_worker.py)
-                    # This ensures the first step (reset step) doesn't store forward_inputs,
-                    # which matches the removal of first step's dones/truncations/terminations
                     forward_inputs_to_store = last_forward_inputs[stage_id]
+                    
+                    res_norm_ratio = result.get("res_norm_ratio", None)
+                    res_norm_ratio_enabled = result.get("res_norm_ratio_enabled", None)
+                    res_enabled_ratio = result.get("res_enabled_ratio", None)
                     
                     chunk_step_result = ChunkStepResult(
                         prev_logprobs=result["prev_logprobs"],
@@ -392,7 +396,17 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                         rewards=rewards,
                         forward_inputs=forward_inputs_to_store,
                     )
+                    
+                    # Add residual metrics to chunk_step_result if available
+                    if res_norm_ratio is not None:
+                        chunk_step_result.res_norm_ratio = res_norm_ratio
+                    if res_norm_ratio_enabled is not None:
+                        chunk_step_result.res_norm_ratio_enabled = res_norm_ratio_enabled
+                    if res_enabled_ratio is not None:
+                        chunk_step_result.res_enabled_ratio = res_enabled_ratio
+
                     self.buffer_list[stage_id].append_result(chunk_step_result)
+                    
                     if last_extracted_obs[stage_id] is not None and hasattr(
                         self.hf_model, "q_head"
                     ):
@@ -417,6 +431,21 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                 dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                     env_output, extracted_obs
                 )
+                
+                # For residual policy, predict() needs raw env_output["obs"] (with task_descriptions) for base model
+                # NOTE: Call predict() BEFORE appending last_forward_inputs to buffer, so we can add base_next_action
+                actions, result = self.predict(
+                    env_obs=extracted_obs,
+                    mode="train",
+                    global_step=self.global_step,
+                    raw_env_obs=env_output["obs"]  # Raw obs with task_descriptions for base model
+                )
+                
+                # NOTE: Add base_next_action to last_forward_inputs (previous step's forward_inputs) if needed
+                # This ensures consistency with normal step handling
+                if last_forward_inputs[stage_id] is not None and self.use_residual and self.critic_input != "res":
+                    last_forward_inputs[stage_id]["base_next_action"] = result["forward_inputs"]["base_action"]
+                
                 self.buffer_list[stage_id].dones.append(dones)
                 self.buffer_list[stage_id].truncations.append(env_output["truncations"])
                 self.buffer_list[stage_id].terminations.append(
@@ -426,14 +455,7 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                 self.buffer_list[stage_id].forward_inputs.append(
                     put_tensor_device(last_forward_inputs[stage_id], "cpu")
                 )
-
-                # For residual policy, predict() needs raw env_output["obs"] (with task_descriptions) for base model
-                actions, result = self.predict(
-                    env_obs=extracted_obs,
-                    mode="train",
-                    global_step=self.global_step,
-                    raw_env_obs=env_output["obs"]  # Raw obs with task_descriptions for base model
-                )
+                
                 if "prev_values" in result:
                     self.buffer_list[stage_id].prev_values.append(
                         result["prev_values"].cpu().contiguous()

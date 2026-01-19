@@ -1213,10 +1213,10 @@ class EnvOutput:
         task_descriptions = (
             list(obs["task_descriptions"]) if "task_descriptions" in obs else None
         )
-        robot_proprio_state = obs["robot_proprio_state"]
-        object_to_robot_relations = obs["object_to_robot_relations"]
+        robot_proprio_state = obs["robot_proprio_state"] if "robot_proprio_state" in obs else None
+        object_to_robot_relations = obs["object_to_robot_relations"] if "object_to_robot_relations" in obs else None
 
-        rl_flatten_obs = torch.cat([robot_proprio_state, object_to_robot_relations], dim=-1)
+        rl_flatten_obs = torch.cat([robot_proprio_state, object_to_robot_relations], dim=-1) if robot_proprio_state is not None and object_to_robot_relations is not None else None
 
         return {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
@@ -1256,6 +1256,11 @@ class ChunkStepResult:
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
+    
+    # Optional: residual policy metrics for logging
+    res_norm_ratio: torch.Tensor = None  # [B] - residual action norm / base action norm
+    res_norm_ratio_enabled: float = None  # scalar - res_norm_ratio for enabled samples only
+    res_enabled_ratio: float = None  # scalar - probability of enabling residual action
 
     def __post_init__(self):
         if self.prev_logprobs is not None:
@@ -1272,6 +1277,8 @@ class ChunkStepResult:
             self.rewards = self.rewards.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
+        if self.res_norm_ratio is not None:
+            self.res_norm_ratio = self.res_norm_ratio.cpu().contiguous()
 
 
 @dataclass(kw_only=True)
@@ -1302,6 +1309,16 @@ class EmbodiedRolloutResult:
     transitions: list[tuple[dict[str, Any], dict[str, Any]]] = field(
         default_factory=list
     )
+    # Optional: residual policy metrics for logging
+    res_norm_ratio: list[torch.Tensor] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * n_chunk_steps
+    res_norm_ratio_enabled: list[float] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * n_chunk_steps
+    res_enabled_ratio: list[float] = field(
+        default_factory=list
+    )  # lens of results is rollout_epoch * n_chunk_steps
 
     def append_result(self, result: ChunkStepResult):
         if result.prev_logprobs is not None:
@@ -1318,6 +1335,13 @@ class EmbodiedRolloutResult:
             self.rewards.append(result.rewards)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        # Add residual metrics if available
+        if hasattr(result, 'res_norm_ratio') and result.res_norm_ratio is not None:
+            self.res_norm_ratio.append(result.res_norm_ratio)
+        if hasattr(result, 'res_norm_ratio_enabled') and result.res_norm_ratio_enabled is not None:
+            self.res_norm_ratio_enabled.append(result.res_norm_ratio_enabled)
+        if hasattr(result, 'res_enabled_ratio') and result.res_enabled_ratio is not None:
+            self.res_enabled_ratio.append(result.res_enabled_ratio)
 
     def add_transition(self, obs, next_obs):
         self.transitions.append(
@@ -1371,6 +1395,25 @@ class EmbodiedRolloutResult:
                 "prev_values",
             ]
             rollout_result_dict[k] = merged_forward_inputs[k]
+
+        # Add residual metrics if available
+        # Convert to tensors for split_dict_to_chunk compatibility
+        if len(self.res_norm_ratio) > 0:
+            # res_norm_ratio is a list of tensors [B], stack them along dim=0
+            # Each tensor has shape [B], stacking gives [n_steps, B]
+            rollout_result_dict["res_norm_ratio"] = torch.stack(self.res_norm_ratio, dim=0).cpu().contiguous()
+        if len(self.res_norm_ratio_enabled) > 0:
+            # res_norm_ratio_enabled is a list of scalars, convert to tensor [n_steps, 1]
+            # Expand to 2D for split_dict_to_chunk compatibility (dim=1 splitting)
+            rollout_result_dict["res_norm_ratio_enabled"] = torch.tensor(
+                self.res_norm_ratio_enabled, dtype=torch.float32
+            ).unsqueeze(1).cpu().contiguous()  # [n_steps] -> [n_steps, 1]
+        if len(self.res_enabled_ratio) > 0:
+            # res_enabled_ratio is a list of scalars, convert to tensor [n_steps, 1]
+            # Expand to 2D for split_dict_to_chunk compatibility (dim=1 splitting)
+            rollout_result_dict["res_enabled_ratio"] = torch.tensor(
+                self.res_enabled_ratio, dtype=torch.float32
+            ).unsqueeze(1).cpu().contiguous()  # [n_steps] -> [n_steps, 1]
 
         transition_dict = stack_list_of_dict_tensor(self.transitions)
         if len(transition_dict) > 0:
