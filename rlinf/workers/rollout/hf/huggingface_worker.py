@@ -101,7 +101,7 @@ class MultiStepRolloutWorker(Worker):
         
         # Use strict=False to allow missing keys (e.g., q_head may not be in merged checkpoints)
         # This is safe because q_head is only used during training, not during eval
-        self.hf_model.load_state_dict(model_dict, strict=False)
+        self.hf_model.load_state_dict(model_dict)
 
     def setup_sample_params(self):
         # length parameters for rollout

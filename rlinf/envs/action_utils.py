@@ -63,14 +63,32 @@ def prepare_actions_for_maniskill(
 def prepare_actions_for_libero(
     raw_chunk_actions,
     model_type,
+    base_model_type=None,
 ) -> np.ndarray:
     chunk_actions = raw_chunk_actions
-    if SupportedModel(model_type) in [
-        SupportedModel.OPENVLA,
-        SupportedModel.OPENVLA_OFT,
+    # Determine if base model is OpenVLA/OpenVLA-OFT
+    # For residual policies, check base_model_type instead of model_type
+    model_type_enum = SupportedModel(model_type)
+    is_residual_policy = model_type_enum in [
         SupportedModel.RESIDUAL_POLICY,
         SupportedModel.LORA_RESIDUAL_POLICY,
-    ]:
+    ]
+    
+    if is_residual_policy and base_model_type is not None:
+        # For residual policy, check base_model_type
+        base_model_type_enum = SupportedModel(base_model_type)
+        is_openvla_model = base_model_type_enum in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]
+    else:
+        # For non-residual policies, check model_type directly
+        is_openvla_model = model_type_enum in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]
+    
+    if is_openvla_model:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
     return chunk_actions
@@ -79,18 +97,36 @@ def prepare_actions_for_libero(
 def prepare_actions_for_isaaclab(
     raw_chunk_actions,
     model_type,
+    base_model_type=None,
 ) -> torch.Tensor:
     """
     Here reture a general 7 dof action. If the action is modified, please change the output of the model
     For example, in `RLinf/rlinf/models/embodiment/gr00t/simulation_io.py`
     """
     chunk_actions = torch.from_numpy(raw_chunk_actions)
-    if SupportedModel(model_type) in [
-        SupportedModel.OPENVLA,
-        SupportedModel.OPENVLA_OFT,
+    # Determine if base model is OpenVLA/OpenVLA-OFT
+    # For residual policies, check base_model_type instead of model_type
+    model_type_enum = SupportedModel(model_type)
+    is_residual_policy = model_type_enum in [
         SupportedModel.RESIDUAL_POLICY,
         SupportedModel.LORA_RESIDUAL_POLICY,
-    ]:
+    ]
+    
+    if is_residual_policy and base_model_type is not None:
+        # For residual policy, check base_model_type
+        base_model_type_enum = SupportedModel(base_model_type)
+        is_openvla_model = base_model_type_enum in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]
+    else:
+        # For non-residual policies, check model_type directly
+        is_openvla_model = model_type_enum in [
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ]
+    
+    if is_openvla_model:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = torch.sign(chunk_actions[..., -1]) * -1.0
     return chunk_actions
@@ -150,11 +186,13 @@ def prepare_actions(
     action_dim,
     action_scale: float = 1.0,
     policy: str = "widowx_bridge",
+    base_model_type: str = None,
 ) -> torch.Tensor | np.ndarray:
     if env_type == "libero":
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
+            base_model_type=base_model_type,
         )
     elif env_type == "maniskill":
         chunk_actions = prepare_actions_for_maniskill(
@@ -178,6 +216,7 @@ def prepare_actions(
         chunk_actions = prepare_actions_for_isaaclab(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
+            base_model_type=base_model_type,
         )
     elif env_type == "robocasa":
         chunk_actions = prepare_actions_for_robocasa(

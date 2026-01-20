@@ -39,11 +39,18 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     )
     from rlinf.models.embodiment.gr00t.utils import replace_dropout_with_identity
 
-    if cfg.embodiment_tag == "libero_franka":
+    # Map RLinf tags to n1d6 tags
+    from rlinf.models.embodiment.gr00t.embodiment_tags import get_embodiment_tag, map_rlinf_tag_to_n1d6
+    
+    # Get the n1d6 embodiment tag
+    n1d6_tag = map_rlinf_tag_to_n1d6(cfg.embodiment_tag)
+    embodiment_tag_enum = get_embodiment_tag(cfg.embodiment_tag)
+    
+    if cfg.embodiment_tag == "libero_franka" or n1d6_tag == "libero_panda":
         data_config = load_data_config(
             "rlinf.models.embodiment.gr00t.modality_config:LiberoFrankaDataConfig"
         )
-    elif cfg.embodiment_tag == "maniskill_widowx":
+    elif cfg.embodiment_tag == "maniskill_widowx" or n1d6_tag == "oxe_widowx":
         data_config = load_data_config(
             "rlinf.models.embodiment.gr00t.modality_config:ManiskillWidowXDataConfig"
         )
@@ -61,7 +68,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
     model = GR00T_N1_5_ForRLActionPrediction.from_pretrained(
         model_path,
         torch_dtype=torch_dtype,
-        embodiment_tag=cfg.embodiment_tag,  # This tag determines the state encoder and action head to use
+        embodiment_tag=embodiment_tag_enum,  # Use the mapped n1d6 tag enum
         modality_config=modality_config,
         modality_transform=modality_transform,
         denoising_steps=cfg.denoising_steps,

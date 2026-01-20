@@ -6,6 +6,8 @@ defaults:
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
+# env will be override later 
+
 hydra:
   run:
     dir: .
@@ -18,14 +20,13 @@ cluster:
   component_placement:
     actor,env,rollout: all
 
-runner:
-  eval_policy_path: "/workspace/RLinf/merged_policy_dir"
-  # eval_policy_path: "/workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model"
+runner: 
+  eval_policy_path: "/workspace/RLinf/logs/20260118-16:23:55-libero_spatial_task3_lora_residual_sac_openvlaoft/libero_spatial_task3_no_offload_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_6000/actor/huggingface_model"
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft"
+    experiment_name: "task8_single_trial_residual_sac_openvlaoft"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 20000
@@ -109,7 +110,9 @@ env:
   # Note: max_steps_per_rollout_epoch must be divisible by num_action_chunks (8)
   # Alternative: For longer rollouts, use total_num_envs=64, max_steps_per_rollout_epoch=16, update_epoch=256
   train:
-    total_num_envs: 32 # Adjusted to achieve 4:1 ratio (256 transitions per global step)
+    specific_reset_id: 8
+    max_trials_per_task: 1
+    total_num_envs: 32  # Adjusted to achieve 4:1 ratio (256 transitions per global step)
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False
@@ -120,6 +123,8 @@ env:
     reset_gripper_open: False
   
   eval:
+    specific_reset_id: 8
+    max_trials_per_task: 1
     total_num_envs: 32 # Increased for more comprehensive evaluation (must be divisible by env_world_size)
     auto_reset: True
     ignore_terminations: True
@@ -137,7 +142,7 @@ rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
   model_dir: ""
-  enable_offload: False  # Enabled to save GPU memory for environments (32 envs need ~17G)
+  enable_offload: False 
   pipeline_stage_num: 1
 
   model:
@@ -149,7 +154,7 @@ actor:
   training_backend: "fsdp"
 
   # Aligned with target config: batch_size=256 per update
-  micro_batch_size: 64 # Aligned with target batch_size=256
+  micro_batch_size: 64  # Aligned with target batch_size=256
   global_batch_size: 1024  # Aligned with target batch_size=256
   seed: 1234
   enable_offload: False  # Disabled for better performance with FSDP full_shard
@@ -199,4 +204,3 @@ reward:
 
 critic:
   use_critic_model: False
-

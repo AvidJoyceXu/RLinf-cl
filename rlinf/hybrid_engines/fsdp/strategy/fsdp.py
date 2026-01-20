@@ -65,12 +65,38 @@ class FSDPStrategy(FSDPStrategyBase):
             self.cfg.fsdp_config.sharding_strategy
         )
 
+        # Determine if base model is OpenVLA/OpenVLA-OFT
+        # For residual policies, check base_model.model_type instead of model.model_type
+        model_type = SupportedModel(self.cfg.model.model_type)
+        is_residual_policy = model_type in [
+            SupportedModel.RESIDUAL_POLICY,
+            SupportedModel.LORA_RESIDUAL_POLICY,
+        ]
+        
+        if is_residual_policy:
+            # For residual policy, check base_model.model_type
+            base_model_type = self.cfg.model.get("base_model", {}).get("model_type", None)
+            if base_model_type is not None:
+                base_model_type_enum = SupportedModel(base_model_type)
+                is_openvla_model = base_model_type_enum in [
+                    SupportedModel.OPENVLA,
+                    SupportedModel.OPENVLA_OFT,
+                ]
+            else:
+                # Fallback: if base_model is not configured, default to False
+                is_openvla_model = False
+        else:
+            # For non-residual policies, check model.model_type directly
+            is_openvla_model = model_type in [
+                SupportedModel.OPENVLA,
+                SupportedModel.OPENVLA_OFT,
+            ]
+        
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=model,
             config=None,
             is_lora=self.cfg.model.is_lora,
-            is_openvla_model=SupportedModel(self.cfg.model.model_type)
-            in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT, SupportedModel.RESIDUAL_POLICY, SupportedModel.LORA_RESIDUAL_POLICY],
+            is_openvla_model=is_openvla_model,
         )
 
         backward_prefetch = get_backward_prefetch_strategy(

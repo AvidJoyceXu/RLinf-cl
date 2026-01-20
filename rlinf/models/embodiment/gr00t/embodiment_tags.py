@@ -12,42 +12,74 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Embodiment tags for RLinf GR00T integration.
+This module re-exports EmbodimentTag from IsaacGR00T n1d6 and provides
+mapping functions for backward compatibility.
+"""
 
-from enum import Enum
+# Import from n1d6 implementation
+from IsaacGR00T.gr00t_n1d6.data.embodiment_tags import EmbodimentTag
+
+# Mapping from old RLinf tags to n1d6 tags
+_RLINF_TO_N1D6_TAG_MAPPING = {
+    "libero_franka": "libero_panda",
+    "maniskill_widowx": "oxe_widowx",  # Map to closest equivalent
+}
+
+# Reverse mapping for reference
+_N1D6_TO_RLINF_TAG_MAPPING = {
+    "libero_panda": "libero_franka",
+    "oxe_widowx": "maniskill_widowx",
+}
 
 
-class EmbodimentTag(Enum):
-    GR1 = "gr1"
+def map_rlinf_tag_to_n1d6(tag: str) -> str:
     """
-    The GR1 dataset.
+    Map RLinf embodiment tag to n1d6 embodiment tag.
+    
+    Args:
+        tag: RLinf embodiment tag string (e.g., "libero_franka")
+        
+    Returns:
+        n1d6 embodiment tag string (e.g., "libero_panda")
     """
+    return _RLINF_TO_N1D6_TAG_MAPPING.get(tag, tag)
 
-    OXE_DROID = "oxe_droid"
-    """
-    The OxE Droid dataset.
-    """
 
-    AGIBOT_GENIE1 = "agibot_genie1"
+def get_embodiment_tag(tag: str | EmbodimentTag) -> EmbodimentTag:
     """
-    The AgiBot Genie-1 with gripper dataset.
+    Get EmbodimentTag enum from string or enum, handling RLinf to n1d6 mapping.
+    
+    Args:
+        tag: Embodiment tag as string or EmbodimentTag enum
+        
+    Returns:
+        EmbodimentTag enum instance
     """
-
-    LIBERO_FRANKA = "libero_franka"
-    """
-    The Libero Franka dataset.
-    """
-
-    MANISKILL_WIDOWX = "maniskill_widowx"
-    """
-    The maniskill widowx dataset.
-    """
+    if isinstance(tag, EmbodimentTag):
+        return tag
+    
+    # Map RLinf tags to n1d6 tags
+    mapped_tag = map_rlinf_tag_to_n1d6(tag)
+    
+    # Try to get the enum value
+    try:
+        return EmbodimentTag(mapped_tag)
+    except ValueError:
+        # If mapping fails, try the original tag
+        return EmbodimentTag(tag)
 
 
 # Embodiment tag string: to projector index in the Action Expert Module
+# This mapping is from the n1d6 processing file
 EMBODIMENT_TAG_MAPPING = {
-    EmbodimentTag.LIBERO_FRANKA.value: 31,
-    EmbodimentTag.OXE_DROID.value: 17,
-    EmbodimentTag.AGIBOT_GENIE1.value: 26,
-    EmbodimentTag.GR1.value: 24,
-    EmbodimentTag.MANISKILL_WIDOWX.value: 30,
+    "robocasa_panda_omron": 13,
+    "gr1": 20,
+    "behavior_r1_pro": 24,
+    "unitree_g1": 8,
+    "libero_panda": 2,
+    "oxe_google": 0,
+    "oxe_widowx": 1,
+    "new_embodiment": 10,
 }

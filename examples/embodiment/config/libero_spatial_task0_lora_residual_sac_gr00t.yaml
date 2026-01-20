@@ -2,7 +2,7 @@ defaults:
   - env/libero_spatial_task0@env.train
   - env/libero_spatial_task0@env.eval
   - model/lora_residual_policy@actor.model
-  - model/openvla_oft@actor.base_model
+  - model/gr00t@actor.base_model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
@@ -25,7 +25,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft"
+    experiment_name: "libero_spatial_task0_rand_trials_lora_residual_sac_gr00t"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 20000
@@ -81,11 +81,11 @@ algorithm:
     min_length: 1
 
 # Residual Policy Configuration
-# Base Model: OpenVLA-OFT (provides visual understanding and base policy)
+# Base Model: GR00T N1d6 (provides visual understanding and base policy)
 # Residual Policy: MLP (fine-tunes policy in state space)
 residual_policy:
   enabled: True
-  base_model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"  # Path to pre-trained OpenVLA-OFT model
+  base_model_path: "/workspace/hf/libero_spatial_gr00t"  # Path to pre-trained GR00T model
   res_scale: 0.05  # Scaling factor for residual action
   prog_explore: 500 # Progressive exploration steps
   prog_explore_threshold: 100  # Threshold for progressive exploration
@@ -141,7 +141,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: ""
+    model_path: "/workspace/hf/libero_spatial_gr00t"  # GR00T base model path for rollout
     precision: ${actor.model.precision}
 
 actor:
@@ -171,13 +171,30 @@ actor:
     # LIBERO RL obs: robot_proprio_state (39-dim) + object_to_robot_relations (35-dim) = 74-dim
     obs_dim: 74 
   base_model:
-    model_type: "openvla_oft"
+    model_type: "gr00t"
     precision: ${actor.model.precision}
-    model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"
-    unnorm_key: libero_spatial_no_noops
-    max_prompt_length: 128
+    model_path: "/workspace/hf/libero_spatial_gr00t"
+    obs_converter_type: "libero"
+    embodiment_tag: "libero_panda"
+    num_action_chunks: ${actor.model.num_action_chunks}
+    denoising_steps: 4
     add_q_head: False
     add_value_head: False
+    rl_head_config:
+      joint_logprob: False
+      noise_method: "flow_sde"
+      ignore_last: False
+      safe_get_logprob: False
+      noise_anneal: False
+      noise_params: [0.7, 0.3, 400]
+      noise_level: 0.5
+      add_value_head: False
+      chunk_critic_input: False
+      detach_critic_input: True
+      disable_dropout: True
+      use_vlm_value: False
+      value_vlm_mode: "mean_token"
+      padding_value: 570
   optim:
     lr: 3.0e-4  # Lower learning rate for SAC
     value_lr: 3.0e-4  # Q-network learning rate

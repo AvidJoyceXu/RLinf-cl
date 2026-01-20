@@ -28,7 +28,7 @@ use_ordered_reset_state_ids: False
 specific_reset_id: 0
 # Limit the number of trials to use from the specified task (only used when specific_reset_id is set)
 # Set to 1 to use only trial_id=0 (the first trial) of task_id=0
-max_trials_per_task: 20
+max_trials_per_task: 1
 
 video_cfg:
   save_video: True

@@ -135,6 +135,9 @@ class EnvWorker(Worker):
         """
         This function is used to interact with the environment.
         """
+        base_model_type = None
+        if hasattr(self.cfg.actor.model, "base_model"):
+            base_model_type = self.cfg.actor.model.base_model.get("model_type", None)
         chunk_actions = prepare_actions(
             raw_chunk_actions=chunk_actions,
             env_type=self.cfg.env.train.env_type,
@@ -142,6 +145,7 @@ class EnvWorker(Worker):
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
+            base_model_type=base_model_type,
         )
         env_info = {}
 
@@ -195,6 +199,9 @@ class EnvWorker(Worker):
         """
         This function is used to evaluate the environment.
         """
+        base_model_type = None
+        if hasattr(self.cfg.actor.model, "base_model"):
+            base_model_type = self.cfg.actor.model.base_model.get("model_type", None)
         chunk_actions = prepare_actions(
             raw_chunk_actions=raw_actions,
             env_type=self.cfg.env.train.env_type,
@@ -202,6 +209,7 @@ class EnvWorker(Worker):
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
+            base_model_type=base_model_type,
         )
         env_info = {}
 
