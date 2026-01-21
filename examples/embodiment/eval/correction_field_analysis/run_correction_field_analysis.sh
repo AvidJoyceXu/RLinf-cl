@@ -20,12 +20,12 @@ CONFIG_FILE="configs/eval_lora_config.yaml"  # 评估配置文件路径
 # 格式：task_id:checkpoint_path
 # 如果某个task的checkpoint为空，将使用config文件中的eval_policy_path
 declare -A CHECKPOINT_PATHS
-CHECKPOINT_PATHS[0]="/workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model"
-CHECKPOINT_PATHS[2]=""  # 如果为空，将使用config默认路径
-CHECKPOINT_PATHS[3]="/workspace/RLinf/logs/20260117-15:07:09-libero_spatial_task3_lora_residual_sac_openvlaoft/libero_spatial_task3_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model"
-CHECKPOINT_PATHS[4]=""  # 如果为空，将使用config默认路径
-CHECKPOINT_PATHS[6]=""  # 如果为空，将使用config默认路径
-CHECKPOINT_PATHS[7]=""  # 如果为空，将使用config默认路径
+CHECKPOINT_PATHS[0]="/workspace/RLinf/logs/20260121-07:24:09-libero_spatial_task0_lora_residual_sac_openvlaoft/task0_single_trial_lora_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model"
+CHECKPOINT_PATHS[2]="/workspace/RLinf/logs/20260119-10:05:34-libero_spatial_task2_lora_residual_sac_openvlaoft/task2_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model"  # 如果为空，将使用config默认路径
+CHECKPOINT_PATHS[3]="/workspace/RLinf/logs/20260119-13:18:01-libero_spatial_task3_lora_residual_sac_openvlaoft/task3_single_trial_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model"
+CHECKPOINT_PATHS[4]="/workspace/RLinf/logs/20260119-16:57:44-libero_spatial_task4_lora_residual_sac_openvlaoft/task4_single_trial_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model"  # 如果为空，将使用config默认路径
+CHECKPOINT_PATHS[6]="/workspace/RLinf/logs/20260120-02:34:04-libero_spatial_task6_lora_residual_sac_openvlaoft/task6_single_trial_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model"  # 如果为空，将使用config默认路径
+CHECKPOINT_PATHS[7]="/workspace/RLinf/logs/20260120-02:34:18-libero_spatial_task7_lora_residual_sac_openvlaoft/task7_single_trial_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model"  # 如果为空，将使用config默认路径
 
 # 要跳过的task IDs（不进行分析）
 SKIP_TASKS=(1 5 8 9)

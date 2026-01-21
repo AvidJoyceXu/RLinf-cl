@@ -19,16 +19,16 @@
 #
 # 示例：
 #   bash examples/embodiment/batch_eval_cross_task.sh libero_spatial_task0_lora_residual_sac_gr00t \
-#       /workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model \
-#       /workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model \    # 会被跳过
+#       /workspace/RLinf/logs/20260121-07:24:09-libero_spatial_task0_lora_residual_sac_openvlaoft/task0_single_trial_lora_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model \
+#       /skip \    
 #       /workspace/RLinf/logs/20260119-10:05:34-libero_spatial_task2_lora_residual_sac_openvlaoft/task2_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model \
 #       /workspace/RLinf/logs/20260119-13:18:01-libero_spatial_task3_lora_residual_sac_openvlaoft/task3_single_trial_residual_sac_openvlaoft/checkpoints/global_step_3000/actor/huggingface_model \
 #       /workspace/RLinf/logs/20260119-16:57:44-libero_spatial_task4_lora_residual_sac_openvlaoft/task4_single_trial_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model \
-#       /workspace/RLinf/logs/20260119-17:02:38-libero_spatial_task5_lora_residual_sac_openvlaoft/task5_single_trial_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model \
+#       /skip \
 #       /workspace/RLinf/logs/20260120-02:34:04-libero_spatial_task6_lora_residual_sac_openvlaoft/task6_single_trial_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model \
 #       /workspace/RLinf/logs/20260120-02:34:18-libero_spatial_task7_lora_residual_sac_openvlaoft/task7_single_trial_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model \
-#       /workspace/RLinf/logs/20260120-02:34:18-libero_spatial_task7_lora_residual_sac_openvlaoft/task7_single_trial_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model \    # 会被跳过
-#       /workspace/RLinf/logs/20260120-02:34:18-libero_spatial_task7_lora_residual_sac_openvlaoft/task7_single_trial_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model       # 会被跳过
+#       /skip \    
+#       /skip 
 
 # 工作原理：
 #   1. 脚本会遍历所有policy-task组合，但跳过task 1, 8, 9（7×7=49种）
