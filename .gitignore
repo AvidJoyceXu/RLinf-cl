@@ -1,3 +1,10 @@
+IsaacGR00T
+libero-sac
+*.md
+results
+merged_policy_dir
+
+
 __pycache__
 .vscode
 *.log
