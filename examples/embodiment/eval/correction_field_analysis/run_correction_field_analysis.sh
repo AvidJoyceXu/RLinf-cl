@@ -1,13 +1,12 @@
 #!/bin/bash
 
 ###############################################################################
-# Correction Vector Field Analysis Runner for rlinf LoRA Residual Policy
+# Batch Correction Vector Field Analysis Runner for rlinf LoRA Residual Policy
 # 
 # 使用方法:
 #   bash run_correction_field_analysis.sh
 # 
-# 或者修改下面的配置参数后运行:
-#   bash run_correction_field_analysis.sh
+# 批量分析多个task pairs的correction field，跳过指定的task IDs
 ###############################################################################
 
 # =============================================================================
@@ -17,14 +16,19 @@
 # 基础配置
 CONFIG_FILE="configs/eval_lora_config.yaml"  # 评估配置文件路径
 
-# 任务配置
-TASK_I=0                                      # 任务i ID
-TASK_J=3                                      # 任务j ID
+# Checkpoint路径配置 - 为每个task指定checkpoint路径
+# 格式：task_id:checkpoint_path
+# 如果某个task的checkpoint为空，将使用config文件中的eval_policy_path
+declare -A CHECKPOINT_PATHS
+CHECKPOINT_PATHS[0]="/workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model"
+CHECKPOINT_PATHS[2]=""  # 如果为空，将使用config默认路径
+CHECKPOINT_PATHS[3]="/workspace/RLinf/logs/20260117-15:07:09-libero_spatial_task3_lora_residual_sac_openvlaoft/libero_spatial_task3_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model"
+CHECKPOINT_PATHS[4]=""  # 如果为空，将使用config默认路径
+CHECKPOINT_PATHS[6]=""  # 如果为空，将使用config默认路径
+CHECKPOINT_PATHS[7]=""  # 如果为空，将使用config默认路径
 
-# Checkpoint路径配置
-# 如果为空，将使用config文件中的eval_policy_path
-CHECKPOINT_I="/workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model"                               # 任务i的checkpoint路径（可选，huggingface model目录）
-CHECKPOINT_J="/workspace/RLinf/logs/20260117-15:07:09-libero_spatial_task3_lora_residual_sac_openvlaoft/libero_spatial_task3_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_4000/actor/huggingface_model"                               # 任务j的checkpoint路径（可选，huggingface model目录）
+# 要跳过的task IDs（不进行分析）
+SKIP_TASKS=(1 5 8 9)
 
 # 状态收集配置
 STATE_METHOD="base_rollout"                      # 状态收集方法: demo, both_demo, base_rollout
@@ -33,6 +37,9 @@ REFERENCE_TASK="0"                            # 参考任务ID（仅当state_met
 
 # 分析阈值配置
 DELTA_DIR=0.5                                 # 方向一致性危险阈值（0-1之间）
+
+# 输出目录（可选，用于汇总报告）
+OUTPUT_BASE_DIR="/workspace/RLinf/results"  # 如果为空，将使用config中的默认输出目录
 
 # =============================================================================
 # 脚本执行区域 - 通常不需要修改
@@ -43,65 +50,178 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=============================================================================="
-echo "Correction Vector Field Analysis (rlinf LoRA Residual Policy)"
+echo "Batch Correction Vector Field Analysis (rlinf LoRA Residual Policy)"
 echo "=============================================================================="
 echo ""
+
+# 获取所有要分析的task IDs（排除跳过的task）
+TASK_IDS=()
+for task_id in "${!CHECKPOINT_PATHS[@]}"; do
+    # 检查是否在跳过列表中
+    skip=false
+    for skip_task in "${SKIP_TASKS[@]}"; do
+        if [ "$task_id" == "$skip_task" ]; then
+            skip=true
+            break
+        fi
+    done
+    if [ "$skip" == false ]; then
+        TASK_IDS+=("$task_id")
+    fi
+done
+
+# 排序task IDs
+TASK_IDS=($(printf '%s\n' "${TASK_IDS[@]}" | sort -n))
+
 echo "Configuration:"
 echo "  Config File:      $CONFIG_FILE"
-echo "  Task I:           $TASK_I"
-echo "  Task J:           $TASK_J"
-echo "  Checkpoint I:     ${CHECKPOINT_I:-'(using config default)'}"
-echo "  Checkpoint J:     ${CHECKPOINT_J:-'(using config default)'}"
 echo "  State Method:     $STATE_METHOD"
 echo "  Max Demos:        $MAX_DEMOS"
-echo "  Reference Task:   ${REFERENCE_TASK:-'(auto)'}"
 echo "  Delta Dir:        $DELTA_DIR"
+echo "  Skip Tasks:       ${SKIP_TASKS[*]}"
+echo "  Tasks to analyze: ${TASK_IDS[*]}"
+echo "  Total tasks:      ${#TASK_IDS[@]}"
 echo ""
 
-# 构建Python命令
-PYTHON_CMD="python analyze_correction_vector_field.py"
-PYTHON_CMD="$PYTHON_CMD --config $CONFIG_FILE"
-PYTHON_CMD="$PYTHON_CMD --task_i $TASK_I"
-PYTHON_CMD="$PYTHON_CMD --task_j $TASK_J"
-PYTHON_CMD="$PYTHON_CMD --state_method $STATE_METHOD"
-PYTHON_CMD="$PYTHON_CMD --max_demos $MAX_DEMOS"
-PYTHON_CMD="$PYTHON_CMD --delta_dir $DELTA_DIR"
-
-# 添加可选的checkpoint路径
-if [ -n "$CHECKPOINT_I" ]; then
-    PYTHON_CMD="$PYTHON_CMD --checkpoint_i $CHECKPOINT_I"
-fi
-
-if [ -n "$CHECKPOINT_J" ]; then
-    PYTHON_CMD="$PYTHON_CMD --checkpoint_j $CHECKPOINT_J"
-fi
-
-# 添加可选的reference_task（仅当state_method=demo时使用）
-if [ -n "$REFERENCE_TASK" ]; then
-    PYTHON_CMD="$PYTHON_CMD --reference_task $REFERENCE_TASK"
-fi
-
-echo "Running command:"
-echo "  $PYTHON_CMD"
+# 验证checkpoint路径
+echo "Checkpoint paths:"
+for task_id in "${TASK_IDS[@]}"; do
+    ckpt_path="${CHECKPOINT_PATHS[$task_id]}"
+    if [ -n "$ckpt_path" ]; then
+        if [ ! -d "$ckpt_path" ] && [ ! -f "$ckpt_path" ]; then
+            echo "  ⚠️  Task $task_id: $ckpt_path (path not found, will use config default)"
+        else
+            echo "  ✅ Task $task_id: $ckpt_path"
+        fi
+    else
+        echo "  ℹ️  Task $task_id: (using config default)"
+    fi
+done
 echo ""
+
+# 计算总对数
+TOTAL_PAIRS=$(( ${#TASK_IDS[@]} * (${#TASK_IDS[@]} - 1) / 2 ))
+CURRENT_PAIR=0
+
+echo "=============================================================================="
+echo "Starting batch analysis for ${#TASK_IDS[@]} tasks (${TOTAL_PAIRS} pairs)"
 echo "=============================================================================="
 echo ""
 
-# 执行Python脚本
-eval $PYTHON_CMD
+# 初始化结果数组
+declare -a RESULTS
 
-EXIT_CODE=$?
+# 遍历所有task pairs
+for i in "${!TASK_IDS[@]}"; do
+    task_i="${TASK_IDS[$i]}"
+    ckpt_i="${CHECKPOINT_PATHS[$task_i]}"
+    
+    for j in "${!TASK_IDS[@]}"; do
+        task_j="${TASK_IDS[$j]}"
+        ckpt_j="${CHECKPOINT_PATHS[$task_j]}"
+        
+        # 只分析 i < j 的pairs（避免重复）
+        if [ "$task_i" -ge "$task_j" ]; then
+            continue
+        fi
+        
+        CURRENT_PAIR=$((CURRENT_PAIR + 1))
+        
+        echo "=============================================================================="
+        echo "[$CURRENT_PAIR/$TOTAL_PAIRS] Analyzing Task $task_i vs Task $task_j"
+        echo "=============================================================================="
+        echo "Checkpoint I: ${ckpt_i:-'(using config default)'}"
+        echo "Checkpoint J: ${ckpt_j:-'(using config default)'}"
+        echo ""
+        
+        # 构建Python命令
+        PYTHON_CMD="python analyze_correction_vector_field.py"
+        PYTHON_CMD="$PYTHON_CMD --config $CONFIG_FILE"
+        PYTHON_CMD="$PYTHON_CMD --task_i $task_i"
+        PYTHON_CMD="$PYTHON_CMD --task_j $task_j"
+        PYTHON_CMD="$PYTHON_CMD --state_method $STATE_METHOD"
+        PYTHON_CMD="$PYTHON_CMD --max_demos $MAX_DEMOS"
+        PYTHON_CMD="$PYTHON_CMD --delta_dir $DELTA_DIR"
+        
+        # 添加可选的checkpoint路径
+        if [ -n "$ckpt_i" ]; then
+            PYTHON_CMD="$PYTHON_CMD --checkpoint_i $ckpt_i"
+        fi
+        
+        if [ -n "$ckpt_j" ]; then
+            PYTHON_CMD="$PYTHON_CMD --checkpoint_j $ckpt_j"
+        fi
+        
+        # 添加可选的reference_task（仅当state_method=demo时使用）
+        if [ -n "$REFERENCE_TASK" ] && [ "$STATE_METHOD" == "demo" ]; then
+            PYTHON_CMD="$PYTHON_CMD --reference_task $REFERENCE_TASK"
+        fi
+        
+        # 执行分析
+        echo "Running: $PYTHON_CMD"
+        echo ""
+        
+        if eval $PYTHON_CMD; then
+            echo "✅ Task $task_i vs Task $task_j: Analysis completed"
+            RESULTS+=("Task_${task_i}_vs_Task_${task_j}: SUCCESS")
+        else
+            echo "❌ Task $task_i vs Task $task_j: Analysis failed"
+            RESULTS+=("Task_${task_i}_vs_Task_${task_j}: FAILED")
+        fi
+        
+        echo ""
+        echo "---"
+        echo ""
+    done
+done
 
-if [ $EXIT_CODE -eq 0 ]; then
-    echo ""
-    echo "=============================================================================="
-    echo "✅ Analysis completed successfully!"
-    echo "=============================================================================="
+# 生成汇总报告
+echo "=============================================================================="
+echo "Generating Summary Report"
+echo "=============================================================================="
+echo ""
+
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+if [ -n "$OUTPUT_BASE_DIR" ]; then
+    SUMMARY_FILE="${OUTPUT_BASE_DIR}/batch_correction_field_analysis_${TIMESTAMP}/summary_all_pairs.txt"
+    mkdir -p "$(dirname "$SUMMARY_FILE")"
 else
-    echo ""
-    echo "=============================================================================="
-    echo "❌ Analysis failed with exit code: $EXIT_CODE"
-    echo "=============================================================================="
-    exit $EXIT_CODE
+    SUMMARY_FILE="${SCRIPT_DIR}/batch_correction_field_analysis_${TIMESTAMP}_summary.txt"
 fi
+
+{
+    echo "Batch Correction Vector Field Analysis Summary"
+    echo "=============================================="
+    echo "Timestamp: $(date)"
+    echo "Config File: $CONFIG_FILE"
+    echo "State Method: $STATE_METHOD"
+    echo "Max Demos: $MAX_DEMOS"
+    echo "Delta Dir: $DELTA_DIR"
+    echo "Skip Tasks: ${SKIP_TASKS[*]}"
+    echo ""
+    echo "Total Tasks Analyzed: ${#TASK_IDS[@]}"
+    echo "Tasks: ${TASK_IDS[*]}"
+    echo "Total Pairs Analyzed: $TOTAL_PAIRS"
+    echo ""
+    echo "Checkpoint Paths:"
+    for task_id in "${TASK_IDS[@]}"; do
+        ckpt_path="${CHECKPOINT_PATHS[$task_id]}"
+        echo "  Task $task_id: ${ckpt_path:-'(using config default)'}"
+    done
+    echo ""
+    echo "Results:"
+    for result in "${RESULTS[@]}"; do
+        echo "  $result"
+    done
+    echo ""
+} > "$SUMMARY_FILE"
+
+echo "Summary saved to: $SUMMARY_FILE"
+echo ""
+echo "=============================================================================="
+echo "✅ Batch analysis completed!"
+echo "=============================================================================="
+echo ""
+echo "Results summary:"
+cat "$SUMMARY_FILE"
 
