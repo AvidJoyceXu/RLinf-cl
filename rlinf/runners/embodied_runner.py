@@ -93,12 +93,19 @@ class EmbodiedRunner:
         if resume_dir is None:
             return
 
-        actor_checkpoint_path = os.path.join(resume_dir, "actor")
-        assert os.path.exists(actor_checkpoint_path), (
-            f"resume_dir {actor_checkpoint_path} does not exist."
-        )
+        if os.path.exists(os.path.join(resume_dir, "actor")):
+            actor_checkpoint_path = os.path.join(resume_dir, "actor") 
+        else:
+            actor_checkpoint_path = resume_dir
+            assert os.path.exists(actor_checkpoint_path), (
+                f"resume_dir {actor_checkpoint_path} does not exist."
+            )
+        
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        self.global_step = int(resume_dir.split("global_step_")[-1])
+        try: 
+            self.global_step = int(resume_dir.split("global_step_")[-1])
+        except:
+            self.global_step = 0
 
     def send_demo_buffer(self):
         if self.demo_buffer is not None:

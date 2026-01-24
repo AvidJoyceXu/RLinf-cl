@@ -52,7 +52,10 @@ class LiberoEnv(gym.Env):
         self.group_size = self.cfg.group_size
         self.num_group = self.num_envs // self.group_size
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
-        self.specific_reset_id = cfg.get("specific_reset_id", None)
+        try:
+            self.specific_reset_id = list(cfg.get("specific_reset_id", None))
+        except TypeError:
+            self.specific_reset_id = cfg.get("specific_reset_id", None)
         self.max_trials_per_task = cfg.get("max_trials_per_task", None)
 
         self.ignore_terminations = cfg.ignore_terminations
@@ -146,18 +149,45 @@ class LiberoEnv(gym.Env):
             self._get_task_and_trial_ids_from_reset_state_ids(self.reset_state_ids)
         )
 
-    def _get_random_reset_state_ids(self, num_reset_states):
-        if self.specific_reset_id is not None: # NOTE：task_id指定为specific_reset_id, trial_id随机选择
-            task_id = self.specific_reset_id
-            num_trials = self.trial_id_bins[task_id]
-            # 如果设置了max_trials_per_task，限制trial选择范围
-            if self.max_trials_per_task is not None:
-                num_trials = min(num_trials, self.max_trials_per_task)
-            trial_ids = self._generator.integers(
-                low=0, high=num_trials, size=(num_reset_states,)
+    def _sample_task_id_from_specific_reset_id(self, num_samples=1):
+        """
+        从 specific_reset_id 中采样 task_id。
+        如果 specific_reset_id 是单个数字，返回该数字（重复 num_samples 次）。
+        如果 specific_reset_id 是列表，从列表中随机采样 num_samples 个 task_id。
+        
+        Args:
+            num_samples: 需要采样的 task_id 数量
+            
+        Returns:
+            numpy array of task_ids with shape (num_samples,)
+        """
+        if self.specific_reset_id is None:
+            return None
+        
+        if isinstance(self.specific_reset_id, (list, np.ndarray)):
+            # 如果是列表，从列表中随机采样
+            task_ids = self._generator.choice(
+                self.specific_reset_id, size=num_samples, replace=True
             )
-            start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
-            reset_state_ids = start_pivot + trial_ids
+            return task_ids
+        else:
+            # 如果是单个数字，直接返回（重复 num_samples 次）
+            return np.full(num_samples, self.specific_reset_id, dtype=int)
+
+    def _get_random_reset_state_ids(self, num_reset_states):
+        if self.specific_reset_id is not None: # NOTE：task_id从specific_reset_id中采样（可以是单个数字或列表）, trial_id随机选择
+            # 从 specific_reset_id 中采样 task_ids
+            task_ids = self._sample_task_id_from_specific_reset_id(num_reset_states)
+            reset_state_ids = []
+            for task_id in task_ids:
+                num_trials = self.trial_id_bins[task_id]
+                # 如果设置了max_trials_per_task，限制trial选择范围
+                if self.max_trials_per_task is not None:
+                    num_trials = min(num_trials, self.max_trials_per_task)
+                trial_id = self._generator.integers(low=0, high=num_trials)
+                start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                reset_state_ids.append(start_pivot + trial_id)
+            reset_state_ids = np.array(reset_state_ids)
         else:
             reset_state_ids = self._generator.integers(
                 low=0, high=self.total_num_group_envs, size=(num_reset_states,)
@@ -165,12 +195,36 @@ class LiberoEnv(gym.Env):
         return reset_state_ids
 
     def get_reset_state_ids_all(self):
-        # 如果指定了task和max_trials_per_task，只包含该task的前N个trials
+        # 如果指定了task和max_trials_per_task，只包含指定task(s)的前N个trials
         if self.specific_reset_id is not None and self.max_trials_per_task is not None:
-            task_id = self.specific_reset_id
-            num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
-            start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
-            reset_state_ids = np.arange(start_pivot, start_pivot + num_trials)
+            if isinstance(self.specific_reset_id, (list, np.ndarray)):
+                # 如果是列表，包含所有指定 task 的 trials
+                reset_state_ids_list = []
+                for task_id in self.specific_reset_id:
+                    num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
+                    start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                    reset_state_ids_list.append(np.arange(start_pivot, start_pivot + num_trials))
+                reset_state_ids = np.concatenate(reset_state_ids_list)
+            else:
+                # 如果是单个数字
+                task_id = self.specific_reset_id
+                num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
+                start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                reset_state_ids = np.arange(start_pivot, start_pivot + num_trials)
+        elif self.specific_reset_id is not None:
+            # 如果指定了task但没有max_trials_per_task，包含所有指定 task 的所有 trials
+            if isinstance(self.specific_reset_id, (list, np.ndarray)):
+                reset_state_ids_list = []
+                for task_id in self.specific_reset_id:
+                    start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                    end_pivot = self.cumsum_trial_id_bins[task_id]
+                    reset_state_ids_list.append(np.arange(start_pivot, end_pivot))
+                reset_state_ids = np.concatenate(reset_state_ids_list)
+            else:
+                task_id = self.specific_reset_id
+                start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                end_pivot = self.cumsum_trial_id_bins[task_id]
+                reset_state_ids = np.arange(start_pivot, end_pivot)
         else:
             reset_state_ids = np.arange(self.total_num_group_envs)
         valid_size = len(reset_state_ids) - (
@@ -183,18 +237,49 @@ class LiberoEnv(gym.Env):
 
     def _get_ordered_reset_state_ids(self, num_reset_states):
         if self.specific_reset_id is not None:
-            # 如果设置了max_trials_per_task，从该task的前N个trials中按顺序选择
+            # 如果设置了max_trials_per_task，从指定task(s)的前N个trials中按顺序选择
             if self.max_trials_per_task is not None:
-                task_id = self.specific_reset_id
-                num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
-                start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
-                # 按顺序选择trials，循环使用
-                trial_ids = np.arange(num_reset_states) % num_trials
-                reset_state_ids = start_pivot + trial_ids
+                if isinstance(self.specific_reset_id, (list, np.ndarray)):
+                    # 如果是列表，从所有指定 task 的 trials 中按顺序选择
+                    # 首先收集所有可用的 reset_state_ids
+                    all_reset_state_ids = []
+                    for task_id in self.specific_reset_id:
+                        num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
+                        start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                        all_reset_state_ids.extend(range(start_pivot, start_pivot + num_trials))
+                    all_reset_state_ids = np.array(all_reset_state_ids)
+                    # 按顺序选择，循环使用
+                    reset_state_ids = np.array([
+                        all_reset_state_ids[i % len(all_reset_state_ids)] 
+                        for i in range(num_reset_states)
+                    ])
+                else:
+                    # 如果是单个数字
+                    task_id = self.specific_reset_id
+                    num_trials = min(self.trial_id_bins[task_id], self.max_trials_per_task)
+                    start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                    # 按顺序选择trials，循环使用
+                    trial_ids = np.arange(num_reset_states) % num_trials
+                    reset_state_ids = start_pivot + trial_ids
             else:
-                reset_state_ids = self.specific_reset_id * np.ones(
-                    (self.num_group,), dtype=int
-                )
+                # 如果没有max_trials_per_task，从 specific_reset_id 中采样 task_ids
+                if isinstance(self.specific_reset_id, (list, np.ndarray)):
+                    # 从列表中按顺序循环选择 task_ids
+                    task_ids = np.array([
+                        self.specific_reset_id[i % len(self.specific_reset_id)]
+                        for i in range(num_reset_states)
+                    ])
+                    # 对于每个 task_id，选择第一个 trial（因为 ordered 模式下通常使用第一个 trial）
+                    reset_state_ids = []
+                    for task_id in task_ids:
+                        start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                        reset_state_ids.append(start_pivot)
+                    reset_state_ids = np.array(reset_state_ids)
+                else:
+                    # 如果是单个数字，选择该 task 的第一个 trial（重复 num_reset_states 次）
+                    task_id = self.specific_reset_id
+                    start_pivot = self.cumsum_trial_id_bins[task_id - 1] if task_id > 0 else 0
+                    reset_state_ids = np.full(num_reset_states, start_pivot, dtype=int)
         else:
             if self.start_idx + num_reset_states > len(self.reset_state_ids_all[0]):
                 self.reset_state_ids_all = self.get_reset_state_ids_all()
