@@ -1,0 +1,2 @@
+bash examples/embodiment/batch_eval_cross_task.sh libero_spatial_task0_lora_residual_sac_gr00t /workspace/RLinf/logs/20260121-07:24:09-libero_spatial_task0_lora_residual_sac_openvlaoft/task0_single_trial_lora_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model /skip /workspace/RLinf/logs/20260119-10:05:34-libero_spatial_task2_lora_residual_sac_openvlaoft/task2_residual_sac_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model /workspace/RLinf/logs/20260119-13:18:01-l
+
