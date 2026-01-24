@@ -1022,7 +1022,10 @@ class GR00T_N1_5_ForRLActionPrediction(BasePolicy, Gr00tN1d6):
             Dict[str, Any]: The transformed observation.
         """
         # Ensure correct dimensions before applying transforms
-        return self._modality_transform(obs)
+        obs = self._modality_transform(obs)
+        if obs["eagle_pixel_values"].ndim == 4:
+            obs["eagle_pixel_values"] = obs["eagle_pixel_values"].unsqueeze(1)
+        return obs
 
     def unapply_transforms(self, action: dict[str, Any]) -> dict[str, Any]:
         """
