@@ -11,10 +11,10 @@
 # =============================================================================
 
 # 结果目录（包含所有correction_field_analysis_*文件夹）
-RESULTS_DIR="/workspace/RLinf/examples/embodiment/eval/results"
+RESULTS_DIR="/workspace/RLinf/examples/embodiment/eval/results/libero_object"
 
 # 输出目录（可选，如果为空则使用results_dir/analysis_summary）
-OUTPUT_DIR=""
+OUTPUT_DIR="/workspace/RLinf/examples/embodiment/eval/results/libero_object/analysis_summary"
 
 # =============================================================================
 # 脚本执行区域

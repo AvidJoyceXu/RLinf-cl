@@ -1,9 +1,13 @@
 results
+*.mp4
+*.png
 libero-sac
 merged_policy_dir
 IsaacGR00T
 logs
 *.md
+*/video/*
+*/wandb/*
 
 __pycache__
 .vscode

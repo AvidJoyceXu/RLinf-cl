@@ -157,14 +157,14 @@ def main():
     
     print(f"\nFound {len(success_rates)} success rate entries")
     
-    # Required pairs: (0,2) and (2,6)
-    required_pairs = [(0, 2), (2, 6)]
+    # NOTE: 
+    required_pairs = [(6, 8), (2, 9), (2, 6)]
     
     # Find good pairs automatically
     print("\n" + "=" * 60)
     print("Analyzing task pairs for good bidirectional performance...")
     print("=" * 60)
-    good_pairs = find_good_pairs(success_rates, min_bidirectional_rate=0.5, min_avg_rate=0.65)
+    good_pairs = find_good_pairs(success_rates, min_bidirectional_rate=0.1, min_avg_rate=0.5)
     
     # Combine required and good pairs (avoid duplicates)
     all_pairs = set(required_pairs)

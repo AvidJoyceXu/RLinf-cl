@@ -72,7 +72,8 @@ export HYDRA_FULL_ERROR=1
 # ============================================================================
 # 定义要跳过的task ID列表（task 1, 8, 9会被跳过）
 # 有效的task ID: 0, 2, 3, 4, 5, 6, 7
-declare -a SKIP_TASKS=(1 5 8 9)
+# declare -a SKIP_TASKS=(1 5 8 9)
+declare -a SKIP_TASKS=(0 3 4 5)
 
 # 检查task是否应该被跳过
 should_skip_task() {
