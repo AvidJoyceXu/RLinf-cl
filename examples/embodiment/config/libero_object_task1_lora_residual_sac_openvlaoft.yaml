@@ -110,7 +110,7 @@ env:
   train:
     specific_reset_id: 1
     max_trials_per_task: 1
-    total_num_envs: 32 # Adjusted to achieve 4:1 ratio (256 transitions per global step)
+    total_num_envs: 64 # Adjusted to achieve 4:1 ratio (256 transitions per global step)
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: False

@@ -22,7 +22,7 @@ from gr00t.data.transform.base import ComposedModalityTransform, ModalityTransfo
 from gr00t.data.transform.concat import ConcatTransform
 from gr00t.data.transform.state_action import (
     StateActionSinCosTransform,
-    StateActionToTensor,
+   StateActionToTensor,
     StateActionTransform,
 )
 from gr00t.data.transform.video import (
