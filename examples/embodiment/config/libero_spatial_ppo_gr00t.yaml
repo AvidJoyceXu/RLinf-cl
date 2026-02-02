@@ -23,7 +23,7 @@ runner:
     log_path: "../results"
     project_name: rlinf
     experiment_name: "libero_spatial_ppo_gr00t"
-    logger_backends: ["tensorboard"] # wandb, swanlab
+    logger_backends: [""] # wandb, swanlab, NOTE: disable for debugging
 
   max_epochs: 1000
   max_steps: -1
@@ -110,7 +110,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/RLinf-Gr00t-SFT-Spatial"
+    model_path: "/workspace/hf/libero_spatial_gr00t"
     precision: ${actor.model.precision}
 
 actor:
@@ -123,7 +123,7 @@ actor:
 
   # Override the default values in model/gr00t
   model:
-    model_path: "/path/to/RLinf-Gr00t-SFT-Spatial"
+    model_path: "/workspace/hf/libero_spatial_gr00t"
     model_type: "gr00t"
     add_value_head: True
 

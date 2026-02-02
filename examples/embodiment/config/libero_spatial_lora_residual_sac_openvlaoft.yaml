@@ -19,12 +19,12 @@ cluster:
     actor,env,rollout: all
 
 runner:
-  eval_policy_path: "/workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model"
+  eval_policy_path: "/workspace/RLinf/all_merged/libero_spatial/sequential_merge"
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "task0_single_trial_lora_residual_sac_openvlaoft"
+    experiment_name: "libero_spatial_all_merged_lora_openvlaoft"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 20000
@@ -121,9 +121,9 @@ env:
     reset_gripper_open: False
   
   eval:
-    specific_reset_id: 0
+    specific_reset_id: [0, 2, 3, 4, 6, 7]
     max_trials_per_task: 1
-    total_num_envs: 32 # Increased for more comprehensive evaluation (must be divisible by env_world_size)
+    total_num_envs: 256 # Increased for more comprehensive evaluation (must be divisible by env_world_size)
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 240

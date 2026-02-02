@@ -97,6 +97,12 @@ def main():
         action='store_true',
         help='Use optimized version with norm restoration (recommended)'
     )
+
+    parser.add_argument(
+        '--is_sequential',
+        action='store_true',
+        help='Use sequential merged (recommended)'
+    )
     
     args = parser.parse_args()
     
@@ -131,11 +137,18 @@ def main():
         merger = RobustMergeLoRA(prune_ratio=args.prune_ratio)
     
     # Execute merge
-    merged_params = merger.merge_actors(
-        checkpoint_paths=args.checkpoint_paths,
-        task_weights=args.task_weights,
-        output_path=args.output_path
-    )
+    if args.is_sequential: 
+        merged_params = merger.merge_actors_sequential(
+            checkpoint_paths=args.checkpoint_paths,
+            task_weights=args.task_weights,
+            output_path=args.output_path
+        )
+    else:
+        merged_params = merger.merge_actors(
+            checkpoint_paths=args.checkpoint_paths,
+            task_weights=args.task_weights,
+            output_path=args.output_path
+        )
     
     print(f"\n✅ Merge completed!")
     print(f"Output file: {args.output_path}")

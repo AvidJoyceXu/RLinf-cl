@@ -417,6 +417,174 @@ class RobustMergeLoRA:
         
         return merged_params
     
+    def merge_actors_sequential(
+        self, 
+        checkpoint_paths: List[str], 
+        task_weights: Optional[List[float]] = None,
+        output_path: Optional[str] = None
+    ) -> Dict:
+        """
+        顺序融合多个 LoRA Residual Actor（两两合并）
+        
+        融合顺序：P1 + P2 -> P12, P12 + P3 -> P123, P123 + P4 -> P1234, ...
+        
+        Args:
+            checkpoint_paths: List[str], 每个任务的checkpoint路径 [P1, P2, ..., Pn]
+            output_path: Optional[str], 保存融合结果的路径
+        
+        Returns:
+            merged_params: Dict, 融合后的参数，格式与 LoRAResidualPolicy.get_lora_parameters() 一致
+        """
+        assert task_weights is None, "目前不支持task weights"
+
+        n_tasks = len(checkpoint_paths)
+        
+        if n_tasks < 2:
+            raise ValueError(f"At least 2 checkpoints required for sequential merge, got {n_tasks}")
+        
+        print(f"Sequential merging {n_tasks} LoRA Residual Actors...")
+        print(f"Merge order: P1 + P2 -> P12, P12 + P3 -> P123, ...")
+        
+        # 1. 加载所有任务的参数
+        all_task_params = []
+        for i, path in enumerate(checkpoint_paths):
+            print(f"Loading task {i+1} from {path}...")
+            
+            # Try to load as safetensors first, then fall back to torch.load
+            try:
+                if os.path.isdir(path) or (os.path.isfile(path) and path.endswith('.safetensors')):
+                    checkpoint = _load_checkpoint_safetensors(path)
+                else:
+                    checkpoint = torch.load(path, map_location='cpu')
+            except Exception as e:
+                # Fall back to torch.load if safetensors loading fails
+                print(f"  Warning: Failed to load as safetensors, trying torch.load: {e}")
+                checkpoint = torch.load(path, map_location='cpu')
+            
+            # Extract LoRA parameters from checkpoint
+            params = _load_lora_params_from_checkpoint(checkpoint)
+            all_task_params.append(params)
+        
+        # 2. 顺序两两合并
+        # 初始化为第一个策略的参数
+        current_merged = all_task_params[0].copy()
+        
+        # 对每个后续策略进行两两合并
+        for task_idx in range(1, n_tasks):
+            # 生成合并步骤的描述
+            prev_tasks_str = ''.join(str(i) for i in range(1, task_idx + 1))
+            next_task_num = task_idx + 1
+            result_tasks_str = ''.join(str(i) for i in range(1, task_idx + 2))
+            
+            print(f"\n{'='*60}")
+            print(f"Merging step {task_idx}: P{prev_tasks_str} + P{next_task_num} -> P{result_tasks_str}")
+            print(f"{'='*60}")
+            
+            next_task_params = all_task_params[task_idx]
+            
+            # 2.1 融合 LoRA 层（两两合并）
+            merged_lora_layers = {}
+            for layer_name in ['fc1', 'fc2', 'fc3']:
+                print(f"Merging {layer_name}...")
+                
+                # 提取当前合并结果和下一个任务的 A 和 B 矩阵
+                A_matrices = [
+                    current_merged['lora_layers'][layer_name]['A'],
+                    next_task_params['lora_layers'][layer_name]['A']
+                ]
+                B_matrices = [
+                    current_merged['lora_layers'][layer_name]['B'],
+                    next_task_params['lora_layers'][layer_name]['B']
+                ]
+                B_biases = [
+                    current_merged['lora_layers'][layer_name]['B_bias'],
+                    next_task_params['lora_layers'][layer_name]['B_bias']
+                ]
+                
+                # 两两合并，使用均匀权重 [0.5, 0.5]
+                pair_weights = [0.5, 0.5]
+                
+                # 应用 RobustMerge
+                A_merged, B_merged, B_bias_merged = self._robust_merge_lora_layer(
+                    A_matrices, B_matrices, B_biases, pair_weights
+                )
+                
+                merged_lora_layers[layer_name] = {
+                    'A': A_merged,
+                    'B': B_merged,
+                    'B_bias': B_bias_merged
+                }
+            
+            # 2.2 融合输出层（两两合并，简单加权平均）
+            merged_output_layers = {}
+            for output_name in ['fc_mean', 'fc_logstd']:
+                print(f"Merging {output_name}...")
+                
+                weights = [
+                    current_merged['output_layers'][output_name]['weight'],
+                    next_task_params['output_layers'][output_name]['weight']
+                ]
+                biases = [
+                    current_merged['output_layers'][output_name]['bias'],
+                    next_task_params['output_layers'][output_name]['bias']
+                ]
+                
+                # 两两合并，使用均匀权重 [0.5, 0.5]
+                merged_weight = 0.5 * weights[0] + 0.5 * weights[1]
+                merged_bias = 0.5 * biases[0] + 0.5 * biases[1]
+                
+                merged_output_layers[output_name] = {
+                    'weight': merged_weight,
+                    'bias': merged_bias
+                }
+            
+            # 2.3 更新当前合并结果
+            current_merged = {
+                'lora_layers': merged_lora_layers,
+                'output_layers': merged_output_layers,
+                'meta': current_merged['meta']  # 保持第一个任务的元信息
+            }
+        
+        # 3. 最终合并结果
+        merged_params = current_merged
+        
+        # 4. 保存（如果指定了路径）
+        if output_path is not None:
+            # Check if output_path is a directory (for safetensors) or file (for .pt)
+            if os.path.isdir(output_path) or output_path.endswith('/') or (not os.path.exists(output_path) and not output_path.endswith('.pt')):
+                # Save as safetensors format
+                # Determine the actual directory path
+                if os.path.isdir(output_path):
+                    save_dir = output_path
+                elif output_path.endswith('/'):
+                    save_dir = output_path.rstrip('/')
+                else:
+                    # Create directory from output_path
+                    save_dir = output_path if os.path.dirname(output_path) else output_path
+                    os.makedirs(save_dir, exist_ok=True)
+                
+                _save_checkpoint_safetensors(
+                    merged_params=merged_params,
+                    output_path=save_dir,
+                    task_weights=None,  # Sequential merge doesn't use explicit weights
+                    n_tasks=n_tasks,
+                    prune_ratio=self.prune_ratio,
+                    merge_method='robust_merge_sequential',
+                    reference_checkpoint_path=checkpoint_paths[0] if checkpoint_paths else None
+                )
+            else:
+                # Save as .pt format (backward compatibility)
+                save_dict = {
+                    'merged_params': merged_params,
+                    'n_tasks': n_tasks,
+                    'prune_ratio': self.prune_ratio,
+                    'merge_method': 'robust_merge_sequential'
+                }
+                torch.save(save_dict, output_path)
+                print(f"Saved merged model to {output_path}")
+        
+        return merged_params
+    
     def _robust_merge_lora_layer(
         self, 
         A_matrices: List[torch.Tensor], 
@@ -753,6 +921,193 @@ class RobustMergeLoRAOptimized:
                     'prune_ratio': self.prune_ratio,
                     'restore_norm': self.restore_norm,
                     'merge_method': 'robust_merge_optimized'
+                }
+                torch.save(save_dict, output_path)
+                print(f"Saved merged model to {output_path}")
+        
+        return merged_params
+    
+    def merge_actors_sequential(
+        self, 
+        checkpoint_paths: List[str], 
+        task_weights: Optional[List[float]] = None,
+        output_path: Optional[str] = None
+    ) -> Dict:
+        """
+        顺序融合多个 LoRA Residual Actor（两两合并，优化版本）
+        
+        融合顺序：P1 + P2 -> P12, P12 + P3 -> P123, P123 + P4 -> P1234, ...
+        
+        Args:
+            checkpoint_paths: List[str], 每个任务的checkpoint路径 [P1, P2, ..., Pn]
+            task_weights: Optional[List[float]], 目前不支持，必须为 None
+            output_path: Optional[str], 保存融合结果的路径
+        
+        Returns:
+            merged_params: Dict, 融合后的参数，格式与 LoRAResidualPolicy.get_lora_parameters() 一致
+        """
+        assert task_weights is None, "目前不支持task weights"
+        
+        n_tasks = len(checkpoint_paths)
+        
+        if n_tasks < 2:
+            raise ValueError(f"At least 2 checkpoints required for sequential merge, got {n_tasks}")
+        
+        print(f"Sequential merging {n_tasks} LoRA Residual Actors (Optimized Version)...")
+        print(f"Merge order: P1 + P2 -> P12, P12 + P3 -> P123, ...")
+        if self.restore_norm:
+            print(f"Norm restoration: ENABLED")
+        else:
+            print(f"Norm restoration: DISABLED")
+        
+        # 1. 加载所有任务的参数
+        all_task_params = []
+        for i, path in enumerate(checkpoint_paths):
+            print(f"Loading task {i+1} from {path}...")
+            
+            # Try to load as safetensors first, then fall back to torch.load
+            try:
+                if os.path.isdir(path) or (os.path.isfile(path) and path.endswith('.safetensors')):
+                    checkpoint = _load_checkpoint_safetensors(path)
+                else:
+                    checkpoint = torch.load(path, map_location='cpu')
+            except Exception as e:
+                # Fall back to torch.load if safetensors loading fails
+                print(f"  Warning: Failed to load as safetensors, trying torch.load: {e}")
+                checkpoint = torch.load(path, map_location='cpu')
+            
+            # Extract LoRA parameters from checkpoint
+            params = _load_lora_params_from_checkpoint(checkpoint)
+            all_task_params.append(params)
+        
+        # 2. 顺序两两合并
+        # 初始化为第一个策略的参数
+        current_merged = all_task_params[0].copy()
+        
+        # 对每个后续策略进行两两合并
+        for task_idx in range(1, n_tasks):
+            # 生成合并步骤的描述
+            prev_tasks_str = ''.join(str(i) for i in range(1, task_idx + 1))
+            next_task_num = task_idx + 1
+            result_tasks_str = ''.join(str(i) for i in range(1, task_idx + 2))
+            
+            print(f"\n{'='*60}")
+            print(f"Merging step {task_idx}: P{prev_tasks_str} + P{next_task_num} -> P{result_tasks_str}")
+            print(f"{'='*60}")
+            
+            next_task_params = all_task_params[task_idx]
+            
+            # 2.1 融合 LoRA 层（两两合并，使用优化版RobustMerge）
+            merged_lora_layers = {}
+            for layer_name in ['fc1', 'fc2', 'fc3']:
+                print(f"Merging {layer_name}...")
+                
+                # 提取当前合并结果和下一个任务的 A 和 B 矩阵
+                A_matrices = [
+                    current_merged['lora_layers'][layer_name]['A'],
+                    next_task_params['lora_layers'][layer_name]['A']
+                ]
+                B_matrices = [
+                    current_merged['lora_layers'][layer_name]['B'],
+                    next_task_params['lora_layers'][layer_name]['B']
+                ]
+                B_biases = [
+                    current_merged['lora_layers'][layer_name]['B_bias'],
+                    next_task_params['lora_layers'][layer_name]['B_bias']
+                ]
+                
+                # 两两合并，使用均匀权重 [0.5, 0.5]
+                pair_weights = [0.5, 0.5]
+                
+                # 应用优化版RobustMerge
+                A_merged, B_merged, B_bias_merged = self._robust_merge_lora_layer_optimized(
+                    A_matrices, B_matrices, B_biases, pair_weights
+                )
+                
+                merged_lora_layers[layer_name] = {
+                    'A': A_merged,
+                    'B': B_merged,
+                    'B_bias': B_bias_merged
+                }
+            
+            # 2.2 融合输出层（两两合并，考虑范数恢复）
+            merged_output_layers = {}
+            for output_name in ['fc_mean', 'fc_logstd']:
+                print(f"Merging {output_name}...")
+                
+                weights = [
+                    current_merged['output_layers'][output_name]['weight'],
+                    next_task_params['output_layers'][output_name]['weight']
+                ]
+                biases = [
+                    current_merged['output_layers'][output_name]['bias'],
+                    next_task_params['output_layers'][output_name]['bias']
+                ]
+                
+                # 记录原始范数（如果启用范数恢复）
+                if self.restore_norm:
+                    original_output_norms = [torch.norm(w, p='fro').item() for w in weights]
+                    avg_output_norm = np.mean(original_output_norms)
+                
+                # 两两合并，使用均匀权重 [0.5, 0.5]
+                merged_weight = 0.5 * weights[0] + 0.5 * weights[1]
+                merged_bias = 0.5 * biases[0] + 0.5 * biases[1]
+                
+                # 恢复输出层的范数（如果启用）
+                if self.restore_norm:
+                    merged_weight_norm = torch.norm(merged_weight, p='fro').item()
+                    if merged_weight_norm > 1e-6:
+                        scale_factor = avg_output_norm / merged_weight_norm
+                        merged_weight = merged_weight * scale_factor
+                        print(f"  Output layer norm recovery: {merged_weight_norm:.4f} → {torch.norm(merged_weight, p='fro').item():.4f} (target: {avg_output_norm:.4f})")
+                
+                merged_output_layers[output_name] = {
+                    'weight': merged_weight,
+                    'bias': merged_bias
+                }
+            
+            # 2.3 更新当前合并结果
+            current_merged = {
+                'lora_layers': merged_lora_layers,
+                'output_layers': merged_output_layers,
+                'meta': current_merged['meta']  # 保持第一个任务的元信息
+            }
+        
+        # 3. 最终合并结果
+        merged_params = current_merged
+        
+        # 4. 保存（如果指定了路径）
+        if output_path is not None:
+            # Check if output_path is a directory (for safetensors) or file (for .pt)
+            if os.path.isdir(output_path) or output_path.endswith('/') or (not os.path.exists(output_path) and not output_path.endswith('.pt')):
+                # Save as safetensors format
+                # Determine the actual directory path
+                if os.path.isdir(output_path):
+                    save_dir = output_path
+                elif output_path.endswith('/'):
+                    save_dir = output_path.rstrip('/')
+                else:
+                    # Create directory from output_path
+                    save_dir = output_path if os.path.dirname(output_path) else output_path
+                    os.makedirs(save_dir, exist_ok=True)
+                
+                _save_checkpoint_safetensors(
+                    merged_params=merged_params,
+                    output_path=save_dir,
+                    task_weights=None,  # Sequential merge doesn't use explicit weights
+                    n_tasks=n_tasks,
+                    prune_ratio=self.prune_ratio,
+                    merge_method='robust_merge_optimized_sequential',
+                    reference_checkpoint_path=checkpoint_paths[0] if checkpoint_paths else None
+                )
+            else:
+                # Save as .pt format (backward compatibility)
+                save_dict = {
+                    'merged_params': merged_params,
+                    'n_tasks': n_tasks,
+                    'prune_ratio': self.prune_ratio,
+                    'restore_norm': self.restore_norm,
+                    'merge_method': 'robust_merge_optimized_sequential'
                 }
                 torch.save(save_dict, output_path)
                 print(f"Saved merged model to {output_path}")

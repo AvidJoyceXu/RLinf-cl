@@ -5,11 +5,11 @@
 
 set -e  # Exit on error
 
-# Merge Task 1 and Task 6
+# Merge Task 1 and Task 8
 python toolkits/merge_lora_policies/quick_merge.py \
-    --checkpoint_paths /workspace/RLinf/logs/20260122-13:30:27-libero_object_task1_lora_residual_sac_openvlaoft.yaml/libero_object_task1_single_trial_lora_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model /workspace/RLinf/logs/20260123-03:15:44-libero_object_task6_lora_residual_sac_openvlaoft.yaml/libero_object_task6_single_trial_lora_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model \
-    --output_path merged_policy_dir/libero_objectbash/task1_6/ \
-    --restore_norm
+    --checkpoint_paths /workspace/RLinf/logs/20260122-13:30:27-libero_object_task1_lora_residual_sac_openvlaoft.yaml/libero_object_task1_single_trial_lora_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model \
+                        /workspace/RLinf/logs/20260123-04:18:20-libero_object_task8_lora_residual_sac_openvlaoft.yaml/libero_object_task8_single_trial_lora_openvlaoft/checkpoints/global_step_2000/actor/huggingface_model \
+    --output_path merged_policy_dir/libero_object/task1_8/ 
 
 # Merge Task 2 and Task 6
 python toolkits/merge_lora_policies/quick_merge.py \

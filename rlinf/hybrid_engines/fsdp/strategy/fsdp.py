@@ -65,12 +65,13 @@ class FSDPStrategy(FSDPStrategyBase):
             self.cfg.fsdp_config.sharding_strategy
         )
 
+        is_openvla_model = SupportedModel(self.cfg.model.model_type) in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT] or SupportedModel(self.cfg.base_model.model_type) in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT]
+        
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=model,
             config=None,
             is_lora=self.cfg.model.is_lora,
-            is_openvla_model=SupportedModel(self.cfg.model.model_type)
-            in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT, SupportedModel.RESIDUAL_POLICY, SupportedModel.LORA_RESIDUAL_POLICY],
+            is_openvla_model=is_openvla_model,
         )
 
         backward_prefetch = get_backward_prefetch_strategy(
