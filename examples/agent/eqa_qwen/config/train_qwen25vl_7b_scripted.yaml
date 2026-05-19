@@ -1,0 +1,58 @@
+# M2 scripted-policy smoke: emit canned <tool_call> tokens (no LLM, no training).
+# Bypasses self.generate() so the actor / rollout / inference groups never run.
+# Goal: prove the agent loop + tool worker + Habitat episode handle wire up.
+# See code-doc/0514 - RLinf agentic RL pipeline implementation.md §6.3.
+defaults:
+  - train_qwen25vl_7b
+
+
+runner:
+  experiment_name: eqa-m2-scripted-smoke
+  max_epochs: 1
+  max_steps: 1
+  val_check_interval: 1
+  save_interval: 1
+  # 24 GB card: shrink KV cache for the smoke.
+  seq_length: 2048
+
+
+algorithm:
+  # validate_cfg requires group_size > 1; minimal value that passes.
+  group_size: 2
+  # Smoke runs colocated on a single 24 GB card; kl_beta > 0 builds a
+  # reference policy state dict (another ~6 GB), which OOMs the FSDP init.
+  kl_beta: 0.0
+
+
+data:
+  rollout_batch_size: 4
+  train_data_paths: ["/data/hm_eqa/m2_smoke.jsonl"]
+  max_prompt_length: 512
+
+
+agentloop:
+  scripted_policy: True
+  max_turns: 2
+
+
+# Smoke runs on a single 24 GB card: Qwen2.5-VL-7B can't fit both the SGLang
+# rollout and the FSDP actor at once, so the M2 smoke uses 3B-Instruct. The
+# real-LLM warm-up (§4) keeps the 7B path from the base config.
+rollout:
+  model:
+    model_path: /opt/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gpu_memory_utilization: 0.40
+  max_running_requests: 4
+  cuda_graph_max_bs: 4
+  # Without CUDA graph the rollout grabs less peak GPU memory; that headroom
+  # is needed for the FSDP actor's optimizer-state init on a 24 GB card.
+  enforce_eager: True
+
+
+# FSDP cpu_offload: when actor and rollout are colocated on a single 24 GB
+# card, 3B model + AdamW fp32 states + SGLang model + KV pool exceed VRAM.
+# Putting actor params on CPU during init drops the peak.
+actor:
+  fsdp_config:
+    cpu_offload: True
+    offload_pin_memory: False

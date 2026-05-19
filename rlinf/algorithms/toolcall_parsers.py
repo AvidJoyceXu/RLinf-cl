@@ -124,6 +124,42 @@ class Rstar2QwenToolCallParser:
         return response_text, return_function_calls
 
 
+@register_toolcall_parser("eqa-qwen")
+class EQAQwenToolCallParser:
+    """Tool-call parser for the EQA agent (Qwen2.5-VL chat template).
+
+    Parses `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` blocks and
+    returns ToolRequests with dict-shaped arguments — matches the HabitatEQAToolWorker
+    contract in rlinf/agents/eqa/habitat_eqa_tool_worker.py.
+    """
+
+    def __init__(self) -> None:
+        self.tool_call_start_token: str = "<tool_call>"
+        self.tool_call_end_token: str = "</tool_call>"
+        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+    async def __call__(self, response_text: str) -> tuple[str, list[ToolRequest]]:
+        if (
+            self.tool_call_start_token not in response_text
+            or self.tool_call_end_token not in response_text
+        ):
+            return response_text, []
+        matches = self.tool_call_regex.findall(response_text)
+        function_calls: list[ToolRequest] = []
+        for match in matches:
+            try:
+                call = json.loads(match)
+                name = call["name"]
+                arguments = call.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                function_calls.append(ToolRequest(name=name, arguments=arguments))
+            except Exception as e:
+                logging.error(f"eqa-qwen: failed to decode tool call: {e}")
+        content = self.tool_call_regex.sub("", response_text)
+        return content, function_calls
+
+
 @register_toolcall_parser("wideseek_r1-qwen")
 class WideSeekQwenToolCallParser:
     """Tool-call parser for WideSeek-R1 planner/worker/single-agent roles."""
