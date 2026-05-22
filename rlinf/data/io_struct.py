@@ -772,7 +772,11 @@ class RolloutResult:
         max_response_len = training_seq_length - data_seq_length
 
         # when do_down_sample is enabled, there might be no valid rewards
-        if self.rewards is not None and self.rewards.numel() == 0:
+        _rewards_len = (
+            self.rewards.numel() if isinstance(self.rewards, torch.Tensor)
+            else len(self.rewards)
+        ) if self.rewards is not None else 0
+        if self.rewards is not None and _rewards_len == 0:
             batch = {
                 "input_ids": torch.zeros(0, dtype=torch.long).cuda(),
                 "attention_mask": torch.zeros(0, dtype=torch.bool).cuda(),
@@ -876,7 +880,12 @@ class RolloutResult:
             )
 
         if self.rewards is not None:
-            batch["rewards"] = self.rewards.to(Worker.torch_device_type)
+            if isinstance(self.rewards, torch.Tensor):
+                batch["rewards"] = self.rewards.to(Worker.torch_device_type)
+            else:
+                batch["rewards"] = torch.as_tensor(
+                    self.rewards, dtype=torch.float
+                ).to(Worker.torch_device_type)
 
         if self.rollout_logprobs is not None:
             logprobs = batch_pad_to_fixed_len(
@@ -969,7 +978,7 @@ class RolloutResult:
             "response_mask",
         ]
         for k in list_fields:
-            v = getattr(rollout_result, k)
+            v = getattr(rollout_result, k, None)
             if v is not None:
                 fields_split[k] = split_list(v, split_num)
             else:
@@ -983,7 +992,7 @@ class RolloutResult:
             "returns",
         ]
         for k in optional_tensor_fields:
-            v = getattr(rollout_result, k)
+            v = getattr(rollout_result, k, None)
             if v is not None:
                 fields_split[k] = torch.chunk(v, split_num, dim=0)
             else:
@@ -995,7 +1004,7 @@ class RolloutResult:
             "advantages",
         ]
         for k in optional_tensor_list_fields:
-            v = getattr(rollout_result, k)
+            v = getattr(rollout_result, k, None)
             if v is not None:
                 if isinstance(v, torch.Tensor):
                     fields_split[k] = torch.chunk(v, split_num, dim=0)
@@ -1071,6 +1080,19 @@ class DynamicRolloutResult:
     extra_fields_traj: Optional[dict] = None  # [group_size]
     extra_fields_group: Optional[dict] = None  # [1]
 
+    @property
+    def prompt_ids(self) -> list[list[int]]:
+        """Split prompt tokens from concatenated input_ids using prompt_lengths."""
+        return [ids[:pl] for ids, pl in zip(self.input_ids, self.prompt_lengths)]
+
+    @property
+    def response_ids(self) -> list[list[int]]:
+        """Split response tokens from concatenated input_ids using prompt/response lengths."""
+        return [
+            ids[pl : pl + rl]
+            for ids, pl, rl in zip(self.input_ids, self.prompt_lengths, self.response_lengths)
+        ]
+
     @staticmethod
     def _get_attention_masks_and_position_ids(
         prompt_lengths: torch.Tensor,
@@ -1109,6 +1131,7 @@ class DynamicRolloutResult:
 
     def to_actor_batch(
         self,
+        data_seq_length: int,
         seq_length: int,
         pad_token: int,
     ) -> dict[str, torch.Tensor]:
@@ -1116,6 +1139,9 @@ class DynamicRolloutResult:
         Transform the rollout result into a format suitable for the actor.
 
         Args:
+            data_seq_length (int): Maximum prompt length (unused by DynamicRolloutResult
+                which pads to the full seq_length directly, but required to match the
+                RolloutResult interface called from fsdp_actor_worker.py).
             seq_length (int): Total sequence length for training, e.g., 8192.
             pad_token (int): Token used for padding, e.g., `tokenizer.pad_token_id`.
 

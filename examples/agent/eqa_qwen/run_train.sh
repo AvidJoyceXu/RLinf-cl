@@ -8,6 +8,8 @@ tabs 4
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TOKENIZERS_PARALLELISM=false
 export RAY_DEDUP_LOGS=0
+# H20-3e: NVLink SHARP (NVLS) causes CUDA error 1 on barrier() in containerized env.
+export NCCL_NVLS_ENABLE=0
 
 CONFIG_PATH="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_PATH=$(dirname $(dirname $(dirname "$CONFIG_PATH")))

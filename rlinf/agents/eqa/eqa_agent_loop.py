@@ -72,7 +72,7 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
         assert self.toolcall_parser is not None, (
             "EQAAgentLoopWorker requires agentloop.toolcall_parser (e.g. 'eqa-qwen')"
         )
-        if self.cfg.runner.task_type != "reasoning_eval":
+        if self.cfg.runner.task_type != "reasoning_eval" and not self.scripted_policy:
             assert self.cfg.algorithm.recompute_logprobs, (
                 "EQA agent must use recompute_logprobs (tool insertions re-tokenize)"
             )

@@ -141,6 +141,10 @@ class FSDPActor(FSDPModelManager, Worker):
             cfg (DictConfig): The global yaml configuration.
             placement (ModelParallelComponentPlacement): The accelerator placement for actor worker.
         """
+        # H20-3e (and any NVLink SHARP hardware): NVLS causes CUDA error 1 on
+        # barrier() inside containerized Ray workers. Must be set before any
+        # NCCL collective (including init_process_group) happens in this process.
+        os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
         if cfg_fsdp is None:
             cfg_fsdp = cfg.actor
         Worker.__init__(self)
@@ -886,7 +890,10 @@ class FSDPActor(FSDPModelManager, Worker):
         while recv_batch_size < self.total_batch_size_per_dp:
             batch, rollout_result = self.get_batch(input_channel)
             batches.append(batch)
-            recv_batch_size += rollout_result.num_sequence
+            # Use group_size (number of GRPO trajectories) rather than num_sequence
+            # (total turns), so multi-turn agents accumulate correctly.
+            # total_batch_size_per_dp = rollout_batch_size * group_size // world_size.
+            recv_batch_size += rollout_result.group_size
         assert recv_batch_size == self.total_batch_size_per_dp, (
             f"Expected {self.total_batch_size_per_dp} sequences from channel, but got {recv_batch_size}"
         )

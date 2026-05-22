@@ -116,12 +116,13 @@ tools:
 
 rollout:
   group_name: "RolloutGroup"
-  gpu_memory_utilization: 0.5
+  gpu_memory_utilization: 0.8
   model:
-    # HF cache snapshot dir (Qwen/Qwen2.5-VL-7B-Instruct). Override via Hydra
-    # if the snapshot hash differs in your cache.
-    model_path: /opt/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5
-    model_type: qwen2.5_vl
+    # HF cache snapshot dir (Qwen/Qwen2.5-7B-Instruct, text-only).
+    # RGB perception is off by default (M1-M3); switch to qwen2.5_vl once
+    # observe() RGB returns are wired and a VL snapshot is staged.
+    model_path: /opt/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+    model_type: qwen2.5
     precision: ${actor.model.precision}
   enforce_eager: False
   distributed_executor_backend: mp
@@ -176,7 +177,7 @@ actor:
   calculate_flops: False
   seed: 1234
 
-  enable_offload: True
+  enable_offload: False
 
   global_batch_size: 8
   micro_batch_size: 1
