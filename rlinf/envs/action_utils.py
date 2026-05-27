@@ -60,17 +60,20 @@ def prepare_actions_for_maniskill(
     return chunk_actions
 
 
+_OPENVLA_GRIPPER_MODELS = (SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT)
+
+
 def prepare_actions_for_libero(
     raw_chunk_actions,
     model_type,
 ) -> np.ndarray:
+    # Gripper-convention transform is only correct for models that emit the
+    # OpenVLA gripper convention (gripper in [0,1], 1 = open). LIBERO expects
+    # [-1, 1] with the opposite sign. For residual policies, the caller passes
+    # the *base* model's type so this works whether the base is OpenVLA-OFT
+    # (transform applied) or Pi0/Pi0.5 (already in LIBERO convention).
     chunk_actions = raw_chunk_actions
-    if SupportedModel(model_type) in [
-        SupportedModel.OPENVLA,
-        SupportedModel.OPENVLA_OFT,
-        SupportedModel.RESIDUAL_POLICY,
-        SupportedModel.LORA_RESIDUAL_POLICY,
-    ]:
+    if SupportedModel(model_type) in _OPENVLA_GRIPPER_MODELS:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = np.sign(chunk_actions[..., -1]) * -1.0
     return chunk_actions
@@ -85,12 +88,7 @@ def prepare_actions_for_isaaclab(
     For example, in `RLinf/rlinf/models/embodiment/gr00t/simulation_io.py`
     """
     chunk_actions = torch.from_numpy(raw_chunk_actions)
-    if SupportedModel(model_type) in [
-        SupportedModel.OPENVLA,
-        SupportedModel.OPENVLA_OFT,
-        SupportedModel.RESIDUAL_POLICY,
-        SupportedModel.LORA_RESIDUAL_POLICY,
-    ]:
+    if SupportedModel(model_type) in _OPENVLA_GRIPPER_MODELS:
         chunk_actions[..., -1] = 2 * chunk_actions[..., -1] - 1
         chunk_actions[..., -1] = torch.sign(chunk_actions[..., -1]) * -1.0
     return chunk_actions

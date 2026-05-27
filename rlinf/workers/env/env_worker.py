@@ -58,6 +58,14 @@ class EnvWorker(Worker):
         # stage_num: default to 2, use for pipeline rollout process
         self.stage_num = self.cfg.rollout.pipeline_stage_num
 
+        # Effective model type for action post-processing (gripper convention,
+        # etc.). When residual policy is enabled, the env-facing action is
+        # base_action + res_scale * residual_action and the gripper convention
+        # is governed by the *base* model, not the residual.
+        self._action_model_type = self.cfg.actor.model.model_type
+        if self.cfg.get("residual_policy", {}).get("enabled", False):
+            self._action_model_type = self.cfg.actor.base_model.model_type
+
         # Env configurations
         self.only_eval = getattr(self.cfg.runner, "only_eval", False)
         self.enable_eval = self.cfg.runner.val_check_interval > 0 or self.only_eval
@@ -138,7 +146,7 @@ class EnvWorker(Worker):
         chunk_actions = prepare_actions(
             raw_chunk_actions=chunk_actions,
             env_type=self.cfg.env.train.env_type,
-            model_type=self.cfg.actor.model.model_type,
+            model_type=self._action_model_type,
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),
@@ -198,7 +206,7 @@ class EnvWorker(Worker):
         chunk_actions = prepare_actions(
             raw_chunk_actions=raw_actions,
             env_type=self.cfg.env.train.env_type,
-            model_type=self.cfg.actor.model.model_type,
+            model_type=self._action_model_type,
             num_action_chunks=self.cfg.actor.model.num_action_chunks,
             action_dim=self.cfg.actor.model.action_dim,
             policy=self.cfg.actor.model.get("policy_setup", None),

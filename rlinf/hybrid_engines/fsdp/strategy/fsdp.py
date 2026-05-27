@@ -65,12 +65,21 @@ class FSDPStrategy(FSDPStrategyBase):
             self.cfg.fsdp_config.sharding_strategy
         )
 
+        # `is_openvla_model` controls whether the VisionTransformer /
+        # PrismaticProjector wrap policies are added (and `prismatic` is
+        # imported). For residual training, the wrapped module is the residual
+        # MLP, but the *base* model — loaded in the rollout worker — is what
+        # determines whether we're in an OpenVLA environment. Dispatch on the
+        # base when present, otherwise on the model itself.
+        wrap_policy_model_cfg = (
+            self.cfg.base_model if "base_model" in self.cfg else self.cfg.model
+        )
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=model,
             config=None,
             is_lora=self.cfg.model.is_lora,
-            is_openvla_model=SupportedModel(self.cfg.model.model_type)
-            in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT, SupportedModel.RESIDUAL_POLICY, SupportedModel.LORA_RESIDUAL_POLICY],
+            is_openvla_model=SupportedModel(wrap_policy_model_cfg.model_type)
+            in [SupportedModel.OPENVLA, SupportedModel.OPENVLA_OFT],
         )
 
         backward_prefetch = get_backward_prefetch_strategy(
