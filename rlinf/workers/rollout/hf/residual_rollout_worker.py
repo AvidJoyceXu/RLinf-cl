@@ -43,24 +43,48 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
-        
+
         # Residual policy configuration
         self.residual_cfg = cfg.get("residual_policy", {})
         self.use_residual = self.residual_cfg.get("enabled", False)
-        
+
         if self.use_residual:
             self.res_scale = self.residual_cfg.get("res_scale", 0.1)
             self.prog_explore = self.residual_cfg.get("prog_explore", 10000)
             self.prog_explore_threshold = self.residual_cfg.get("prog_explore_threshold", 0)
             self.actor_input = cfg.get("network", {}).get("actor_input", "obs")
             self.critic_input = cfg.get("network", {}).get("critic_input", "res")
-            
+
             # Base model will be loaded in init_worker
             self.base_model = None
             self.base_model_config = None
-            
+            self.base_model_type = None
+
             # Global step for progressive exploration
             self.global_step = 0
+
+    def _get_base_model_kwargs(self, mode: str) -> dict:
+        """Build kwargs for base_model.predict_action_batch based on its model type.
+
+        OpenVLA / OpenVLA-OFT consume autoregressive sampling kwargs
+        (do_sample, temperature, top_k, ...). OpenPI / Pi05 only take
+        ``mode``, ``compute_values``, ``return_obs``.
+        """
+        if self.base_model_type in (
+            SupportedModel.OPENVLA,
+            SupportedModel.OPENVLA_OFT,
+        ):
+            kwargs = (
+                self._train_sampling_params
+                if mode == "train"
+                else self._eval_sampling_params
+            ).copy()
+            kwargs["calulate_logprobs"] = False
+            kwargs["calulate_values"] = False
+            kwargs["return_obs"] = False
+            return kwargs
+        # OpenPI (pi0 / pi05), MLP, CNN, GR00T all take only mode-style kwargs.
+        return {"mode": mode, "compute_values": False, "return_obs": False}
 
     def init_worker(self):
         """Initialize worker with residual policy support."""
@@ -78,17 +102,21 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             if base_model_path is None:
                 raise ValueError("base_model_path must be specified when residual_policy.enabled=True")
             
-            # Create base model config (OpenVLA)
+            # Create base model config (OpenVLA-OFT, Pi0/Pi0.5, ...)
             base_model_config = copy.deepcopy(self.cfg.actor.base_model)
             self.base_model = get_model(base_model_config)
             self.base_model.eval()
             self.base_model_config = base_model_config
-            
+            self.base_model_type = SupportedModel(base_model_config.model_type)
+
             # Freeze base model parameters
             for param in self.base_model.parameters():
                 param.requires_grad = False
-            
-            print(f"[ResidualRolloutWorker] Base model loaded from {base_model_path}")
+
+            print(
+                f"[ResidualRolloutWorker] Base model ({self.base_model_type.value}) "
+                f"loaded from {base_model_path}"
+            )
             print(f"[ResidualRolloutWorker] Residual policy enabled with res_scale={self.res_scale}")
 
         self.setup_sample_params()
@@ -119,17 +147,9 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         # Use raw_env_obs for base model if provided, otherwise use env_obs
         # Base model needs raw env_obs with task_descriptions
         base_env_obs = raw_env_obs if raw_env_obs is not None else env_obs
-        # Prepare sampling parameters for base model
-        base_kwargs = (
-            self._train_sampling_params
-            if mode == "train"
-            else self._eval_sampling_params
-        )
-        base_kwargs = base_kwargs.copy()
-        base_kwargs["calulate_logprobs"] = False
-        base_kwargs["calulate_values"] = False
-        base_kwargs["return_obs"] = False
-        
+        # Prepare sampling parameters for base model based on its type
+        base_kwargs = self._get_base_model_kwargs(mode)
+
         # Get base action from base model
         with torch.no_grad():
             base_chunk_actions, base_result = self.base_model.predict_action_batch(
