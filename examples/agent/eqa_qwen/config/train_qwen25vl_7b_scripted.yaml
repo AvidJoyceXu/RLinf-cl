@@ -8,18 +8,6 @@ defaults:
   - train_qwen25vl_7b
 
 
-cluster:
-  # H20-3e: NVLink SHARP (NVLS) causes CUDA error 1 on barrier() in containers.
-  # Set NCCL_NVLS_ENABLE=0 for all Ray workers via node_groups env_configs.
-  node_groups:
-    - label: "all"
-      node_ranks: all
-      env_configs:
-        - node_ranks: all
-          env_vars:
-            - NCCL_NVLS_ENABLE: "0"
-
-
 runner:
   experiment_name: eqa-m2-scripted-smoke
   max_epochs: 1

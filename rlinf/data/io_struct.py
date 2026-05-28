@@ -1072,6 +1072,16 @@ class DynamicRolloutResult:
     rewards: Optional[torch.Tensor | list[float]] = None
     advantages: Optional[torch.Tensor] = None
 
+    # Fields not produced by the dynamic agent loop but read (via `is not None`
+    # guards) by RolloutResult.merge_result_list, which fsdp_actor_worker.py
+    # invokes on lists of DynamicRolloutResult in the dynamic-batch path.
+    # Presence with default None lets the guards skip cleanly.
+    response_mask: Optional[list[list[int]]] = None
+    answers: Optional[list[str | dict]] = None
+    multi_modal_inputs: Optional[list[dict]] = None
+    values: Optional[torch.Tensor] = None
+    returns: Optional[torch.Tensor] = None
+
     # extra fields used in training for custom process
     extra_fields_train: dict[str, list] = field(default_factory=dict)  # [num_sequence]
 

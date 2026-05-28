@@ -141,10 +141,6 @@ class FSDPActor(FSDPModelManager, Worker):
             cfg (DictConfig): The global yaml configuration.
             placement (ModelParallelComponentPlacement): The accelerator placement for actor worker.
         """
-        # H20-3e (and any NVLink SHARP hardware): NVLS causes CUDA error 1 on
-        # barrier() inside containerized Ray workers. Must be set before any
-        # NCCL collective (including init_process_group) happens in this process.
-        os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
         if cfg_fsdp is None:
             cfg_fsdp = cfg.actor
         Worker.__init__(self)
@@ -539,12 +535,20 @@ class FSDPActor(FSDPModelManager, Worker):
         rollout_result: RolloutResult,
         compute_ref_logprobs: bool,
     ):
+        # When num_sequence < logprob_forward_micro_batch_size (typical for
+        # smoke runs with rollout_batch_size=2), the floor-division yields 0
+        # and _split_to_micro_batch's non-dynamic path divides by zero in
+        # get_iterator_k_split. Clamp to at least 1 micro-batch.
+        split_num = max(
+            1,
+            rollout_result.num_sequence
+            // self.cfg.algorithm.logprob_forward_micro_batch_size,
+        )
         micro_batches_iter, _, dbs_indices = self._split_to_micro_batch(
             batch,
             self.enable_dynamic_batch_size,
             max_tokens_per_mbs=self.max_tokens_per_mbs,
-            split_num=rollout_result.num_sequence
-            // self.cfg.algorithm.logprob_forward_micro_batch_size,
+            split_num=split_num,
         )
         if self.enable_dynamic_batch_size:
             indices = sum(dbs_indices, [])

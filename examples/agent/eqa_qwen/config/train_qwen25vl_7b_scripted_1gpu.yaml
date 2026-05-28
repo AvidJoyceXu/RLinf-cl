@@ -1,0 +1,44 @@
+# M2 scripted-policy smoke on a SINGLE H20-3e (~140 GB) card.
+# Mirrors train_qwen25vl_7b_scripted but compresses placement to 1 GPU and
+# loosens memory so FSDP actor + SGLang rollout can coexist via offload.
+# See code-doc/0525 - Debug Launch.md.
+defaults:
+  - train_qwen25vl_7b_scripted
+
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout,reward: 0
+
+
+runner:
+  # Host `/` is at 98% capacity; redirect the smoke run's ~14 GB checkpoint into
+  # the bind-mounted /data2 (code-doc -> /workspace/code-doc) rather than the
+  # container's writable layer.
+  output_dir: /workspace/code-doc/logs/results-1gpu
+
+  # Dynamic batch packs sequences via prepare_pack_fsdp, which assumes the
+  # RolloutResult left-padded prompt layout. DynamicRolloutResult uses
+  # right-padding (see io_struct.py:1052), so pack indices land in pad regions
+  # and the actor's backward trips a CUDA illegal memory access. Disable
+  # packing for the 1-GPU scripted smoke until the FSDP pack path is made
+  # layout-aware (see code-doc/0525 - single-card RL infra debugging plan.md §5).
+  enable_dynamic_batch_size: False
+
+
+data:
+  # global_batch_size = rollout_batch_size * group_size / n_minibatches
+  #                   = 2 * 2 / 2 = 2, divisible by actor_world_size=1.
+  rollout_batch_size: 2
+
+
+actor:
+  global_batch_size: 2
+  # CPU-offload optimizer/params while SGLang holds the GPU.
+  enable_offload: True
+
+
+rollout:
+  # Leave headroom for FSDP weights+grads+optimizer when offload swaps back in.
+  gpu_memory_utilization: 0.5
