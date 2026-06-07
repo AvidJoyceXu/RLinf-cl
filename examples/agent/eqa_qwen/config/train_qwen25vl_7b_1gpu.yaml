@@ -1,0 +1,31 @@
+# M3 real-inference smoke on a SINGLE H20-3e (~140 GB).
+# Inherits the 1-GPU scripted config (placement=0, offload, mem 0.5,
+# enable_dynamic_batch_size=False, output redirect to /data2) but turns the
+# real LLM policy back on: the model is actually prompted and its <tool_call>
+# output is parsed and dispatched. See code-doc/0525 - single-card RL infra
+# debugging plan.md.
+defaults:
+  - train_qwen25vl_7b_scripted_1gpu
+
+
+runner:
+  experiment_name: eqa-m3-real-smoke
+  # keep the smoke short; bump once the loop is verified
+  max_steps: 1
+
+
+data:
+  # The prompt now carries the system instruction + full tool schema + question
+  # + options (built in EQAAgentLoopWorker.pre_process_query). The bare 512
+  # budget truncates the tool schema, so widen it. response budget =
+  # seq_length(8192) - 2048 = 6144 tokens across all turns.
+  max_prompt_length: 2048
+
+
+agentloop:
+  scripted_policy: False
+  max_turns: 6
+  print_outputs: True
+  # Per-episode JSON-line traces (question, skill sequence, tool results,
+  # reward) for offline inspection. Bind-mounted code-doc -> /workspace/code-doc.
+  trace_dump_dir: /workspace/code-doc/logs/results-1gpu-real/traces

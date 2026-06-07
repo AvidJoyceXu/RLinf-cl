@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from typing import Any
 from uuid import uuid4
 
@@ -53,6 +54,35 @@ _SCRIPTED_TURNS = [
 ]
 
 
+_SYSTEM_PROMPT = (
+    "You are an embodied agent exploring a 3D indoor scene to answer a "
+    "multiple-choice question. You act over multiple turns by calling exactly "
+    "one tool per turn. First explore the scene (e.g. `observe`, `go_to_object`, "
+    "`look_at`, `query_object`) to gather evidence, recording findings with "
+    "`wm_write_node` and recalling them with `wm_query`. When confident, call "
+    "`submit_answer` with the letter (A/B/C/D) of the correct option."
+)
+
+
+def _eqa_tool_schemas() -> list[dict]:
+    """Tool schemas for the Qwen native `tools=` chat template; matches the
+    eqa-qwen parser / HabitatEQAToolWorker contract. Imported lazily so the
+    agent-loop worker does not hard-depend on spatialcode at module import."""
+    from spatialcode.embodied.eqa_episode import tool_schemas
+
+    return list(tool_schemas())
+
+
+def _build_prompt_messages(spec: dict) -> list[dict]:
+    options = spec.get("options") or {}
+    options_text = "\n".join(f"{k}. {v}" for k, v in options.items())
+    user = f"Question: {spec.get('question', '')}\nOptions:\n{options_text}"
+    return [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
 class EQAAgentLoopWorker(MultiAgentLoopWorker):
     """Agent loop for the EQA task — Qwen2.5-VL emits <tool_call> JSON.
 
@@ -68,6 +98,10 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
         max_total_len = int(self.cfg.runner.seq_length)
         self.max_resp_len = max(1, max_total_len - self.max_prompt_len)
         self.scripted_policy: bool = bool(cfg.agentloop.get("scripted_policy", False))
+        # When set, every finished episode is appended (as one JSON line) to
+        # {trace_dump_dir}/trace_pid{pid}.jsonl for offline inspection of the
+        # model's skill sequence / reward. Off (None) by default.
+        self.trace_dump_dir: str | None = cfg.agentloop.get("trace_dump_dir", None)
 
         assert self.toolcall_parser is not None, (
             "EQAAgentLoopWorker requires agentloop.toolcall_parser (e.g. 'eqa-qwen')"
@@ -76,6 +110,14 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
             assert self.cfg.algorithm.recompute_logprobs, (
                 "EQA agent must use recompute_logprobs (tool insertions re-tokenize)"
             )
+
+    def _dump_trace(self, record: dict) -> None:
+        if not self.trace_dump_dir:
+            return
+        os.makedirs(self.trace_dump_dir, exist_ok=True)
+        path = os.path.join(self.trace_dump_dir, f"trace_pid{os.getpid()}.jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     # --------------------------------------------------------------- lifecycle
 
@@ -100,6 +142,27 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
             episode_id, async_op=True
         ).async_wait()
 
+        # The dataset row's `prompt` is just the bare question. For real
+        # generation the model needs the system prompt + tool schema + options,
+        # so rebuild the prompt from the spec and chat-template it. (Scripted
+        # policy ignores prompt content, so this is harmless there too.) The
+        # built prompt must fit within max_prompt_len — bump data.max_prompt_length
+        # in the config if the tool schema gets truncated.
+        messages = _build_prompt_messages(spec_dict)
+        # Pass tools via the Qwen2.5 native template — it injects the canonical
+        # <tool_call>{"name":...,"arguments":...}</tool_call> format the model is
+        # tuned to emit and that the eqa-qwen parser expects. (Hand-embedding the
+        # schema in the system text made the model improvise a bare `name {args}`
+        # format the parser couldn't read.)
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages,
+            tools=_eqa_tool_schemas(),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        built_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_ids = built_ids[: self.max_prompt_len]
+
         ctx = {
             "episode_id": episode_id,
             "answer": str(spec_dict["answer"]),
@@ -107,10 +170,10 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
             "question": spec_dict.get("question", ""),
             "turn": 0,
             "all_llm_response_ids": [],
-            "problem_prompt_ids": copy.deepcopy(prompt_ids[: self.max_prompt_len]),
+            "problem_prompt_ids": copy.deepcopy(prompt_ids),
             "tool_trace": [],
         }
-        return prompt_ids[: self.max_prompt_len], ctx
+        return prompt_ids, ctx
 
     async def post_process_query(
         self, generate_context: dict[str, Any], output: MultiAgentLoopOutput
@@ -157,6 +220,19 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
             for t in output.single_turn_outputs
         ]
         output.extra_fields["tool_trace"] = generate_context["tool_trace"]
+
+        self._dump_trace(
+            {
+                "episode_id": episode_id,
+                "question": generate_context["question"],
+                "options": generate_context["options"],
+                "answer_gt": generate_context["answer"],
+                "num_turns": generate_context["turn"],
+                "reward": reward_score,
+                "response_text": response_text,
+                "tool_trace": generate_context["tool_trace"],
+            }
+        )
         return output
 
     # ----------------------------------------------------------------- generate
@@ -190,6 +266,12 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
 
         if "</tool_call>" in llm_response_text:
             llm_response_text = llm_response_text.split("</tool_call>")[0] + "</tool_call>"
+            llm_response_ids = self.tokenizer.encode(llm_response_text, add_special_tokens=False)
+        elif "<tool_call>" in llm_response_text:
+            # Generation stopped on the "</tool_call>" stop string, which the
+            # rollout engine trims from the output. Re-append it so the parser's
+            # open+close check passes.
+            llm_response_text = llm_response_text + "</tool_call>"
             llm_response_ids = self.tokenizer.encode(llm_response_text, add_special_tokens=False)
 
         llm_output = AgentLoopOutput(

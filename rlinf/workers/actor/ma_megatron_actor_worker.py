@@ -110,6 +110,7 @@ class MAMegatronActor(MegatronActor):
                 ],
             )
         batch = result.to_actor_batch(
+            self.cfg.data.max_prompt_length,
             self.cfg.actor.model.encoder_seq_length,
             self.tokenizer.eos_token_id,
         )

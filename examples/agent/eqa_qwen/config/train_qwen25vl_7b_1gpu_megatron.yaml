@@ -1,0 +1,335 @@
+# M3 real-inference smoke on a SINGLE H20-3e (~140 GB) using the MEGATRON actor.
+#
+# Why this exists: the FSDP actor has no multi-agent (MA) multi-turn path, so
+# real (variable-turn) rollouts trip
+#   RolloutResult.split_results: num_sequence % (group_size * split_num) == 0
+# (see code-doc/0528 - M3 real-inference status and open issues.md, Issue A).
+# The Megatron MA actor (MAMegatronActor, selected by train.py when
+# actor.training_backend == megatron) has a purpose-built ragged multi-turn
+# split (DynamicRolloutResult.split_results by per-group turn counts) + loss
+# scales over group/agent/turn, so it solves Issue A by construction.
+#
+# Checkpoint: NO separate Megatron checkpoint is needed. The existing HF
+# Qwen2.5-7B-Instruct snapshot is converted to Megatron on-the-fly at startup
+# (megatron.use_hf_ckpt: True + ckpt_convertor; agent_runner.py:128-141).
+# Qwen2.5-7B is in the convertor's supported list (default_args.yaml).
+#
+# Memory: Megatron + on-the-fly HF->MG conversion + collocated SGLang on one
+# card is heavy (this is the OOM that originally drove the FSDP move). We lean
+# on full activation recompute + offload of optimizer/weight/grad + rollout
+# gpu_memory_utilization 0.5. If it still OOMs, drop runner.seq_length first.
+#
+# This config is intentionally self-contained (mirrors the searchr1 megatron
+# template) rather than inheriting the FSDP chain, to avoid mixing FSDP-shaped
+# actor keys with the Megatron actor block.
+defaults:
+  - override hydra/job_logging: stdout
+
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout,reward: 0
+
+
+runner:
+  task_type: reasoning
+  experiment_name: eqa-m3-real-smoke-megatron
+  logger:
+    log_path: ${runner.output_dir}/${runner.experiment_name}
+    project_name: rlinf
+    experiment_name: ${runner.experiment_name}
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  # keep the smoke short; bump once the loop is verified
+  max_steps: 1
+  val_check_interval: 1
+  save_interval: 1
+
+  seq_length: 8192
+
+  # Megatron MA path handles ragged batches via get_batch_pad + pack_traj_batch;
+  # it does NOT use the FSDP dynamic-pack path that crashed in Bug #2. Leave the
+  # global flag off; pack_traj on the actor drives Megatron packing.
+  enable_dynamic_batch_size: False
+  max_tokens_per_mbs: 11008
+
+  resume_dir: null
+  # Host `/` is ~97% full; keep checkpoints + the converted Megatron ckpt on
+  # the bind-mounted /data2 (code-doc -> /workspace/code-doc).
+  output_dir: /workspace/code-doc/logs/results-1gpu-megatron
+
+
+algorithm:
+  # group_size > 1 required by validate_cfg; keep minimal for the smoke.
+  group_size: 2
+  n_minibatches: 1
+  training_batch_size_per_gpu: 1
+  rollout_batch_size_per_gpu: null
+
+  logprob_forward_micro_batch_size: 1
+  val_rollout_batch_size_per_gpu: 1
+
+  recompute_logprobs: True
+  shuffle_rollout: False
+
+  loss_type: actor
+  loss_agg_func: "token-mean"
+  # No reference policy for the smoke.
+  kl_beta: 0.0
+  kl_penalty_type: low_var_kl
+  ratio_clip_eps: 0.2
+  entropy_bonus: 0.0
+  calculate_entropy: False
+  clip_ratio_c: null
+  clip_ratio_low: null
+  clip_ratio_high: null
+
+  # MA-GRPO: dynamic (ragged multi-turn) advantage + loss scales over
+  # group/agent/turn. This is the path MAMegatronActor implements.
+  adv_type: grpo_dynamic
+  loss_scales: ["group_level", "agent_level", "turn_level"]
+  advantage_mode: trajectory
+  normalize_advantages: False
+  early_stop_imp_ratio: 5.0
+  use_valid_token_scale: False
+
+  sampling_params:
+    do_sample: True
+    temperature: 1.0
+    top_k: 1000000
+    top_p: 1.0
+    repetition_penalty: 1.0
+    max_new_tokens: ${subtract:${runner.seq_length}, ${data.max_prompt_length}}
+    min_new_tokens: 1
+    stop: ["</tool_call>", "<|im_end|>"]
+
+
+data:
+  type: math
+  # The prompt carries system instruction + full tool schema + question +
+  # options (built in EQAAgentLoopWorker.pre_process_query); 512 truncates it.
+  max_prompt_length: 2048
+  filter_prompt_by_length: True
+  # global_batch_size = rollout_batch_size * group_size / n_minibatches
+  #                   = 2 * 2 / 1 = 4.
+  rollout_batch_size: 2
+  val_rollout_batch_size: null
+  num_workers: 2
+  prompt_key: prompt
+  answer_key: solutions
+  apply_chat_template: False
+  shuffle: True
+  validation_shuffle: True
+  seed: 1234
+  train_data_paths: ["/data/hm_eqa/m2_smoke.jsonl"]
+
+
+agentloop:
+  group_name: "AgentLoopGroup"
+  toolcall_parser: "eqa-qwen"
+  max_turns: 6
+  max_tool_response_length: 800
+  tool_response_truncate_side: "right"
+  print_outputs: True
+  is_dynamic_rollout_batch: True
+  scripted_policy: False
+  # Per-episode JSON-line traces for offline inspection.
+  trace_dump_dir: /workspace/code-doc/logs/results-1gpu-megatron/traces
+
+
+tools:
+  habitat_eqa:
+    pool_size: 1
+    render_rgb: False
+
+
+rollout:
+  group_name: "RolloutGroup"
+  # Leave headroom for Megatron weights+grads+optimizer when offload swaps back.
+  gpu_memory_utilization: 0.5
+  model:
+    # HF cache snapshot dir (Qwen/Qwen2.5-7B-Instruct, text-only). Converted to
+    # Megatron on-the-fly via ckpt_convertor below.
+    model_path: /opt/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
+    model_type: qwen2.5
+    precision: ${actor.model.precision}
+  enforce_eager: False
+  distributed_executor_backend: mp
+  disable_log_stats: False
+  detokenize: True
+  padding: null
+  eos: null
+  return_logprobs: ${not:${algorithm.recompute_logprobs}}
+
+  rollout_backend: sglang
+  sglang:
+    attention_backend: triton
+    decode_log_interval: 500000
+    use_torch_compile: False
+    torch_compile_max_bs: 128
+  vllm:
+    attention_backend: FLASH_ATTN
+    enable_chunked_prefill: True
+    enable_prefix_caching: True
+    enable_flash_infer_sampler: True
+    max_num_batched_tokens: null
+    torch_profiler_dir: null
+
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_running_requests: 64
+  cuda_graph_max_bs: 64
+
+  validate_weight_first_sync: True
+  validate_weight: False
+  validate_save_dir: null
+  print_outputs: False
+
+
+reward:
+  group_name: "RewardGroup"
+  use_reward_model: False
+  reward_type: 'eqa'
+  reward_scale: 1.0
+
+  tokenizer:
+    tokenizer_model: ${actor.tokenizer.tokenizer_model}
+    use_fast: ${actor.tokenizer.use_fast}
+    trust_remote_code: ${actor.tokenizer.trust_remote_code}
+    padding_side: ${actor.tokenizer.padding_side}
+
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: megatron
+  enable_dp_load_balance: True
+  calculate_flops: False
+  seed: 1234
+
+  pack_traj: True
+  # megatron config
+  mcore_gpt: True
+  spec_name: decoder_gpt
+
+  # CPU-offload optimizer/params/grad while SGLang holds the GPU.
+  offload_optimizer: True
+  offload_weight: True
+  offload_grad: True
+
+  global_batch_size: 4
+  micro_batch_size: 1
+
+  model:
+    precision: bf16
+
+    seq_length: ${runner.seq_length}
+    encoder_seq_length: ${runner.seq_length}
+
+    # converted at startup from HF; no pre-existing Megatron ckpt.
+    megatron_checkpoint: null
+
+    # Qwen2.5-7B megatron model config
+    activation: swiglu
+    normalization: rmsnorm
+    add_bias_linear: False
+    position_embedding_type: rope
+
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    sequence_parallel: False
+
+    # Full activation recompute over all 28 layers to fit a single card.
+    recompute_method: block
+    recompute_granularity: full
+    recompute_num_layers: 28
+
+    apply_rope_fusion: True
+    bias_dropout_fusion: False
+    persist_layer_norm: False
+    bias_activation_fusion: False
+    attention_softmax_in_fp32: True
+    batch_p2p_comm: False
+    variable_seq_lengths: True
+    gradient_accumulation_fusion: False
+    moe_token_dispatcher_type: alltoall
+    use_cpu_initialization: False
+
+  optim:
+    optimizer: adam
+    lr: 1.0e-06
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-05
+    min_lr: 0.0
+    weight_decay: 0.01
+    clip_grad: 0.8
+
+    use_distributed_optimizer: True
+    overlap_grad_reduce: False
+    overlap_param_gather: False
+    optimizer_enable_pin: False
+    overlap_param_gather_with_optimizer_step: False
+
+    # bf16 (Qwen native) -> no grad scale needed.
+    bf16: True
+    fp16: False
+
+  lr_sched:
+    lr_warmup_fraction: 0.05
+    lr_warmup_init: 0.0
+    lr_warmup_iters: 0
+    max_lr: 1.0e-06
+    min_lr: 0.0
+    lr_decay_style: constant
+    lr_decay_iters: 1000
+
+  tokenizer:
+    tokenizer_model: ${rollout.model.model_path}
+    use_fast: False
+    trust_remote_code: True
+    padding_side: 'right'
+
+  megatron:
+    ddp_bucket_size: null
+    distributed_backend: nccl
+    distributed_timeout_minutes: 30
+    ckpt_format: torch
+    use_dist_ckpt: False
+    tp_comm_bootstrap_backend: nccl
+    tp_comm_overlap_cfg: null
+    # Convert the HF snapshot to Megatron at startup and train from it.
+    use_hf_ckpt: True
+    use_profiler: False
+
+    ckpt_convertor:
+      model: Qwen2.5-7B
+      hf_model_path: ${rollout.model.model_path}
+      # Converted Megatron ckpt lands on /data2 (host / is ~97% full).
+      save_path: ${runner.output_dir}/${runner.experiment_name}/converted_ckpts/actor
+      use_gpu_num: 0
+      use_gpu_index: null
+      process_num: 16
+      tensor_model_parallel_size: ${actor.model.tensor_model_parallel_size}
+      pipeline_model_parallel_size: ${actor.model.pipeline_model_parallel_size}
+
+
+inference:
+  model_type: ${rollout.model.model_type}
+  group_name: "InferenceGroup"
+  load_from_actor: True
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    sequence_parallel: False
+
+
+critic:
+  use_critic_model: False

@@ -1,0 +1,52 @@
+# M3 real-inference smoke on ALL 8x H20-3e (~140 GB each) using the MEGATRON
+# actor (MAMegatronActor). Goal: prove Issue A is solved end-to-end — real
+# variable-turn rollouts -> reward -> advantage -> backprop -> optimizer step,
+# without the FSDP split divisibility crash.
+#
+# Inherits the verified single-card Megatron config and overrides only what
+# scales to 8 collocated cards.
+#
+# Parallelism: actor,rollout,reward collocated on all 8 cards. TP=1/PP=1 (from
+# parent) -> actor data-parallel size = 8. The MA inference loop consumes
+# rollout_batch_size // dp_world_size groups per rank, so rollout_batch_size
+# MUST be divisible by 8 (ma_megatron_actor_worker.py:531). The distributed
+# optimizer shards Adam state across the 8 DP ranks, so memory is comfortable.
+defaults:
+  - train_qwen25vl_7b_1gpu_megatron
+
+
+cluster:
+  component_placement:
+    actor,rollout,reward: all
+
+
+runner:
+  experiment_name: eqa-m3-real-smoke-megatron-8gpu
+  output_dir: /workspace/code-doc/logs/results-8gpu-megatron
+  max_steps: 1
+  # Skip validation + checkpoint save for the smoke: we only need to confirm
+  # one rollout->reward->backprop->optim cycle completes. (>max_steps disables.)
+  val_check_interval: 100000
+  save_interval: 100000
+
+
+algorithm:
+  # 8 GRPO samples per prompt -> reward variance for the advantage.
+  group_size: 8
+  n_minibatches: 1
+
+
+data:
+  # 8 prompts (groups), one per DP rank. Divisible by dp_world_size=8.
+  rollout_batch_size: 8
+
+
+actor:
+  # global_batch_size divisible by micro_batch_size(1) * dp(8). The MA path also
+  # recomputes the effective gbs at runtime via configure_batch_sizes.
+  global_batch_size: 8
+  micro_batch_size: 1
+
+
+agentloop:
+  trace_dump_dir: /workspace/code-doc/logs/results-8gpu-megatron/traces
