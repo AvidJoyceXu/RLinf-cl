@@ -682,3 +682,111 @@ class Robo2VLMSFTDataset(Robo2VLMDataset):
             label_mask,
             multi_modal_inputs,
         )
+
+
+@VLMDatasetRegistry.register("eqa_toolcall")
+class EqaToolCallSftDataset(VLMBaseDataset):
+    """Multi-turn tool-call SFT dataset for the HM-EQA agent.
+
+    Consumes the JSONL written by `spatialcode/scripts/build_sft_dataset.py`
+    (one synthesized expert trajectory per row). Unlike the single-turn
+    `VLMSftDataset` (one trailing answer span), each example here is a whole
+    trajectory whose trainable assistant `<tool_call>` spans are INTERLEAVED with
+    masked tool-response spans — so the label mask is a union of disjoint spans,
+    which the single-turn prefix-subtraction masking cannot express. See
+    code-doc/0607 §4.5 for the full argument.
+
+    Token layout exactly mirrors the RL rollout's flat continuation (no per-turn
+    chat headers / `<tool_response>` wrappers / `<|im_end|>`), built via
+    `spatialcode.sft_format`. This makes SFT a faithful cold-start for the GRPO
+    rollout in `rlinf/agents/eqa/eqa_agent_loop.py`.
+
+    Expected row keys: `prompt_messages` (canonical system+user messages),
+    `tool_steps` (each: name, arguments, reasoning?, result_text), `answer`.
+
+    Text-only (Phase 1, no rendered RGB): `multi_modal_inputs={}`.
+    """
+
+    def __init__(
+        self,
+        data_paths,
+        config: DictConfig,
+        tokenizer: AutoTokenizer,
+        eval_dataset: bool = False,
+    ) -> None:
+        super().__init__(data_paths, config, tokenizer)
+        self.eval_dataset = eval_dataset
+        # Full-sequence cap (prompt + all turns). Distinct from max_prompt_length,
+        # which only bounds the prompt.
+        self.max_seq_length = int(
+            config.data.get("max_length", config.runner.get("seq_length", 4096))
+        )
+        self._eqa_tools = None  # lazy; see _tool_schemas()
+
+    def _tool_schemas(self) -> list[dict]:
+        """The tool schema used to render the prompt — must match the schema the
+        rollout passes to `apply_chat_template(tools=...)`. Prefer the sidecar the
+        builder wrote (`data.tool_schemas_path`, Habitat-free); else lazy-import
+        the canonical source (pulls Habitat, fine inside the training container)."""
+        if self._eqa_tools is not None:
+            return self._eqa_tools
+        path = self.cfg.data.get("tool_schemas_path", None)
+        if path:
+            with open(path) as f:
+                self._eqa_tools = json.load(f)
+        else:
+            from spatialcode.embodied.eqa_episode import tool_schemas
+
+            self._eqa_tools = list(tool_schemas())
+        return self._eqa_tools
+
+    def _process_raw_record(self, raw: dict[str, Any], idx: int) -> DatasetItem:
+        from spatialcode.sft_format import format_tool_call, truncate_keeping_final
+
+        messages = raw["prompt_messages"]
+        prompt_text = self.tokenizer.apply_chat_template(
+            messages,
+            tools=self._tool_schemas(),
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        # add_special_tokens=False mirrors EQAAgentLoopWorker.pre_process_query.
+        prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+
+        if self.eval_dataset:
+            # Held-out agentic accuracy is measured by the agent loop in
+            # reasoning_eval mode (code-doc/0607 §6), not the SFT worker's
+            # single-shot generation. Here we just expose the prompt so the
+            # worker's eval runs without error; label_mask=all-True (no loss).
+            input_ids, label_mask = list(prompt_ids), [True] * len(prompt_ids)
+        else:
+            turns = []
+            for step in raw["tool_steps"]:
+                call = format_tool_call(
+                    step["name"], step.get("arguments") or {}, step.get("reasoning")
+                )
+                call_ids = self.tokenizer.encode(call, add_special_tokens=False)
+                resp_ids = self.tokenizer.encode(
+                    step.get("result_text", ""), add_special_tokens=False
+                )
+                turns.append((call_ids, resp_ids))
+            input_ids, label_mask = truncate_keeping_final(
+                prompt_ids, turns, self.max_seq_length
+            )
+
+        input_ids_t = torch.tensor(input_ids, dtype=torch.long)
+        attention_mask = torch.ones(len(input_ids), dtype=torch.long)
+        label_mask_t = torch.tensor(label_mask, dtype=torch.bool)
+
+        return SftDatasetItem(
+            prompt=input_ids_t,
+            length=int(input_ids_t.numel()),
+            idx=idx,
+            image_data=[None],
+            answer=str(raw.get("answer", "")),
+            prompt_text=prompt_text,
+            attention_mask=attention_mask,
+            label_mask=label_mask_t,
+            meta={"scene_id": raw.get("scene_id"), "num_turns": raw.get("num_turns")},
+            multi_modal_inputs={},
+        )

@@ -90,6 +90,11 @@ class FSDPVlmSftWorker(FSDPSftWorker):
             SupportedModel.QWEN2_5_VL_SFT,
             SupportedModel.QWEN3_VL_SFT,
             SupportedModel.QWEN3_VL_MOE_SFT,
+            # Text Qwen2.5 (EQA tool-call SFT, Phase-1 text-only). The model loader
+            # auto-selects AutoModelForCausalLM for text configs and the forward
+            # path is image-agnostic (multi_modal_inputs={}), so the only thing
+            # this branch needs is a text-only VLMDatasetRegistry dataset.
+            SupportedModel.QWEN2_5,
         ]:
             from torch.utils.data import DataLoader, DistributedSampler
 
@@ -187,6 +192,7 @@ class FSDPVlmSftWorker(FSDPSftWorker):
             SupportedModel.QWEN2_5_VL_SFT,
             SupportedModel.QWEN3_VL_SFT,
             SupportedModel.QWEN3_VL_MOE_SFT,
+            SupportedModel.QWEN2_5,
         ]:
             raise ValueError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
