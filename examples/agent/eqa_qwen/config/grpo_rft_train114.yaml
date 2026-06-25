@@ -1,0 +1,43 @@
+# GRPO RFT after SFT cold-start: initialize the policy from the SFT checkpoint
+# (train114) and reinforce on the 114 HM-EQA train questions.
+#
+# Inherits the verified 8-card Megatron GRPO config and overrides only:
+#   - the init policy  -> the SFT HF export (rollout + HF->Megatron both use it)
+#   - max_turns 6 -> 20  (the SFT policy submits ~turn 18; 6 would truncate every
+#                         rollout to budget_exhausted, defeating the cold-start)
+#   - the dataset -> the 114 train questions in {prompt, solutions} form
+#   - a real (small) training horizon + checkpointing
+#
+# Launch (in the rlinf-eqa container; Ray restarted with NVLS disabled — see
+# code-doc/0528 §BREAKTHROUGH):
+#   bash examples/agent/eqa_qwen/run_train.sh grpo_rft_train114
+defaults:
+  - train_qwen25vl_7b_8gpu_megatron
+
+
+runner:
+  experiment_name: eqa-grpo-rft-train114
+  output_dir: /data/hm_eqa/grpo_rft_train114
+  max_steps: 20
+  save_interval: 10
+  # 0 disables validation entirely (agent_runner ignores run_val anyway) and
+  # skips the `save_interval % val_check_interval == 0` assert in check_progress.
+  val_check_interval: 0
+
+
+data:
+  train_data_paths: ["/data/hm_eqa/train_rl.jsonl"]
+
+
+agentloop:
+  # SFT policy explores ~3 objects then submits (~18 turns); give it room.
+  max_turns: 20
+  trace_dump_dir: /data/hm_eqa/grpo_rft_train114/traces
+
+
+rollout:
+  model:
+    # Init from the SFT cold-start checkpoint (HF export of global_step_42).
+    # Both the SGLang rollout and the on-the-fly HF->Megatron actor conversion
+    # read ${rollout.model.model_path}.
+    model_path: /data/hm_eqa/sft_runs/train114_hf

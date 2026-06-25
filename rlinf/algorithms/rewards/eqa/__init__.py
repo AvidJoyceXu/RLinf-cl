@@ -6,6 +6,10 @@
 #
 #     https://www.apache.org/licenses/LICENSE-2.0
 
-from rlinf.algorithms.rewards.eqa.reward import EQAReward, compute_score
+from rlinf.algorithms.rewards.eqa.reward import (
+    EQAReward,
+    compute_score,
+    extract_submitted_letter,
+)
 
-__all__ = ["EQAReward", "compute_score"]
+__all__ = ["EQAReward", "compute_score", "extract_submitted_letter"]

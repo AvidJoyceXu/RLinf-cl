@@ -111,7 +111,10 @@ agentloop:
 tools:
   habitat_eqa:
     pool_size: 1
+    # render_rgb enables the egocentric color sensor required by inspect() (B.1).
+    # vision_backend: "stub" (no VLM, text-only ablation) | "qwen2.5-vl".
     render_rgb: False
+    vision_backend: "stub"
 
 
 rollout:

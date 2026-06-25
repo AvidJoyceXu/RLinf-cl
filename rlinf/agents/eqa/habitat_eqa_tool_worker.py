@@ -52,13 +52,16 @@ class HabitatEQAToolWorker(ToolWorker):
         tcfg = cfg.tools.habitat_eqa
         self.pool_size: int = int(tcfg.get("pool_size", 1))
         self.render_rgb: bool = bool(tcfg.get("render_rgb", False))
+        # Vision backend for the inspect() skill (B.1). "stub" = no VLM (text-only
+        # ablation / CI); "qwen2.5-vl" = local Qwen2.5-VL-7B.
+        self.vision_backend: str = str(tcfg.get("vision_backend", "stub"))
         self._episodes: dict[str, EQAEpisode] = {}
         self._idle: list[EQAEpisode] = []
         self.request_processor_task: asyncio.Task | None = None
 
     def init_worker(self, input_channel: Channel, output_channel: Channel):
         super().init_worker(input_channel, output_channel)
-        self._idle = [EQAEpisode(render_rgb=self.render_rgb) for _ in range(self.pool_size)]
+        self._idle = [EQAEpisode(render_rgb=self.render_rgb, vision_backend=self.vision_backend) for _ in range(self.pool_size)]
 
     def start_server(self):
         loop = asyncio.get_running_loop()
@@ -119,7 +122,7 @@ class HabitatEQAToolWorker(ToolWorker):
         if not self._idle:
             # Pool exhausted — block until one frees up. M2 scope: just expand
             # the pool by one rather than block the event loop. Revisit at M3.
-            self._idle.append(EQAEpisode(render_rgb=self.render_rgb))
+            self._idle.append(EQAEpisode(render_rgb=self.render_rgb, vision_backend=self.vision_backend))
         episode = self._idle.pop()
         self._episodes[session_id] = episode
         return episode

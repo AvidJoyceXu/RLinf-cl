@@ -31,6 +31,12 @@ data:
   # global_batch_size = rollout_batch_size * group_size / n_minibatches
   #                   = 2 * 2 / 2 = 2, divisible by actor_world_size=1.
   rollout_batch_size: 2
+  # Parent scripted config sets 512, but the EQA prompt (system + tool schema +
+  # options) is ~713 tokens (614 before the inspect tool) and grows per turn as
+  # tool responses accumulate. A turn whose context exceeds max_prompt_length makes
+  # prompt_start negative in io_struct.to_actor_batch → position_ids size-mismatch
+  # crash. Match the real configs' 4096 (verified 2026-06-16 1-GPU scripted smoke).
+  max_prompt_length: 4096
 
 
 actor:

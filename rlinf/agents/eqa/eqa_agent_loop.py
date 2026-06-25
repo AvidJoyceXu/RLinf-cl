@@ -33,7 +33,7 @@ from uuid import uuid4
 
 from omegaconf import DictConfig
 
-from rlinf.algorithms.rewards.eqa import compute_score
+from rlinf.algorithms.rewards.eqa import compute_score, extract_submitted_letter
 from rlinf.data.tool_call.tool_io_struct import (
     ToolChannelRequest,
     ToolChannelResponse,
@@ -197,7 +197,8 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
             pass
 
         response_text = self.tokenizer.decode(generate_context["all_llm_response_ids"])
-        traj_info = {"tool_trace": generate_context["tool_trace"]}
+        tool_trace = generate_context["tool_trace"]
+        traj_info = {"tool_trace": tool_trace}
         reward_score = compute_score(
             response_text=response_text,
             answer=generate_context["answer"],
@@ -206,6 +207,20 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
 
         for single_turn_output in output.single_turn_outputs:
             single_turn_output.reward_score = reward_score
+
+        # Phase-1 logging (code-doc/0611 §A.3): interpretable per-trajectory signals.
+        # `properly_ended` = the episode terminated by calling submit_answer (vs
+        # running out of budget). Mark is_end on the terminal turn so the
+        # `fraction_of_samples_properly_ended` metric becomes meaningful — verified
+        # it only feeds that cosmetic metric and does NOT gate the loss mask
+        # (response_mask is built from prompt/response lengths in io_struct).
+        submitted = extract_submitted_letter(response_text, traj_info)
+        properly_ended = bool(tool_trace) and tool_trace[-1].get("name") == "submit_answer"
+        correct = submitted is not None and submitted == str(generate_context["answer"]).upper()
+        if properly_ended and output.single_turn_outputs:
+            output.single_turn_outputs[-1].is_end = True
+        output.extra_fields["submitted"] = submitted is not None
+        output.extra_fields["correct"] = bool(correct)
 
         output.extra_fields["llm_reward"] = reward_score
         output.extra_fields["response_text"] = response_text
@@ -398,7 +413,33 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
         for r in task_results:
             for _ in r.single_turn_outputs:
                 idx_to_sub_traj.append(0)
-        return None, None, None, {"idx_to_sub_traj": idx_to_sub_traj}
+        # Per-trajectory correctness/submit flags → consumed by get_rollout_metrics
+        # to log rollout/accuracy + rollout/submit_rate (code-doc/0611 §A.3).
+        extra_fields_traj = {
+            "correct": [bool(r.extra_fields.get("correct", False)) for r in task_results],
+            "submitted": [bool(r.extra_fields.get("submitted", False)) for r in task_results],
+        }
+        return None, extra_fields_traj, None, {"idx_to_sub_traj": idx_to_sub_traj}
+
+    def get_rollout_metrics(self, rollout_result) -> dict:
+        """Aggregate interpretable EQA rollout metrics (accuracy, submit rate).
+
+        Keys use the `__mean__/` stat prefix the agent-loop `post_process_metric`
+        understands: each value is a (numerator, group_size) pair, summed across
+        groups/workers into an overall ratio under the `rollout/` namespace.
+        """
+        if self.is_eval:
+            return {}
+        eft = rollout_result.extra_fields_traj or {}
+        correct = eft.get("correct") or []
+        submitted = eft.get("submitted") or []
+        n = len(submitted)
+        if n == 0:
+            return {}
+        return {
+            "__mean__/rollout/accuracy": (float(sum(1 for c in correct if c)), float(n)),
+            "__mean__/rollout/submit_rate": (float(sum(1 for s in submitted if s)), float(n)),
+        }
 
 
 def _parse_spec(answer: str) -> dict:
