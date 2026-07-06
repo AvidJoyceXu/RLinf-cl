@@ -9,7 +9,13 @@
 from rlinf.algorithms.rewards.eqa.reward import (
     EQAReward,
     compute_score,
+    compute_staged_rewards,
     extract_submitted_letter,
 )
 
-__all__ = ["EQAReward", "compute_score", "extract_submitted_letter"]
+__all__ = [
+    "EQAReward",
+    "compute_score",
+    "compute_staged_rewards",
+    "extract_submitted_letter",
+]

@@ -29,7 +29,12 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: all
+    # 2 GPUs — mirrors the PROVEN sft_debug run (code-doc/logs/sft_debug, 2026-06-09):
+    # FSDP + bf16 on placement `4-5` trained cleanly. The 8-GPU `all` placement fails
+    # NCCL init ("Cuda failure 1 'invalid argument'") — the NVLS regression (0528
+    # §gotcha #1), which needs NCCL_NVLS_ENABLE=0 before ray start; it does NOT trigger
+    # at 2 GPUs, so `4-5` just sidesteps it. bf16 (below) fits 7B; fp32 OOMs the 143 GB H20.
+    actor: 4-5
 
 runner:
   task_type: sft
@@ -41,10 +46,14 @@ runner:
 
   seq_length: 8192
   max_epochs: -1
-  max_steps: 2000
-  val_check_interval: 500
-  save_interval: 500
-  experiment_name: eqa_toolcall_sft
+  # 114 train rows, global_batch_size 32 -> ~3.5 steps/epoch. 80 steps ~= 22
+  # epochs: enough to internalise the ACI format as a GRPO cold-start without
+  # collapsing to memorised answers (GRPO does the real learning). Revisit after
+  # reading the G2 curve.
+  max_steps: 80
+  val_check_interval: 20
+  save_interval: 40
+  experiment_name: eqa_toolcall_sft_v5
   output_dir: ../results
   resume_dir: null
 
@@ -54,9 +63,9 @@ data:
   apply_chat_template: True
   use_chat_template: True
   # Trajectory JSONL + the tool-schema sidecar written next to it by the builder.
-  train_data_paths: "/data/hm_eqa/sft/expert.jsonl"
-  val_data_paths: "/data/hm_eqa/sft/expert_val.jsonl"
-  tool_schemas_path: "/data/hm_eqa/sft/expert.jsonl.tools.json"
+  train_data_paths: "/data/hm_eqa/sft/train114_frontier_textonly_v5.jsonl"
+  val_data_paths: "/data/hm_eqa/sft/train_val10.jsonl"
+  tool_schemas_path: "/data/hm_eqa/sft/train114_frontier_textonly_v5.jsonl.tools.json"
   # Unused by EqaToolCallSftDataset (it reads prompt_messages/tool_steps) but kept
   # for VLMBaseDataset.__init__ compatibility.
   prompt_key: "question"
@@ -77,13 +86,13 @@ actor:
   training_backend: "fsdp"
   micro_batch_size: 1
   eval_batch_size: 1
-  global_batch_size: 64
+  global_batch_size: 32
   seed: 42
 
   model:
     # Text backbone, same as the GRPO rollout. Loader auto-picks CausalLM.
     model_type: "qwen2.5"
-    precision: fp32
+    precision: bf16          # proven in sft_debug; fp32 OOMs 7B even on a 143 GB H20
     model_path: "/opt/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
     is_lora: False
 
@@ -96,7 +105,7 @@ actor:
     clip_grad: 1.0
     lr_scheduler: "cosine"
     total_training_steps: ${runner.max_steps}
-    lr_warmup_steps: 100
+    lr_warmup_steps: 8
 
   fsdp_config:
     strategy: "fsdp"

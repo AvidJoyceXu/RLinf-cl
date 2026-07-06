@@ -35,9 +35,23 @@ agentloop:
   trace_dump_dir: /data/hm_eqa/grpo_rft_train114/traces
 
 
+reward:
+  # C4 STAGED reward (was silently inactive: the Megatron config chain only set
+  # `reward.reward_type: eqa` — the reward-WORKER class — never `reward.type`, which
+  # the agent loop reads via reward_cfg.get("type", "terminal"). So the first G2 run
+  # used pure terminal {-0.5 no-submit, 0.0 wrong, 1.0 correct}; under sampling the
+  # cautious cold-start almost never submits, so every sample in a group floored at
+  # -0.5 -> zero advantage variance -> flat curve. Staged credits per-turn coverage
+  # gain + new objects + relevant inspect (from meta=episode.traj_info()), so
+  # budget-exhaust trajectories earn graded reward by exploration -> restores
+  # within-group variance for GRPO. Terminal stays dominant (|±1.0| >> shaping).
+  type: staged
+
+
 rollout:
   model:
-    # Init from the SFT cold-start checkpoint (HF export of global_step_42).
-    # Both the SGLang rollout and the on-the-fly HF->Megatron actor conversion
-    # read ${rollout.model.model_path}.
-    model_path: /data/hm_eqa/sft_runs/train114_hf
+    # Init from the v5 SFT cold-start (HF export of global_step_80; loss 0.58->0.018,
+    # 22 epochs; behavioral eval 13/15 acc, 14/15 submit, 100% valid tool calls — see
+    # code-doc/logs/sft_eval_v5_step80). Both the SGLang rollout and the on-the-fly
+    # HF->Megatron actor conversion read ${rollout.model.model_path}.
+    model_path: /data/hm_eqa/sft_runs/train114_hf_v5_step80

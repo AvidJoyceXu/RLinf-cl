@@ -166,6 +166,22 @@ reward:
   reward_type: 'eqa'
   reward_scale: 1.0
 
+  # Agent-loop shaping (read in EQAAgentLoopWorker.post_process_query; distinct
+  # from `reward_type` which picks the rule-based class). `type: terminal` keeps
+  # the M2 behaviour (one trajectory scalar on every turn); `type: staged` gives
+  # per-turn process credit + a dominant terminal reward. The `− staged` ablation
+  # (doc 01 §3.3) is flipping this one key. Defaults: terminal for E1–E4.
+  type: terminal
+  shaping:
+    w_cov: 0.3            # reward per unit coverage-fraction gained this turn
+    w_obj: 0.05           # reward per newly-observed object (capped)
+    obj_cap: 1.0
+    w_inspect: 0.2        # bonus for inspecting a question-relevant object
+    step_penalty: 0.01    # per-turn efficiency penalty
+    term_correct: 1.0
+    term_wrong: 0.0
+    term_nosubmit: -0.5
+
   tokenizer:
     tokenizer_model: ${actor.tokenizer.tokenizer_model}
     use_fast: ${actor.tokenizer.use_fast}

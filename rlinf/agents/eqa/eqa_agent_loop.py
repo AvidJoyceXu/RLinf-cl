@@ -33,7 +33,11 @@ from uuid import uuid4
 
 from omegaconf import DictConfig
 
-from rlinf.algorithms.rewards.eqa import compute_score, extract_submitted_letter
+from rlinf.algorithms.rewards.eqa import (
+    compute_score,
+    compute_staged_rewards,
+    extract_submitted_letter,
+)
 from rlinf.data.tool_call.tool_io_struct import (
     ToolChannelRequest,
     ToolChannelResponse,
@@ -102,6 +106,17 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
         # {trace_dump_dir}/trace_pid{pid}.jsonl for offline inspection of the
         # model's skill sequence / reward. Off (None) by default.
         self.trace_dump_dir: str | None = cfg.agentloop.get("trace_dump_dir", None)
+        # Reward shaping: `terminal` (compute_score, one scalar on every turn) or
+        # `staged` (compute_staged_rewards, per-turn process credit + dominant
+        # terminal). The `− staged` ablation is a one-line config flip (doc 01 §3.3).
+        reward_cfg = cfg.get("reward", {}) or {}
+        self.reward_type = str(reward_cfg.get("type", "terminal"))
+        shaping = reward_cfg.get("shaping", {}) or {}
+        from omegaconf import OmegaConf
+        self.reward_shaping = (
+            OmegaConf.to_container(shaping, resolve=True)
+            if OmegaConf.is_config(shaping) else dict(shaping)
+        )
 
         assert self.toolcall_parser is not None, (
             "EQAAgentLoopWorker requires agentloop.toolcall_parser (e.g. 'eqa-qwen')"
@@ -199,14 +214,35 @@ class EQAAgentLoopWorker(MultiAgentLoopWorker):
         response_text = self.tokenizer.decode(generate_context["all_llm_response_ids"])
         tool_trace = generate_context["tool_trace"]
         traj_info = {"tool_trace": tool_trace}
-        reward_score = compute_score(
-            response_text=response_text,
-            answer=generate_context["answer"],
-            traj_info=traj_info,
-        )
 
-        for single_turn_output in output.single_turn_outputs:
-            single_turn_output.reward_score = reward_score
+        if self.reward_type == "staged":
+            # Per-turn process reward; terminal correctness lands on the last turn.
+            staged = compute_staged_rewards(
+                tool_trace,
+                generate_context["answer"],
+                generate_context["question"],
+                generate_context["options"],
+                **self.reward_shaping,
+            )
+            # Trajectory-level GRPO (advantage_mode: trajectory) needs ONE reward per
+            # trajectory: the Megatron packer (io_struct.pack_traj_batch:1470) asserts
+            # every turn of a packed trajectory shares a single reward. Assigning
+            # distinct per-turn staged[k] crashed the actor at step 1 (AssertionError).
+            # So assign the trajectory RETURN (sum of staged) uniformly to all turns —
+            # keeps the shaping benefit (more coverage -> higher return -> restored
+            # within-group variance) while satisfying the packer. Per-turn granularity
+            # is unused by trajectory advantage; revisit only for token-level credit.
+            reward_score = float(sum(staged))         # trajectory return
+            for single_turn_output in output.single_turn_outputs:
+                single_turn_output.reward_score = reward_score
+        else:
+            reward_score = compute_score(
+                response_text=response_text,
+                answer=generate_context["answer"],
+                traj_info=traj_info,
+            )
+            for single_turn_output in output.single_turn_outputs:
+                single_turn_output.reward_score = reward_score
 
         # Phase-1 logging (code-doc/0611 §A.3): interpretable per-trajectory signals.
         # `properly_ended` = the episode terminated by calling submit_answer (vs
