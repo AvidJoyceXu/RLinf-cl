@@ -18,7 +18,11 @@ defaults:
 runner:
   experiment_name: eqa-grpo-rft-train114
   output_dir: /data/hm_eqa/grpo_rft_train114
-  max_steps: 20
+  # 114 prompts / rollout_batch_size 8 = 14 steps/epoch. The inherited max_epochs:1
+  # capped the prior run at 14 steps (too short to read a trend), so max_steps was a
+  # no-op. Raise epochs so max_steps becomes the binding limit: 40 steps ≈ 2.9 epochs.
+  max_epochs: 4
+  max_steps: 40
   save_interval: 10
   # 0 disables validation entirely (agent_runner ignores run_val anyway) and
   # skips the `save_interval % val_check_interval == 0` assert in check_progress.
