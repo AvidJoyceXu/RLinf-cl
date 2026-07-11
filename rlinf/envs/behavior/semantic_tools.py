@@ -32,7 +32,17 @@ from typing import Optional
 import torch as th
 
 import omnigibson as og
-from omnigibson.object_states import AABB, Inside, OnTop, Open, ToggledOn
+from omnigibson.object_states import (
+    AABB,
+    Cooked,
+    Covered,
+    Filled,
+    Inside,
+    OnTop,
+    Open,
+    ToggledOn,
+)
+from omnigibson.utils.object_state_utils import sample_kinematics
 
 # Robot base within this XY distance of an object counts as "near / reachable".
 NEAR_THRESHOLD_M = 1.5
@@ -249,49 +259,63 @@ class SemanticACI:
     # build_pose_cache(); rollout place tools only read the cache.
 
     _PRED = {"OnTop": OnTop, "Inside": Inside}
+    _SAMPLE_PRED = {"OnTop": "onTop", "Inside": "inside"}
     _SETTLE_STEPS = 10
 
     def build_pose_cache(self, pairs) -> dict:
-        """OFFLINE: for each (movable_name, target_name, predicate), seat the
-        object at a valid rest pose and cache it. Call before rollout, NOT during.
+        """OFFLINE: for each (movable_name, target_name, predicate), find a valid
+        pose and cache it. Call before rollout, NOT during it.
 
-        We seat objects at RING positions spread across the target footprint
-        (per-target counter) rather than sampling or centre-dropping: the
-        kinematic sampler fails on tight targets (small trash-can opening -> 36s
-        fail) and centre placement stacks multiple objects (3 x 0.13m cans do not
-        stack inside a 0.28m bin -> the 3rd sticks out). Spreading them side by
-        side on the interior floor (Inside) / support top (OnTop) lets N objects
-        co-exist, then a short settle makes the pose physically real. Pairs are
-        processed in order so per-container placements spread progressively.
+        Hybrid, because no single strategy covers all container geometries:
+          1) sample_kinematics(use_last_ditch_effort=True) -- uses the target's
+             real interior volume, so it handles elevated/shelved containers
+             (fridge, cabinet) the drop-in can't;
+          2) fallback ring-spread drop-in on the AABB floor/top -- handles tight
+             multi-object bins (3 cans in a small trash can) that the sampler
+             stacks and overflows.
+        Pairs processed in order; per-target counter spreads the fallback ring.
         Returns {key: bool success}."""
         out = {}
-        placed = {}   # target_name -> count already seated (for ring spread)
+        placed = {}
         for movable, target, pred in pairs:
             m, t = self._resolve(movable), self._resolve(target)
             cls = self._PRED[pred]
+            k = placed.get(target, 0)
+            placed[target] = k + 1
             ok = False
             if m is not None and t is not None and cls in getattr(m, "states", {}):
-                lo, hi = t.states[AABB].get_value()
-                cx, cy = float((lo[0] + hi[0]) / 2), float((lo[1] + hi[1]) / 2)
-                radius = 0.28 * min(float(hi[0] - lo[0]), float(hi[1] - lo[1]))
-                k = placed.get(target, 0)
-                placed[target] = k + 1
-                ang = 2 * math.pi * k / 6.0
-                dx = 0.0 if k == 0 else radius * math.cos(ang)
-                dy = 0.0 if k == 0 else radius * math.sin(ang)
-                mlo, mhi = m.states[AABB].get_value()
-                half_h = float(mhi[2] - mlo[2]) / 2
-                base_z = float(lo[2]) if pred == "Inside" else float(hi[2])
-                seat = th.tensor([cx + dx, cy + dy, base_z + half_h + 0.03])
-                m.set_position_orientation(position=seat)
-                for _ in range(self._SETTLE_STEPS):
-                    og.sim.step_physics()
-                ok = bool(m.states[cls].get_value(t))
+                # 1) real-interior sampler (best for roomy/elevated containers)
+                try:
+                    sample_kinematics(self._SAMPLE_PRED[pred], m, t,
+                                      use_last_ditch_effort=True)
+                    ok = bool(m.states[cls].get_value(t))
+                except Exception:
+                    ok = False
+                # 2) fallback: ring-spread drop-in (tight multi-object bins)
+                if not ok:
+                    ok = self._seat_dropin(m, t, cls, pred, k)
                 if ok:
                     pos, orn = m.get_position_orientation()
                     self._pose_cache[(movable, target, pred)] = (pos.clone(), orn.clone())
             out[(movable, target, pred)] = ok
         return out
+
+    def _seat_dropin(self, m, t, cls, pred, k):
+        """Seat @m at a ring position on @t's AABB floor (Inside) / top (OnTop)
+        and settle. @k spreads successive objects around a ring."""
+        lo, hi = t.states[AABB].get_value()
+        cx, cy = float((lo[0] + hi[0]) / 2), float((lo[1] + hi[1]) / 2)
+        radius = 0.28 * min(float(hi[0] - lo[0]), float(hi[1] - lo[1]))
+        ang = 2 * math.pi * k / 6.0
+        dx = 0.0 if k == 0 else radius * math.cos(ang)
+        dy = 0.0 if k == 0 else radius * math.sin(ang)
+        mlo, mhi = m.states[AABB].get_value()
+        half_h = float(mhi[2] - mlo[2]) / 2
+        base_z = float(lo[2]) if pred == "Inside" else float(hi[2])
+        m.set_position_orientation(position=th.tensor([cx + dx, cy + dy, base_z + half_h + 0.03]))
+        for _ in range(self._SETTLE_STEPS):
+            og.sim.step_physics()
+        return bool(m.states[cls].get_value(t))
 
     def grasp(self, name: str) -> ToolResult:
         obj = self._resolve(name)
@@ -352,6 +376,74 @@ class SemanticACI:
 
     def place_inside(self, name: str, container: str) -> ToolResult:
         return self._place("place_inside", name, container, "Inside")
+
+    # ---- transformation tools (class B1: state-based; real state/particle
+    # ---- changes via the genuine object-state setters, not faked flags) ----
+    def _system(self, system_name: str):
+        return self.scene.get_system(system_name)
+
+    def cook(self, name: str) -> ToolResult:
+        """Cook @name (raises MaxTemperature past the cook threshold)."""
+        obj = self._resolve(name)
+        if obj is None:
+            return self._result(False, "cook", {"name": name}, "no such object")
+        if Cooked not in getattr(obj, "states", {}):
+            return self._result(False, "cook", {"name": name}, f"{name} not cookable")
+        if not self._is_near(obj):
+            return self._result(False, "cook", {"name": name},
+                                f"precondition failed: not near {name}")
+        obj.states[Cooked].set_value(True)
+        og.sim.step_physics()
+        return self._result(bool(obj.states[Cooked].get_value()), "cook", {"name": name},
+                            f"Cooked={obj.states[Cooked].get_value()}")
+
+    def _set_covered(self, tool, name, system_name, value):
+        obj = self._resolve(name)
+        if obj is None:
+            return self._result(False, tool, {"name": name}, "no such object")
+        if Covered not in getattr(obj, "states", {}):
+            return self._result(False, tool, {"name": name}, f"{name} has no Covered state")
+        if not self._is_near(obj):
+            return self._result(False, tool, {"name": name, "system": system_name},
+                                f"precondition failed: not near {name}")
+        try:
+            system = self._system(system_name)
+        except Exception as ex:
+            return self._result(False, tool, {"name": name, "system": system_name},
+                                f"no such system {system_name} ({type(ex).__name__})")
+        obj.states[Covered].set_value(system, value)
+        og.sim.step_physics()
+        got = bool(obj.states[Covered].get_value(system))
+        return self._result(got == value, tool, {"name": name, "system": system_name},
+                            f"Covered({name},{system_name})={got}")
+
+    def spray(self, name: str, system_name: str) -> ToolResult:
+        """Cover @name with the @system_name substance (e.g. pesticide)."""
+        return self._set_covered("spray", name, system_name, True)
+
+    def uncover(self, name: str, system_name: str) -> ToolResult:
+        """Remove the @system_name substance from @name (e.g. clean mud)."""
+        return self._set_covered("uncover", name, system_name, False)
+
+    def fill(self, name: str, system_name: str) -> ToolResult:
+        """Fill container @name with the @system_name physical particle system."""
+        obj = self._resolve(name)
+        if obj is None:
+            return self._result(False, "fill", {"name": name}, "no such object")
+        if Filled not in getattr(obj, "states", {}):
+            return self._result(False, "fill", {"name": name}, f"{name} not fillable")
+        if not self._is_near(obj):
+            return self._result(False, "fill", {"name": name, "system": system_name},
+                                f"precondition failed: not near {name}")
+        try:
+            system = self._system(system_name)
+        except Exception as ex:
+            return self._result(False, "fill", {"name": name, "system": system_name},
+                                f"no such system {system_name} ({type(ex).__name__})")
+        obj.states[Filled].set_value(system, True)
+        og.sim.step_physics()
+        return self._result(bool(obj.states[Filled].get_value(system)), "fill",
+                            {"name": name, "system": system_name}, "filled")
 
     def end_task(self) -> ToolResult:
         gs = self.goal_status()
