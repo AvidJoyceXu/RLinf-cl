@@ -32,7 +32,7 @@ from typing import Optional
 import torch as th
 
 import omnigibson as og
-from omnigibson.object_states import Inside, OnTop, Open, ToggledOn
+from omnigibson.object_states import AABB, Inside, OnTop, Open, ToggledOn
 
 # Robot base within this XY distance of an object counts as "near / reachable".
 NEAR_THRESHOLD_M = 1.5
@@ -249,21 +249,44 @@ class SemanticACI:
     # build_pose_cache(); rollout place tools only read the cache.
 
     _PRED = {"OnTop": OnTop, "Inside": Inside}
+    _SETTLE_STEPS = 10
 
     def build_pose_cache(self, pairs) -> dict:
-        """OFFLINE: for each (movable_name, target_name, predicate), sample one
-        valid pose via the (slow) kinematic sampler and cache it. Call before
-        rollout, NOT during it. Returns {key: bool success}."""
+        """OFFLINE: for each (movable_name, target_name, predicate), seat the
+        object at a valid rest pose and cache it. Call before rollout, NOT during.
+
+        We seat objects at RING positions spread across the target footprint
+        (per-target counter) rather than sampling or centre-dropping: the
+        kinematic sampler fails on tight targets (small trash-can opening -> 36s
+        fail) and centre placement stacks multiple objects (3 x 0.13m cans do not
+        stack inside a 0.28m bin -> the 3rd sticks out). Spreading them side by
+        side on the interior floor (Inside) / support top (OnTop) lets N objects
+        co-exist, then a short settle makes the pose physically real. Pairs are
+        processed in order so per-container placements spread progressively.
+        Returns {key: bool success}."""
         out = {}
+        placed = {}   # target_name -> count already seated (for ring spread)
         for movable, target, pred in pairs:
             m, t = self._resolve(movable), self._resolve(target)
             cls = self._PRED[pred]
             ok = False
             if m is not None and t is not None and cls in getattr(m, "states", {}):
-                try:
-                    ok = bool(m.states[cls].set_value(t, True))
-                except Exception:
-                    ok = False
+                lo, hi = t.states[AABB].get_value()
+                cx, cy = float((lo[0] + hi[0]) / 2), float((lo[1] + hi[1]) / 2)
+                radius = 0.28 * min(float(hi[0] - lo[0]), float(hi[1] - lo[1]))
+                k = placed.get(target, 0)
+                placed[target] = k + 1
+                ang = 2 * math.pi * k / 6.0
+                dx = 0.0 if k == 0 else radius * math.cos(ang)
+                dy = 0.0 if k == 0 else radius * math.sin(ang)
+                mlo, mhi = m.states[AABB].get_value()
+                half_h = float(mhi[2] - mlo[2]) / 2
+                base_z = float(lo[2]) if pred == "Inside" else float(hi[2])
+                seat = th.tensor([cx + dx, cy + dy, base_z + half_h + 0.03])
+                m.set_position_orientation(position=seat)
+                for _ in range(self._SETTLE_STEPS):
+                    og.sim.step_physics()
+                ok = bool(m.states[cls].get_value(t))
                 if ok:
                     pos, orn = m.get_position_orientation()
                     self._pose_cache[(movable, target, pred)] = (pos.clone(), orn.clone())
