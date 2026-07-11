@@ -31,7 +31,8 @@ from typing import Optional
 
 import torch as th
 
-from omnigibson.object_states import Open, ToggledOn
+import omnigibson as og
+from omnigibson.object_states import Inside, OnTop, Open, ToggledOn
 
 # Robot base within this XY distance of an object counts as "near / reachable".
 NEAR_THRESHOLD_M = 1.5
@@ -74,6 +75,10 @@ class SemanticACI:
         self.near_threshold = near_threshold
         self.obs_mode = obs_mode
         self._pred = self.task._termination_conditions["predicate"]
+        self._held = None          # name of the object currently grasped, or None
+        # (movable_name, target_name, predicate) -> (pos, orn) valid placement,
+        # built OFFLINE via build_pose_cache(); rollout place tools only read it.
+        self._pose_cache = {}
 
     # ------------------------------------------------------------------ #
     # object / geometry helpers
@@ -177,6 +182,7 @@ class SemanticACI:
             "obs_mode": self.obs_mode,
             "robot_xy": [round(float(robot_xy[0]), 2), round(float(robot_xy[1]), 2)],
             "robot_yaw_deg": round(math.degrees(self._robot_yaw()), 1),
+            "held": self._held,
             "objects": objs,
         }
 
@@ -236,16 +242,93 @@ class SemanticACI:
     def close(self, name: str) -> ToolResult:
         return self._set_flag("close", name, Open, False)
 
-    # ---- deferred to M2 (need offline cached poses; must not call
-    # ---- sample_kinematics at rollout -- see 0710 sim-doc §6 / Gate 4-B) ----
+    # ---- manipulation (cached-pose; NEVER sample_kinematics at rollout) ----
+    # Gate 4-B (0709 §8): offline sample of a feasible placement ~3.4s, a failed
+    # one 20-78s; restoring a cached pose is ~12ms (set_pose + one step_physics to
+    # propagate the kinematic state). So placement poses are sampled OFFLINE via
+    # build_pose_cache(); rollout place tools only read the cache.
+
+    _PRED = {"OnTop": OnTop, "Inside": Inside}
+
+    def build_pose_cache(self, pairs) -> dict:
+        """OFFLINE: for each (movable_name, target_name, predicate), sample one
+        valid pose via the (slow) kinematic sampler and cache it. Call before
+        rollout, NOT during it. Returns {key: bool success}."""
+        out = {}
+        for movable, target, pred in pairs:
+            m, t = self._resolve(movable), self._resolve(target)
+            cls = self._PRED[pred]
+            ok = False
+            if m is not None and t is not None and cls in getattr(m, "states", {}):
+                try:
+                    ok = bool(m.states[cls].set_value(t, True))
+                except Exception:
+                    ok = False
+                if ok:
+                    pos, orn = m.get_position_orientation()
+                    self._pose_cache[(movable, target, pred)] = (pos.clone(), orn.clone())
+            out[(movable, target, pred)] = ok
+        return out
+
     def grasp(self, name: str) -> ToolResult:
-        raise NotImplementedError("grasp deferred to M2 (cached-pose manipulation)")
+        obj = self._resolve(name)
+        if obj is None:
+            return self._result(False, "grasp", {"name": name}, "no such object")
+        if self._held is not None:
+            return self._result(False, "grasp", {"name": name},
+                                f"precondition failed: already holding {self._held}")
+        if not self._is_near(obj):
+            return self._result(False, "grasp", {"name": name},
+                                f"precondition failed: not near {name} "
+                                f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
+        # oracle grasp: lift the object to a carry pose above the robot base so it
+        # is no longer resting on its support (kept physically real, not a flag).
+        rpos, _ = self._robot_pose()
+        carry = th.tensor([float(rpos[0]), float(rpos[1]), float(rpos[2]) + 1.0])
+        obj.set_position_orientation(position=carry)
+        og.sim.step_physics()
+        self._held = name
+        return self._result(True, "grasp", {"name": name}, f"holding {name}")
+
+    def release(self, name: str = None) -> ToolResult:
+        if self._held is None:
+            return self._result(False, "release", {}, "precondition failed: not holding anything")
+        held = self._held
+        self._held = None
+        return self._result(True, "release", {"name": held}, f"released {held}")
+
+    def _place(self, tool, name, target, pred):
+        if self._held != name:
+            return self._result(False, tool, {"name": name, "target": target},
+                                f"precondition failed: not holding {name} (held={self._held})")
+        t = self._resolve(target)
+        if t is None:
+            return self._result(False, tool, {"name": name, "target": target},
+                                f"no such target {target}")
+        if not self._is_near(t):
+            return self._result(False, tool, {"name": name, "target": target},
+                                f"precondition failed: not near {target} "
+                                f"({self._distance(t):.2f}m > {self.near_threshold}m)")
+        key = (name, target, pred)
+        if key not in self._pose_cache:
+            return self._result(False, tool, {"name": name, "target": target},
+                                f"no cached pose for {key}; run build_pose_cache offline "
+                                f"(rollout must not call sample_kinematics)")
+        pos, orn = self._pose_cache[key]
+        obj = self._resolve(name)
+        obj.set_position_orientation(position=pos, orientation=orn)
+        og.sim.step_physics()  # propagate kinematics so the predicate reads correctly
+        ok = bool(obj.states[self._PRED[pred]].get_value(t))
+        if ok:
+            self._held = None
+        return self._result(ok, tool, {"name": name, "target": target},
+                            f"{pred}({name},{target})={ok}")
 
     def place_on(self, name: str, surface: str) -> ToolResult:
-        raise NotImplementedError("place_on deferred to M2 (cached-pose manipulation)")
+        return self._place("place_on", name, surface, "OnTop")
 
     def place_inside(self, name: str, container: str) -> ToolResult:
-        raise NotImplementedError("place_inside deferred to M2 (cached-pose manipulation)")
+        return self._place("place_inside", name, container, "Inside")
 
     def end_task(self) -> ToolResult:
         gs = self.goal_status()
