@@ -236,9 +236,22 @@ class SemanticACI:
             return self._result(False, tool, {"name": name},
                                 f"precondition failed: not near {name} "
                                 f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
-        obj.states[state_cls].set_value(value)
-        return self._result(True, tool, {"name": name},
-                            f"{state_cls.__name__}={value}")
+        # Set the state, settle one step so the actuated joint registers, and
+        # VERIFY the change actually took. Open._set_value samples partial joint
+        # positions and can miss (esp. multi-door objects like cars), so on a miss
+        # retry fully-open/closed. ok reflects the REAL achieved state, not intent.
+        st = obj.states[state_cls]
+        st.set_value(value)
+        og.sim.step_physics()
+        if bool(st.get_value()) != value:
+            try:
+                st.set_value(value, fully=True)  # Open supports fully=; others don't
+            except TypeError:
+                st.set_value(value)
+            og.sim.step_physics()
+        got = bool(st.get_value())
+        return self._result(got == value, tool, {"name": name},
+                            f"{state_cls.__name__}={got}")
 
     def toggle_on(self, name: str) -> ToolResult:
         return self._set_flag("toggle_on", name, ToggledOn, True)
@@ -291,9 +304,15 @@ class SemanticACI:
                     ok = bool(m.states[cls].get_value(t))
                 except Exception:
                     ok = False
-                # 2) fallback: ring-spread drop-in (tight multi-object bins)
+                # 2) fallback: ring-spread drop-in (tight multi-object bins).
+                #    sample_kinematics is rejection-based and flaky in deep
+                #    containers (a fridge shelf can miss on the 2nd item), so try
+                #    several ring slots before giving up on this pair.
                 if not ok:
-                    ok = self._seat_dropin(m, t, cls, pred, k)
+                    for kk in (k, k + 2, k + 4, k + 1):
+                        if self._seat_dropin(m, t, cls, pred, kk):
+                            ok = True
+                            break
                 if ok:
                     pos, orn = m.get_position_orientation()
                     self._pose_cache[(movable, target, pred)] = (pos.clone(), orn.clone())
@@ -444,6 +463,85 @@ class SemanticACI:
         og.sim.step_physics()
         return self._result(bool(obj.states[Filled].get_value(system)), "fill",
                             {"name": name, "system": system_name}, "filled")
+
+    # ---- class B2: slice / dice (product-creating transforms) --------------
+    # These invoke the REAL OmniGibson transition rules (SlicingRule/DicingRule),
+    # so the spawned parts/particles are genuine sim entities. The sim's add-object
+    # and system-init callbacks auto-rebind the BDDL "future" scope entries, which
+    # is exactly what flips the `real(...)` goal atom (see BehaviorTask.
+    # _update_bddl_scope_from_added_obj / _from_system_init). Nothing is faked: we
+    # only bypass the low-level "bring a slicer into contact" control -- the same
+    # abstraction grasp/place make -- driving the identical downstream effect.
+    @staticmethod
+    def _abilities(obj) -> set:
+        return set(getattr(obj, "abilities", {}) or {})
+
+    def _do_transition(self, rule_cls, filter_key, obj):
+        """Execute @rule_cls's transition on a single @obj and settle. Returns the
+        TransitionResults (list of added ObjectAttrs / removed objs)."""
+        rule = rule_cls(self.scene)
+        results = rule.transition({filter_key: [obj]})
+        api = self.scene.transition_rule_api
+        api.execute_transition(added_obj_attrs=results.add, removed_objs=results.remove)
+        # One full sim step applies the added-object init callbacks (which propagate
+        # cooked/saturated onto the parts) and lets scope rebind / systems init.
+        og.sim.step()
+        return results
+
+    def slice(self, name: str) -> ToolResult:
+        """Slice @name into its annotated object parts (e.g. log -> 2x half__log).
+
+        Parts spawn as real DatasetObjects; the future BDDL scope entries bind to
+        them so ``real(half__...)`` becomes satisfied."""
+        from omnigibson.transition_rules import SlicingRule
+        obj = self._resolve(name)
+        if obj is None:
+            return self._result(False, "slice", {"name": name}, "no such object")
+        if "sliceable" not in self._abilities(obj):
+            return self._result(False, "slice", {"name": name},
+                                f"precondition failed: {name} is not sliceable")
+        if not self._is_near(obj):
+            return self._result(False, "slice", {"name": name},
+                                f"precondition failed: not near {name} "
+                                f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
+        results = self._do_transition(SlicingRule, "sliceable", obj)
+        n = len(results.add)
+        return self._result(n > 0 and self._resolve(name) is None, "slice",
+                            {"name": name}, f"sliced into {n} part(s)")
+
+    def dice(self, name: str) -> ToolResult:
+        """Mince @name into its ``diced__<category>`` particle system.
+
+        Only ``diceable`` objects dice directly. A whole vegetable is typically
+        ``sliceable`` but not ``diceable`` (BEHAVIOR models "chop an onion" as
+        slice-into-halves THEN dice-the-halves), so for a sliceable-only object we
+        run the real two-stage chain: SlicingRule -> parts, then DicingRule on each
+        diceable part. Both stages are genuine transitions; the resulting particles
+        are real, which is what flips ``real(diced__...)`` / ``contains(...)``."""
+        from omnigibson.transition_rules import DicingRule, SlicingRule
+        obj = self._resolve(name)
+        if obj is None:
+            return self._result(False, "dice", {"name": name}, "no such object")
+        abil = self._abilities(obj)
+        if not self._is_near(obj):
+            return self._result(False, "dice", {"name": name},
+                                f"precondition failed: not near {name} "
+                                f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
+        if "diceable" in abil:
+            self._do_transition(DicingRule, "diceable", obj)
+            return self._result(self._resolve(name) is None, "dice",
+                                {"name": name}, "diced into particle system")
+        if "sliceable" in abil:
+            parts = [a.obj for a in self._do_transition(SlicingRule, "sliceable", obj).add]
+            diced = 0
+            for part in parts:
+                if "diceable" in self._abilities(part):
+                    self._do_transition(DicingRule, "diceable", part)
+                    diced += 1
+            return self._result(diced > 0, "dice", {"name": name},
+                                f"sliced into {len(parts)} part(s), diced {diced}")
+        return self._result(False, "dice", {"name": name},
+                            f"precondition failed: {name} is neither diceable nor sliceable")
 
     def end_task(self) -> ToolResult:
         gs = self.goal_status()
