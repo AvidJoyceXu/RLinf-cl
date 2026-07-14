@@ -1,0 +1,261 @@
+"""Convert BEHAVIOR expert trajectories into tool-call SFT rows (M3, step 1).
+
+Turns an :class:`~rlinf.envs.behavior.expert_planner.ExpertTrajectory` (a
+privileged planner rollout through :class:`SemanticACI`) into the JSONL row shape
+consumed by RLinf's ``EqaToolCallSftDataset`` (``rlinf/data/datasets/vlm.py``):
+
+  {"activity", "task", "success", "num_turns",
+   "prompt_messages": [{system}, {user}],           # canonical, rendered once
+   "tool_steps": [{"name", "arguments", "result_text"}, ...],
+   "unsupported_predicates", "answer"}
+
+and emits the matching **tool-schema sidecar** (``*.tools.json``) so the training
+dataset renders the prompt without importing OmniGibson.
+
+Design (kept deliberately sim-free so it unit-tests and dumps the schema without
+booting IsaacSim -- it only reads plain attributes off the trajectory object):
+
+  * **observe-first grounding.** Every SFT trajectory starts with one ``observe``
+    turn whose (masked) response is the full symbolic observation captured at
+    reset -- this is where the policy learns the object *names* the later calls
+    ground onto. The single BEHAVIOR tool that consumes new (post-transition)
+    object names, ``dice``, takes the *whole* object and slices+dices internally,
+    so one initial observe suffices under full observability. Re-observation
+    between turns is a documented refinement for the partial-obs study (M4).
+  * **response contract.** ``observe`` returns the full observation JSON; every
+    action tool returns a compact ``{"ok", "reason"}`` ack; ``end_task`` returns
+    ``{"ok", "success"}``. The GRPO agent loop MUST serialize tool responses the
+    same way for SFT to be a faithful cold-start (mirrors ``spatialcode.sft_format``
+    flat-continuation argument in code-doc/0607 §4.5).
+  * **honest labels.** ``success`` and every step's ``ok`` come straight from the
+    trajectory (real BDDL ``goal_status`` / real ``ToolResult.ok``). Filtering to
+    successful demonstrations is the harvester's job (step 2); this module only
+    transcribes.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+
+# --------------------------------------------------------------------------- #
+# Tool schema -- flat {name, description, parameters} list (matches the EQA
+# sidecar shape the dataset feeds to `apply_chat_template(tools=...)`).
+# Parameter names MUST match the SemanticACI kwargs the planner emits, so the
+# rendered arguments dict validates against the schema.
+# --------------------------------------------------------------------------- #
+def _obj(props: dict, required: list[str]) -> dict:
+    return {"type": "object", "properties": props, "required": required}
+
+
+_NAME = {"name": {"type": "string", "description": "sim object name, as reported by observe()"}}
+_SYS = {"system_name": {"type": "string", "description": "particle/substance system name"}}
+
+
+def tool_schemas() -> list[dict]:
+    """The BEHAVIOR semantic-tool schema. Order is stable (sidecar determinism)."""
+    return [
+        {"name": "observe",
+         "description": "Return a symbolic observation of task-relevant objects "
+                        "(names, categories, positions, states, what is held). "
+                        "Call this first to learn the object names.",
+         "parameters": _obj({}, [])},
+        {"name": "go_to",
+         "description": "Navigate the robot base next to an object, facing it. "
+                        "Required before grasp/open/close/toggle/place/transform.",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "grasp",
+         "description": "Pick up a nearby object (must be at it via go_to first).",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "release",
+         "description": "Release the currently held object.",
+         "parameters": _obj(dict(_NAME), [])},
+        {"name": "place_on",
+         "description": "Place the held object on top of a surface object.",
+         "parameters": _obj({**_NAME, "surface": {"type": "string",
+                             "description": "sim name of the support surface"}},
+                            ["name", "surface"])},
+        {"name": "place_inside",
+         "description": "Place the held object inside a container object.",
+         "parameters": _obj({**_NAME, "container": {"type": "string",
+                             "description": "sim name of the container"}},
+                            ["name", "container"])},
+        {"name": "open",
+         "description": "Open a nearby openable container (e.g. fridge, cabinet).",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "close",
+         "description": "Close a nearby openable container.",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "toggle_on",
+         "description": "Turn a nearby toggleable device on.",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "toggle_off",
+         "description": "Turn a nearby toggleable device off.",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "cook",
+         "description": "Cook a nearby cookable object.",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "spray",
+         "description": "Cover a nearby object with a substance system.",
+         "parameters": _obj({**_NAME, **_SYS}, ["name", "system_name"])},
+        {"name": "uncover",
+         "description": "Remove a substance system from a nearby object.",
+         "parameters": _obj({**_NAME, **_SYS}, ["name", "system_name"])},
+        {"name": "fill",
+         "description": "Fill a nearby container with a particle/fluid system.",
+         "parameters": _obj({**_NAME, **_SYS}, ["name", "system_name"])},
+        {"name": "slice",
+         "description": "Slice a nearby sliceable object into its halves.",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "dice",
+         "description": "Mince a nearby object into its diced particle system "
+                        "(slices first if the object is only sliceable).",
+         "parameters": _obj(dict(_NAME), ["name"])},
+        {"name": "end_task",
+         "description": "Declare the task complete. Call when the goal is achieved.",
+         "parameters": _obj({}, [])},
+    ]
+
+
+def dump_tool_schemas(path: str) -> None:
+    with open(path, "w") as f:
+        json.dump(tool_schemas(), f, indent=1)
+
+
+# --------------------------------------------------------------------------- #
+# Prompt (system + user), rendered ONCE -- mirrors the EQA builder so the SFT
+# prompt matches the GRPO rollout exactly.
+# --------------------------------------------------------------------------- #
+BEHAVIOR_SYSTEM_PROMPT = (
+    "You are an embodied household robot completing a long-horizon activity in a "
+    "simulated home. You act over multiple turns, calling exactly one tool per "
+    "turn. Object names come from the observation, so call `observe` first to "
+    "learn what is in the scene and where you are. Then navigate with `go_to` "
+    "before interacting (grasp / open / close / toggle / place / transform), and "
+    "respect ordering: open a container before placing into it and close it "
+    "afterwards if the goal requires it. When every goal condition is met, call "
+    "`end_task`."
+)
+
+
+def goal_atoms_to_lines(atoms: Any) -> list[str]:
+    """Render BDDL ground goal atoms as readable ``pred(arg, ...)`` lines.
+
+    Sim-free: only reads ``atom.body`` (a nested list like ``["inside", a, b]`` or
+    ``["not", ["open", a]]``). Gives the policy the task objective (this is the
+    task spec, NOT the answer -- the answer is the tool sequence)."""
+    lines = []
+    for atom in atoms:
+        body = list(getattr(atom, "body", atom))
+        neg = ""
+        if body and body[0] == "not":
+            neg = "not "
+            body = list(body[1])
+        pred, args = body[0], body[1:]
+        lines.append(f"{neg}{pred}({', '.join(str(a) for a in args)})")
+    return lines
+
+
+def build_prompt_messages(activity: str, goal_lines: list[str],
+                          obs_mode: str = "full") -> list[dict]:
+    goal_block = "\n".join(f"  - {g}" for g in goal_lines) or "  (none)"
+    user = (
+        f"Activity: {activity.replace('_', ' ')}\n"
+        f"Observability: {obs_mode}\n"
+        f"Complete the activity so that all of these goal conditions hold:\n"
+        f"{goal_block}"
+    )
+    return [
+        {"role": "system", "content": BEHAVIOR_SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Trajectory -> row
+# --------------------------------------------------------------------------- #
+def _result_text(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def trajectory_to_row(traj: Any, initial_obs: dict, goal_lines: list[str],
+                      obs_mode: str = "full") -> dict:
+    """Transcribe one ExpertTrajectory (duck-typed) into an SFT row.
+
+    ``traj`` needs ``.activity``, ``.task_description``, ``.success``,
+    ``.unsupported`` and ``.steps`` (each with ``.tool``, ``.args``, ``.ok``,
+    ``.reason``). ``initial_obs`` is ``aci.observe()`` captured at reset, BEFORE
+    the planner mutates the scene.
+    """
+    tool_steps = [{
+        "name": "observe", "arguments": {},
+        "result_text": _result_text(initial_obs),
+    }]
+    for s in traj.steps:
+        tool_steps.append({
+            "name": s.tool,
+            "arguments": dict(s.args or {}),
+            "result_text": _result_text({"ok": bool(s.ok), "reason": s.reason}),
+        })
+    tool_steps.append({
+        "name": "end_task", "arguments": {},
+        "result_text": _result_text({"ok": bool(traj.success),
+                                     "success": bool(traj.success)}),
+    })
+    return {
+        "activity": traj.activity,
+        "task": getattr(traj, "task_description", "") or activity_to_task(traj.activity),
+        "success": bool(traj.success),
+        "num_turns": len(tool_steps),
+        "prompt_messages": build_prompt_messages(traj.activity, goal_lines, obs_mode),
+        "tool_steps": tool_steps,
+        "unsupported_predicates": list(getattr(traj, "unsupported", []) or []),
+        "answer": "",  # BEHAVIOR reward is BDDL success, not a categorical answer
+    }
+
+
+def activity_to_task(activity: str) -> str:
+    return activity.replace("_", " ")
+
+
+# --------------------------------------------------------------------------- #
+# CLI: dump the schema sidecar, and (with no args) run a sim-free self-check.
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    import sys
+    from types import SimpleNamespace
+
+    if len(sys.argv) > 1:
+        dump_tool_schemas(sys.argv[1])
+        print(f"wrote {len(tool_schemas())} tool schemas -> {sys.argv[1]}")
+        sys.exit(0)
+
+    # Sim-free smoke: fabricate a trajectory + obs and render one row.
+    fake = SimpleNamespace(
+        activity="carrying_in_groceries", task_description="", success=True,
+        unsupported=[],
+        steps=[
+            SimpleNamespace(tool="go_to", args={"name": "fridge_xyz"}, ok=True, reason="now 0.9m from fridge_xyz"),
+            SimpleNamespace(tool="open", args={"name": "fridge_xyz"}, ok=True, reason="Open=True"),
+            SimpleNamespace(tool="grasp", args={"name": "bratwurst_1"}, ok=True, reason="holding bratwurst_1"),
+            SimpleNamespace(tool="place_inside", args={"name": "bratwurst_1", "container": "fridge_xyz"}, ok=True, reason="Inside=True"),
+            SimpleNamespace(tool="close", args={"name": "fridge_xyz"}, ok=True, reason="Open=False"),
+        ],
+    )
+    obs = {"obs_mode": "full", "robot_xy": [1.0, 2.0], "held": None,
+           "objects": [{"name": "fridge_xyz", "category": "fridge", "states": {"Open": False}}]}
+    goal = goal_atoms_to_lines([
+        SimpleNamespace(body=["inside", "bratwurst.n.01_1", "fridge.n.01_1"]),
+        SimpleNamespace(body=["not", ["open", "fridge.n.01_1"]]),
+    ])
+    row = trajectory_to_row(fake, obs, goal)
+    assert row["tool_steps"][0]["name"] == "observe"
+    assert row["tool_steps"][-1]["name"] == "end_task"
+    assert row["num_turns"] == len(fake.steps) + 2
+    assert row["prompt_messages"][0]["role"] == "system"
+    assert "inside(bratwurst.n.01_1, fridge.n.01_1)" in row["prompt_messages"][1]["content"]
+    assert "not open(fridge.n.01_1)" in row["prompt_messages"][1]["content"]
+    names = {t["name"] for t in tool_schemas()}
+    assert {s.tool for s in fake.steps} <= names, "planner tools not covered by schema"
+    print(json.dumps(row, indent=2, ensure_ascii=False))
+    print("\nself-check OK: schema covers planner tools; row well-formed")
