@@ -1,0 +1,115 @@
+# BEHAVIOR semantic-tool SFT cold-start config.
+#
+# Trains text Qwen2.5-7B-Instruct to emit the BEHAVIOR semantic-tool ACI in the
+# rollout's flat-continuation format, on privileged-expert trajectories built by
+# rlinf/envs/behavior/harvest_sft.py (494 rows, 25 activities, 3 scenes).
+#
+# Reuses the EQA tool-call SFT machinery unchanged: dataset_name "eqa_toolcall"
+# (EqaToolCallSftDataset) is format-based, not domain-specific, once
+# data.tool_schemas_path points at the BEHAVIOR sidecar. Recipe (FSDP + bf16 +
+# 2-GPU placement 4-5) mirrors the PROVEN eqa_sft run (see REPRO guide, 0714 docs).
+#
+# Data staged at REPO/data/behavior/sft -> container /data/behavior/sft (add the
+# mount `-v $REPO_HOST/data/behavior:/data/behavior` when recreating rlinf-eqa).
+#
+# Run:
+#   bash examples/sft/run_vlm_sft.sh behavior_sft_qwen25_7b
+defaults:
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    # 2 GPUs; FSDP + bf16 on placement `4-5` is NCCL-healthy (8-GPU `all` hits the
+    # NVLS regression). See eqa_sft_qwen25_7b.yaml / REPRO §0.
+    actor: 4-5
+
+runner:
+  task_type: sft
+  logger:
+    log_path: ${runner.output_dir}/${runner.experiment_name}
+    project_name: rlinf
+    experiment_name: ${runner.experiment_name}
+    logger_backends: ["tensorboard"]
+
+  seq_length: 8192
+  max_epochs: -1
+  # 471 train rows, global_batch_size 32 -> ~15 steps/epoch. 120 steps ~= 8 epochs:
+  # enough to internalise the tool-call ACI as a GRPO cold-start (GRPO does the real
+  # learning). Revisit after the loss curve / a held-out agentic eval.
+  max_steps: 120
+  val_check_interval: 30       # save_interval must be a multiple of this
+  save_interval: 60
+  experiment_name: behavior_toolcall_sft
+  output_dir: ../results
+  resume_dir: null
+
+data:
+  type: vlm
+  dataset_name: "eqa_toolcall"     # -> EqaToolCallSftDataset (format-based; reused)
+  apply_chat_template: True
+  use_chat_template: True
+  train_data_paths: "/data/behavior/sft/behavior_sft_train.jsonl"
+  val_data_paths: "/data/behavior/sft/behavior_sft_val.jsonl"
+  tool_schemas_path: "/data/behavior/sft/behavior_sft_train.jsonl.tools.json"
+  # Unused by EqaToolCallSftDataset (reads prompt_messages/tool_steps) but kept for
+  # VLMBaseDataset.__init__ compatibility.
+  prompt_key: "task"
+  answer_key: "answer"
+  image_keys: []
+  max_prompt_length: 2048          # prompt (system+tools+user) budget
+  max_length: 4096                 # full sequence: prompt + all turns (largest row ~2590)
+  lazy_loading: false
+  num_workers: 8
+  shuffle: True
+  seed: 42
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  eval_batch_size: 1
+  global_batch_size: 32
+  seed: 42
+
+  model:
+    # Text backbone, same as the GRPO rollout. Loader auto-picks CausalLM.
+    model_type: "qwen2.5"
+    precision: bf16          # proven; fp32 OOMs 7B even on a 143 GB H20
+    model_path: "/opt/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28"
+    is_lora: False
+
+  optim:
+    lr: 1e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    total_training_steps: ${runner.max_steps}
+    lr_warmup_steps: 8
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: bf16
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
