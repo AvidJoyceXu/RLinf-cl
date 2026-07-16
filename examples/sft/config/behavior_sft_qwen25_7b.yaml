@@ -43,8 +43,14 @@ runner:
   # enough to internalise the tool-call ACI as a GRPO cold-start (GRPO does the real
   # learning). Revisit after the loss curve / a held-out agentic eval.
   max_steps: 120
-  val_check_interval: 30       # save_interval must be a multiple of this
-  save_interval: 60
+  # In-training generation-eval is DISABLED (val_check_interval: 0). The SFT
+  # worker's eval does batched generation, which trips a Qwen2+FlashAttention
+  # right-padding ValueError (pre-existing in the shared eval path). The cold-start
+  # deliverable is the checkpoint, judged by train loss; agentic accuracy is
+  # measured separately via the dedicated eval path, not the SFT worker's generate.
+  val_check_interval: 0
+  save_interval: 60            # saves at 60, 120, and train-end
+
   experiment_name: behavior_toolcall_sft
   output_dir: ../results
   resume_dir: null
