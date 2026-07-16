@@ -1068,8 +1068,18 @@ def generate_with_kv_cache(
 
         generated_ids = torch.cat([generated_ids, next_token.unsqueeze(-1)], dim=-1)
 
-        # unfinished -> 1, finished -> 0
-        append_mask = (~finished).to(dtype=generated_attention_mask.dtype).unsqueeze(-1)
+        # Always attend to the newly-appended token (mask=1), even for finished
+        # samples. Appending 0 for a finished sample puts a pad at the RIGHT end of
+        # its mask; because ranks decode in lock-step until ALL finish (the
+        # all_reduce MIN below), an already-finished sample gets re-forwarded with a
+        # trailing-0 mask, which Qwen2 + FlashAttention rejects as right-padding.
+        # The appended token is a real position in that sample's own sequence and
+        # its post-EOS logits are discarded downstream, so masking it in is safe.
+        append_mask = torch.ones(
+            (batch_size, 1),
+            dtype=generated_attention_mask.dtype,
+            device=generated_attention_mask.device,
+        )
         generated_attention_mask = torch.cat(
             [generated_attention_mask, append_mask], dim=-1
         )
