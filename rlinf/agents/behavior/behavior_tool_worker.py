@@ -29,7 +29,7 @@ TWO OMNIGIBSON CONSTRAINTS SHAPE THIS FILE, and neither is about venvs:
   worker ranks, one activity each, plus routing by activity — not yet implemented, and
   called out in ``_start`` rather than faked.
 * **One session at a time.** A concurrent second session would mutate the first's
-  scene. ``self._lock`` serialises them, so ``group_size`` rollouts of one prompt run
+  scene. ``self._session_lock`` serialises them, so ``group_size`` rollouts of one prompt run
   sequentially within a rank and concurrency comes from rank count.
 
 Every simulator call — boot, reset, tool dispatch — is blocking C++ that can run for
@@ -73,7 +73,12 @@ class BehaviorToolWorker(ToolWorker):
         self._env: Any = None                  # BehaviorEnv, imported lazily
         self._booted_activity: str | None = None
         self._active_session: str | None = None
-        self._lock: asyncio.Lock | None = None
+        # NOT `_lock`: the base Worker class owns `self._lock` (a threading.Lock,
+        # used by `_get_collective_group`). Shadowing it with an asyncio.Lock made
+        # the base's `with self._lock:` raise `AttributeError: __enter__`, because
+        # asyncio.Lock implements __aenter__ and not __enter__ -- which killed the
+        # request pump on its first channel recv and hung the whole run silently.
+        self._session_lock: asyncio.Lock | None = None
         self.request_processor_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------------- lifecycle
@@ -98,7 +103,7 @@ class BehaviorToolWorker(ToolWorker):
             # start_server may be dispatched off the event-loop thread; fall back
             # rather than dying silently.
             loop = asyncio.get_event_loop()
-        self._lock = asyncio.Lock()
+        self._session_lock = asyncio.Lock()
         self.request_processor_task = loop.create_task(self._process_requests())
         self.request_processor_task.add_done_callback(self._on_pump_exit)
         self.log_info(
@@ -176,8 +181,8 @@ class BehaviorToolWorker(ToolWorker):
         spec = dict(spec or {})
         activity = spec["activity"]
 
-        assert self._lock is not None, "start_server() not called"
-        await self._lock.acquire()
+        assert self._session_lock is not None, "start_server() not called"
+        await self._session_lock.acquire()
         try:
             if self._booted_activity is None:
                 self._env = await asyncio.to_thread(self._boot, activity)
@@ -186,7 +191,7 @@ class BehaviorToolWorker(ToolWorker):
                 # Refusing beats mutating: OmniGibson cannot rebuild the scene for a
                 # different activity in this process, so honouring the request would
                 # silently run the wrong task.
-                self._lock.release()
+                self._session_lock.release()
                 return ToolChannelResponse(
                     success=False,
                     result=(
@@ -198,7 +203,7 @@ class BehaviorToolWorker(ToolWorker):
 
             body = await asyncio.to_thread(self._env.start, spec.get("instance_id"))
         except BaseException:
-            self._lock.release()
+            self._session_lock.release()
             raise
 
         self._active_session = request.session_id
@@ -232,8 +237,8 @@ class BehaviorToolWorker(ToolWorker):
         if self._active_session != session_id:
             return
         self._active_session = None
-        if self._lock is not None and self._lock.locked():
-            self._lock.release()
+        if self._session_lock is not None and self._session_lock.locked():
+            self._session_lock.release()
 
     def _boot(self, activity: str):
         """Blocking: boots Kit and loads the scene. Minutes, not seconds."""
