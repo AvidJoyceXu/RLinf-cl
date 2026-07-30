@@ -97,10 +97,40 @@ class BehaviorToolWorker(ToolWorker):
         self.request_processor_task: asyncio.Task | None = None
 
         if self.activity_cfg:
-            # Ray constructs the actor on the worker process's MAIN thread, before
-            # the asyncio loop thread exists -- the one place Kit's assumptions hold.
-            # Blocking here for the boot is deliberate: no request can arrive yet.
-            self._env = self._boot(self.activity_cfg)
+            # Boot on a DEDICATED thread carrying a plain CPython event loop.
+            #
+            # Kit needs three things at once, and each previous attempt supplied only
+            # some of them:
+            #   (a) a thread with NO RUNNING loop. Ray's actor __init__ runs on its
+            #       asyncio thread where uvloop is live, so Kit's internal
+            #       run_until_complete raised "this event loop is already running"
+            #       9,774 times.
+            #   (b) a CPYTHON loop, not uvloop. sglang/Ray install uvloop's policy, so
+            #       `asyncio.new_event_loop()` hands back a uvloop Loop -- which has no
+            #       `_ready` / `_check_closed`, the CPython internals Kit reaches into.
+            #       Verified: hasattr(uvloop_loop, "_ready") is False, CPython True.
+            #       So construct SelectorEventLoop EXPLICITLY, bypassing the policy.
+            #   (c) no signal.signal, since it is not the main thread (see _boot).
+            #
+            # Blocking until the boot finishes is deliberate: no request can arrive
+            # before start_server, and a half-booted env is worse than a slow one.
+            box: dict[str, Any] = {}
+
+            def _boot_thread():
+                loop = asyncio.SelectorEventLoop()   # NOT new_event_loop(): see (b)
+                asyncio.set_event_loop(loop)
+                try:
+                    box["env"] = self._boot(self.activity_cfg)
+                except BaseException as e:           # noqa: BLE001
+                    box["err"] = e
+
+            th = threading.Thread(target=_boot_thread, name="omnigibson-boot",
+                                  daemon=True)
+            th.start()
+            th.join()
+            if "err" in box:
+                raise box["err"]
+            self._env = box["env"]
             self._booted_activity = self.activity_cfg
 
     # ---------------------------------------------------------------- lifecycle
@@ -294,13 +324,9 @@ class BehaviorToolWorker(ToolWorker):
         # Not cosmetic -- it never stops, and the boot never completes. Give the
         # thread a real loop. It is never run(); Kit only needs a loop OBJECT to
         # schedule onto, and call_soon_threadsafe on a non-running loop just queues.
+        # The caller owns loop setup (see __init__): Kit needs a plain CPython loop
+        # that is not running, which only the dedicated boot thread can guarantee.
         on_main = threading.current_thread() is threading.main_thread()
-        if not on_main:
-            # Fallback path only. These make a worker thread survivable, not fast --
-            # see the note in __init__ on why the main thread is the real answer.
-            if not getattr(self, "_thread_loop", None):
-                self._thread_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._thread_loop)
 
         real_signal = _signal.signal
         suppressed: list[int] = []
