@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import traceback
 from typing import Any
 
 from omegaconf import DictConfig
@@ -81,9 +82,43 @@ class BehaviorToolWorker(ToolWorker):
         super().init_worker(input_channel, output_channel)
 
     def start_server(self):
-        loop = asyncio.get_running_loop()
+        """Start the request pump.
+
+        Instrumented deliberately. The first run of this path hung with the worker
+        idle, an EMPTY asyncio thread, and NOTHING in any log: `create_task` on a
+        coroutine that raises immediately swallows the exception, because nobody
+        awaits the task, and the agent loop then blocks forever on a tool response
+        that will never come. A silent hang is the most expensive failure mode there
+        is -- it looks identical to "still booting". So: log both ends, and attach a
+        done-callback that surfaces whatever killed the pump.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # start_server may be dispatched off the event-loop thread; fall back
+            # rather than dying silently.
+            loop = asyncio.get_event_loop()
         self._lock = asyncio.Lock()
         self.request_processor_task = loop.create_task(self._process_requests())
+        self.request_processor_task.add_done_callback(self._on_pump_exit)
+        self.log_info(
+            f"BehaviorToolWorker request pump started (loop={id(loop)}); "
+            f"OmniGibson boots lazily on the first session_start"
+        )
+
+    def _on_pump_exit(self, task: asyncio.Task) -> None:
+        """The pump should run for the whole job; any exit is a bug worth shouting about."""
+        if task.cancelled():
+            self.log_info("BehaviorToolWorker request pump cancelled (shutdown)")
+            return
+        exc = task.exception()
+        if exc is not None:
+            self.log_error(
+                f"BehaviorToolWorker request pump DIED: {type(exc).__name__}: {exc}\n"
+                + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            )
+        else:
+            self.log_error("BehaviorToolWorker request pump exited without an error")
 
     def stop_server(self):
         if self.request_processor_task and not self.request_processor_task.done():
@@ -95,10 +130,18 @@ class BehaviorToolWorker(ToolWorker):
         self._active_session = None
 
     async def _process_requests(self):
+        self.log_info("BehaviorToolWorker pump: awaiting first request")
+        first = True
         while True:
             request: ToolChannelRequest = await self.input_channel.get(
                 async_op=True
             ).async_wait()
+            if first:
+                self.log_info(
+                    f"BehaviorToolWorker pump: first request {request.request_type} "
+                    f"session={request.session_id}"
+                )
+                first = False
             asyncio.create_task(self._handle_one(request))
 
     # ------------------------------------------------------------------ routing
