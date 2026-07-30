@@ -1,15 +1,18 @@
 """BEHAVIOR env-as-a-service — the OmniGibson half of integrated (online) RL.
 
-Runs in the **py3.10 / openvla-oft** venv (IsaacSim 4.5 + OmniGibson 3.7.1) and
-exposes one booted :class:`SemanticACI` over plain HTTP. The **py3.11 / reason**
-trainer (SGLang + Megatron + FSDP) drives it through
-``rlinf/agents/behavior/behavior_tool_worker.py``.
+Exposes one booted :class:`SemanticACI` over plain HTTP.
 
-Why a server instead of an in-process tool worker: the two stacks cannot share an
-interpreter (IsaacSim pins py3.10, the SGLang/apex wheels pin py3.11/torch2.6), so
-EQA's in-process ``HabitatEQAToolWorker`` pattern is unavailable. This is the
-standard agentic-RL answer — env-as-a-service, the same shape Search-R1 uses for
-its retrieval server. Crucially it is **not** the ReST^EM split
+**No longer on the training path.** ``BehaviorToolWorker`` now holds a
+:class:`BehaviorEnv` in process and calls it directly. The claim that motivated this
+server -- "the two stacks cannot share an interpreter (IsaacSim pins py3.10, the
+SGLang/apex wheels pin py3.11/torch2.6)" -- was **wrong**: only IsaacSim's cp310 pin
+is real, and every trainer component has a cp310 form, so one venv runs both. See
+``code-doc/0730 - single-venv container/INSTALL.md`` §1.
+
+This file survives as a **debugging surface**: boot one activity, curl a single tool
+call, drive one episode by hand, time resets without standing up Ray and Megatron.
+That is genuinely useful and is why it is kept rather than deleted. It is **not** the
+ReST^EM split
 (:doc:`0716 <../../../../code-doc/human-plan/0716 - GRPO to iterative RFT - design.md>`):
 sampling and the policy update stay in one online loop, and the venv boundary
 costs one localhost round trip per tool call, not an offline JSONL round trip per
@@ -157,7 +160,14 @@ class BehaviorEnv:
         else:
             match = [f for f in self.instances if f.instance_id == instance_id]
             if not match:
-                raise KeyError(f"instance {instance_id} not available for {self.activity}")
+                have = [f.instance_id for f in self.instances]
+                raise KeyError(
+                    f"instance {instance_id} not available for {self.activity}: "
+                    f"{len(have)} loaded, ids {have[:5]}{'...' if len(have) > 5 else ''}. "
+                    f"instances_per_activity truncates to the FIRST N discovered "
+                    f"instances while build_rl_dataset samples arbitrary ids -- set "
+                    f"tools.behavior.instances_per_activity: 0 to keep all of them."
+                )
             inst = match[0]
 
         # `fast_reset` skips the trailing scene.reset() on the instance load -- the

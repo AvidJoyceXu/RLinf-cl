@@ -178,7 +178,24 @@ class BehaviorAgentLoopWorker(MultiAgentLoopWorker):
             episode_id, async_op=True
         ).async_wait()
 
-        info = started.result if isinstance(started.result, dict) else {}
+        # Surface a failed session_start AS ITSELF. `_handle_one` reports failures as
+        # ToolChannelResponse(success=False, result="<ExcType>: <msg>") -- a string,
+        # not a dict. Coercing that to {} and then asserting on a missing key
+        # reported "the env server returned no goal_nl ... the server predates
+        # nl_goal.py" when the truth was an exception during env boot: a real error
+        # replaced by a misleading one pointing at a component that no longer exists.
+        if not started.success:
+            raise RuntimeError(
+                f"session_start failed for {spec['activity']} "
+                f"(instance {spec.get('instance_id')}): {started.result}"
+            )
+        if not isinstance(started.result, dict):
+            raise TypeError(
+                f"session_start returned {type(started.result).__name__}, expected "
+                f"dict: {started.result!r}"
+            )
+
+        info = started.result
         goal_lines = list(info.get("goal_lines") or [])
         goal_nl = info.get("goal_nl")
         # A reset whose goal already holds would score a free success. Flag it so
@@ -187,8 +204,10 @@ class BehaviorAgentLoopWorker(MultiAgentLoopWorker):
 
         if self.goal_format == "nl":
             assert goal_nl, (
-                f"agentloop.goal_format='nl' but the env server returned no goal_nl "
-                f"for {spec['activity']} — the server predates nl_goal.py"
+                f"agentloop.goal_format='nl' but the tool worker returned no goal_nl "
+                f"for {spec['activity']}. session_start succeeded, so this means "
+                f"BehaviorEnv.start() omitted the key -- check nl_goal.render_goal_nl "
+                f"for this activity. Keys returned: {sorted(info)}"
             )
         messages = sb.build_prompt_messages(
             spec["activity"], goal_lines, info.get("obs_mode", self.obs_mode),

@@ -179,7 +179,12 @@ tools:
     # activity; the activity comes from the dataset prompt and the worker boots
     # lazily on first use. Multi-activity training needs one rank per activity.
     obs_mode: full
-    instances_per_activity: 2
+    # 0 = keep ALL discovered instances. This must not truncate: build_rl_dataset
+    # samples arbitrary instance ids (59, 97, 124, ... for picking_up_trash) while
+    # `instances_per_activity: N` keeps only the first N (ids 0..N-1), so every
+    # session_start raised KeyError. The list is only file metadata -- the sim loads
+    # one instance at a time -- so keeping all 351 costs nothing.
+    instances_per_activity: 0
     # Cameras off: the semantic ACI reads no pixels and camera load cost ~13 of ~16
     # boot minutes. Partial scene load bounds both boot and reset.
     rgb: False

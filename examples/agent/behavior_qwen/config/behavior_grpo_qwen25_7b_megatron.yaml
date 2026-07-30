@@ -173,7 +173,12 @@ tools:
   behavior:
     # In-process OmniGibson; no env-server pool, no HTTP.
     obs_mode: full
-    instances_per_activity: 2
+    # 0 = keep ALL discovered instances. This must not truncate: build_rl_dataset
+    # samples arbitrary instance ids (59, 97, 124, ... for picking_up_trash) while
+    # `instances_per_activity: N` keeps only the first N (ids 0..N-1), so every
+    # session_start raised KeyError. The list is only file metadata -- the sim loads
+    # one instance at a time -- so keeping all 351 costs nothing.
+    instances_per_activity: 0
     rgb: False                   # the semantic ACI reads no pixels
     partial_scene: True          # load_task_relevant_only -> 122 objects, 0.1s reset
 
