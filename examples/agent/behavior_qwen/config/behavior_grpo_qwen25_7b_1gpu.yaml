@@ -17,7 +17,13 @@ defaults:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,rollout: 0
+    # `reward` must be listed even though no reward WORKER is launched:
+    # ModelParallelComponentPlacement asserts reward GPUs are specified
+    # (placement.py:135) before the `if self._reward_gpus:` guard that would have
+    # skipped it. train.py passes reward=None -- the agent loop scores each
+    # trajectory itself from the BDDL goal status in the tool responses -- so this
+    # entry reserves a placement that is never instantiated.
+    actor,rollout,reward: 0
 
 
 runner:

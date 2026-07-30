@@ -24,7 +24,9 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,rollout: all
+    # `reward` is required by the placement assert (placement.py:135) even though
+    # no reward worker exists; see the 1gpu config for the full note.
+    actor,rollout,reward: all
 
 
 runner:
