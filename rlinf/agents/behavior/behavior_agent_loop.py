@@ -62,6 +62,37 @@ from rlinf.workers.agent.agent_loop import (
 )
 
 
+def _parse_episode_spec(answer: Any) -> dict:
+    """Recover the episode spec {activity, scene, instance_id} from the dataset row.
+
+    The loader does NOT hand back what the JSONL stored. `ReasoningDataset` wraps a
+    string answer in a list (`reasoning.py:224`: "if answer is a string, convert it to
+    a list"), so `answer` arrives as `['{"activity": ...}']`, never as the bare str.
+    An earlier version tested `isinstance(answer, str)` and fell through to
+    `dict(answer)`, which tried to read a list of one 89-char string as key/value
+    pairs:
+
+        ValueError: dictionary update sequence element #0 has length 89; 2 is required
+
+    Accept every shape the loader can produce rather than the one shape the file has,
+    and fail with the offending value rather than a length arithmetic error.
+    """
+    if isinstance(answer, (list, tuple)):
+        if len(answer) != 1:
+            raise ValueError(
+                f"episode spec must be a single entry, got {len(answer)}: {answer!r}"
+            )
+        answer = answer[0]
+    if isinstance(answer, str):
+        answer = json.loads(answer)
+    if not isinstance(answer, dict):
+        raise TypeError(f"episode spec must be a dict, got {type(answer).__name__}: {answer!r}")
+    missing = {"activity"} - answer.keys()
+    if missing:
+        raise ValueError(f"episode spec is missing {sorted(missing)}: {answer!r}")
+    return answer
+
+
 class BehaviorAgentLoopWorker(MultiAgentLoopWorker):
     """Agent loop for BEHAVIOR semantic tool-call planning.
 
@@ -130,7 +161,7 @@ class BehaviorAgentLoopWorker(MultiAgentLoopWorker):
     ) -> tuple[list[int], dict[str, Any]]:
         from rlinf.envs.behavior import sft_build as sb
 
-        spec = json.loads(answer) if isinstance(answer, str) else dict(answer)
+        spec = _parse_episode_spec(answer)
         episode_id = uuid4().hex
 
         tool_channel_info = await self._tool_channel()
