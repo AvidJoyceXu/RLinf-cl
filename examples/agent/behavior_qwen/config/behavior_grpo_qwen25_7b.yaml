@@ -1,13 +1,14 @@
 # Integrated online GRPO for the BEHAVIOR semantic-tool planner.
 #
 # This is the config that replaces the ReST^EM loop (0716): sampling and the
-# policy update run in ONE process against fresh on-policy rollouts. The env lives
-# in separate OmniGibson processes because of the venv split, reached over
-# localhost by BehaviorToolWorker — an RPC hop, not a train/sample split.
+# policy update run in ONE process against fresh on-policy rollouts. OmniGibson runs
+# IN PROCESS inside BehaviorToolWorker: one venv carries both stacks, so there is no
+# HTTP hop and no env-server pool to keep alive.
 #
 # Init from the SFT cold-start, not from base: the cold-start is what makes the
 # policy speak the ACI at all, so a from-scratch GRPO run spends its whole budget
-# on rollouts that never emit a parseable tool call.
+# on rollouts that never emit a parseable tool call. The _1gpu variant overrides this
+# to base weights on purpose -- it is a plumbing test, not a learning run.
 defaults:
   - ../../../reasoning/config/training_backend/fsdp@inference.fsdp_config
   - ../../../reasoning/config/training_backend/fsdp@actor.fsdp_config
@@ -58,8 +59,8 @@ runner:
 
 algorithm:
   # group_size samples of the SAME (activity, instance) — this is where GRPO's
-  # advantage variance comes from, and it is bounded by how many env-server
-  # replicas that activity has. Match --replicas in the launcher.
+  # advantage variance comes from. OmniGibson serves one session at a time per
+  # process, so a group runs sequentially inside a rank; each sample costs a reset.
   group_size: 4
   n_minibatches: 2
   training_batch_size_per_gpu: 1
@@ -168,19 +169,29 @@ reward:
 
 tools:
   behavior:
-    # Filled in by scripts/launch_behavior_env_servers.sh (servers.yaml).
-    # {activity: [url, ...]} — replicas per activity bound rollout parallelism.
-    servers: {}
-    request_timeout_s: 300
-    lease_timeout_s: 900
+    # The env now runs IN PROCESS inside the tool worker — no env-server pool, no
+    # servers.yaml, no HTTP. One venv holds both stacks, so there is nothing to
+    # bridge (code-doc/0730 - single-venv container/INSTALL.md §1).
+    #
+    # OmniGibson locks one activity per process, so ONE worker rank serves ONE
+    # activity; the activity comes from the dataset prompt and the worker boots
+    # lazily on first use. Multi-activity training needs one rank per activity.
+    obs_mode: full
+    instances_per_activity: 2
+    # Cameras off: the semantic ACI reads no pixels and camera load cost ~13 of ~16
+    # boot minutes. Partial scene load bounds both boot and reset.
+    rgb: False
+    partial_scene: True
 
 
 rollout:
   group_name: "RolloutGroup"
   gpu_memory_utilization: 0.8
   model:
-    # The SFT cold-start export, NOT the base model. See 0717.
-    model_path: /data2/joycexu/behavior-data/sft/hf_step120
+    # The SFT cold-start export, NOT the base model. See 0717. CONTAINER path --
+    # /data2/joycexu/behavior-data is mounted at /data/behavior-data, and the host
+    # path does not exist inside the container.
+    model_path: /data/behavior-data/sft/hf_step120
     model_type: qwen2.5
     precision: ${actor.model.precision}
   enforce_eager: False

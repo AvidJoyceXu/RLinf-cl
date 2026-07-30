@@ -41,15 +41,10 @@ export PYTHONPATH=${REPO_PATH}:${MEGATRON_PATH}:${REPO_PATH}/examples:${SPATIALC
 
 CONFIG_NAME=${1:-behavior_grpo_qwen25_7b}
 
-# Fail fast and loudly if the env servers are not up: without them every rollout
-# dies on lease acquisition ~10 minutes into the run.
-SERVERS_YAML=${SERVERS_YAML:-/data/behavior-data/env_servers/servers.yaml}
-if [ ! -f "$SERVERS_YAML" ]; then
-    echo "ERROR: $SERVERS_YAML not found — start the env-server pool first:" >&2
-    echo "  scripts/launch_behavior_env_servers.sh --activities <a,b> --replicas 4" >&2
-    exit 1
-fi
+# No env-server pool to start any more: the tool worker holds OmniGibson in process,
+# so there is no servers.yaml to check for. The first rollout pays the Kit boot
+# (~3-4 min with cameras off) inside the worker instead.
 
-with-trainer python ${REPO_PATH}/examples/agent/behavior_qwen/train.py \
+python ${REPO_PATH}/examples/agent/behavior_qwen/train.py \
     --config-path ${CONFIG_PATH}/config/ \
     --config-name $CONFIG_NAME

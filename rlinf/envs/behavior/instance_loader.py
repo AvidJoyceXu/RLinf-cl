@@ -171,6 +171,8 @@ def load_activity_instance_tro_state(
     import omnigibson as og
     from omnigibson.utils.python_utils import recursively_convert_to_torch
 
+    from rlinf.envs.behavior.pose_batch import batched_pose_writes
+
     env.task.activity_instance_id = instance_id
     with open(tro_file_path, "r", encoding="utf-8") as f:
         tro_state = recursively_convert_to_torch(json.load(f))
@@ -182,32 +184,37 @@ def load_activity_instance_tro_state(
     )
     robot_poses = tro_state.pop("robot_poses", None)
 
-    for tro_key, state in tro_state.items():
-        entity = env.task.object_scope.get(tro_key)
-        assert entity is not None, (
-            f"Cached task-relevant object {tro_key!r} is not present in the current "
-            f"object_scope while loading {tro_file_path}."
-        )
-        if getattr(entity, "synset", None) == "agent":
-            continue
-        if (
-            getattr(env.scene, "idx", 0) != 0
-            and isinstance(state, dict)
-            and isinstance(state.get("root_link"), dict)
-            and "pos" in state["root_link"]
-            and "ori" in state["root_link"]
-        ):
-            rebased_state = dict(state)
-            rebased_root_link = dict(state["root_link"])
-            rebased_pos, rebased_ori = env.scene.convert_scene_relative_pose_to_world(
-                rebased_root_link["pos"],
-                rebased_root_link["ori"],
+    # Pose writes only, no simulation -> safe to collapse the fabric syncs.
+    with batched_pose_writes("tro_state load"):
+        for tro_key, state in tro_state.items():
+            entity = env.task.object_scope.get(tro_key)
+            assert entity is not None, (
+                f"Cached task-relevant object {tro_key!r} is not present in the "
+                f"current object_scope while loading {tro_file_path}."
             )
-            rebased_root_link["pos"] = rebased_pos
-            rebased_root_link["ori"] = rebased_ori
-            rebased_state["root_link"] = rebased_root_link
-            state = rebased_state
-        entity.load_state(state, serialized=False)
+            if getattr(entity, "synset", None) == "agent":
+                continue
+            if (
+                getattr(env.scene, "idx", 0) != 0
+                and isinstance(state, dict)
+                and isinstance(state.get("root_link"), dict)
+                and "pos" in state["root_link"]
+                and "ori" in state["root_link"]
+            ):
+                rebased_state = dict(state)
+                rebased_root_link = dict(state["root_link"])
+                (
+                    rebased_pos,
+                    rebased_ori,
+                ) = env.scene.convert_scene_relative_pose_to_world(
+                    rebased_root_link["pos"],
+                    rebased_root_link["ori"],
+                )
+                rebased_root_link["pos"] = rebased_pos
+                rebased_root_link["ori"] = rebased_ori
+                rebased_state["root_link"] = rebased_root_link
+                state = rebased_state
+            entity.load_state(state, serialized=False)
 
     if robot_poses is not None:
         assert robot_name in robot_poses, (
@@ -224,6 +231,8 @@ def load_activity_instance_tro_state(
     else:
         env.scene.write_task_metadata(key="robot_poses", data=None)
 
+    # Deliberately NOT batched: objects genuinely move while physics steps, so
+    # keep_still() must read fresh poses to zero the right velocities.
     for _ in range(25):
         og.sim.step_physics()
         for entity in env.task.object_scope.values():
@@ -232,7 +241,11 @@ def load_activity_instance_tro_state(
 
     env.scene.update_initial_file()
     if reset_scene:
-        env.scene.reset()
+        # This is the expensive one: reset() -> restore() walks EVERY object in the
+        # scene, thousands of prims on house_double_floor_lower. Unbatched it ran
+        # past 90 minutes.
+        with batched_pose_writes("scene.reset"):
+            env.scene.reset()
 
 
 class ActivityInstanceLoader:

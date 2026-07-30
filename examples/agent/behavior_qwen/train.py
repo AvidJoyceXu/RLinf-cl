@@ -104,8 +104,11 @@ def main(cfg) -> None:
     tokenizer = hf_tokenizer(cfg.actor.tokenizer.tokenizer_model)
     train_ds, val_ds = create_rl_dataset(cfg, tokenizer)
 
-    # The tool worker is a thin HTTP proxy to the env servers, so it is cheap and
-    # belongs on one node; the simulators are separate processes elsewhere.
+    # The tool worker now BOOTS OMNIGIBSON IN PROCESS, so it is no longer a thin
+    # proxy: it needs a visible GPU for PhysX and holds the scene for the whole run.
+    # It shares node 0 (and GPU 0) with SGLang, which is why the 1-GPU config drops
+    # rollout.gpu_memory_utilization to 0.5. One rank == one activity, because
+    # OmniGibson locks the activity at first boot.
     tool_workers = {
         BehaviorToolWorker.create_group(cfg).launch(
             cluster, name="behavior", placement_strategy=NodePlacementStrategy([0])

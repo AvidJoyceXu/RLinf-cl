@@ -1,10 +1,15 @@
 # Single-card smoke for the integrated online-GRPO loop.
 #
-# Purpose is to prove the loop closes end-to-end — prompt -> SGLang turn -> HTTP
-# tool call -> OmniGibson -> BDDL reward -> FSDP update — not to learn anything.
-# Point it at ONE activity with `--replicas 2` and read three numbers from the
-# first step: rollout/end_task_rate (does it terminate at all), rollout/goal_coverage
-# (does it make partial progress), rollout/success_rate.
+# Purpose is to prove the loop closes end-to-end — prompt -> SGLang turn -> in-process
+# tool call -> OmniGibson -> BDDL reward -> FSDP update — not to learn anything. Read
+# three numbers from the first step: rollout/end_task_rate (does it terminate at all),
+# rollout/goal_coverage (partial progress), rollout/success_rate.
+#
+# Starts from BASE Qwen2.5-7B-Instruct, not the SFT cold start, because this run is
+# for debugging the pipeline. Expect success_rate 0 and near-zero within-group variance:
+# an un-cold-started policy rarely emits well-formed tool calls, so GRPO has almost no
+# signal. That is fine for a plumbing test and NOT a result — a learning run must init
+# from the SFT export (see 0717 on why variance needs the cold start).
 defaults:
   - behavior_grpo_qwen25_7b
 
@@ -28,8 +33,9 @@ runner:
 
 
 algorithm:
-  # group_size must be <= the number of env-server replicas for the activity,
-  # otherwise the group's samples serialize behind one simulator.
+  # OmniGibson serves one session at a time per process, so a group's samples run
+  # sequentially in one worker rank regardless of this number. Keep it small: each
+  # sample costs a full episode reset.
   group_size: 2
 
 
@@ -45,6 +51,12 @@ actor:
 
 rollout:
   gpu_memory_utilization: 0.5    # leave room for FSDP weights+grads+optimizer
+  model:
+    # BASE instruct weights, not the SFT export — see the header. Container path;
+    # the host HF cache is mounted at /data/hf_home. actor.model.model_path and
+    # tokenizer_model both reference ${rollout.model.model_path}, so this one key
+    # moves all three.
+    model_path: /data/hf_home/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28
 
 
 agentloop:

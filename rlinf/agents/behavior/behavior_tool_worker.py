@@ -8,22 +8,35 @@
 
 """BehaviorToolWorker — RLinf tool worker for the BEHAVIOR semantic-tool ACI.
 
-Structural counterpart of ``HabitatEQAToolWorker``, with one difference that the
-venv split forces: EQA holds ``EQAEpisode`` objects *in process*, while OmniGibson
-cannot be imported here at all (IsaacSim pins py3.10; this worker runs in the
-py3.11 trainer venv beside SGLang and Megatron). So each episode is leased from a
-pool of ``rlinf/envs/behavior/env_server.py`` processes over localhost HTTP.
+Holds a ``BehaviorEnv`` **in process** and calls it directly, exactly like
+``HabitatEQAToolWorker`` holds its ``EQAEpisode`` objects. There is no HTTP hop.
 
-Everything else the agent framework sees is identical to the EQA worker: a
-``session_start`` / ``execute`` / ``session_end`` request triple keyed by
-``session_id``, with ``meta_info`` carrying the real BDDL goal status the reward
-module scores off.
+An earlier version of this file leased episodes from a pool of
+``rlinf/envs/behavior/env_server.py`` processes over localhost HTTP, because the
+trainer was believed to need py3.11 while IsaacSim pins py3.10. That was wrong: the
+trainer stack has a cp310 form for every component, so one venv runs both and the
+RPC boundary had nothing to bridge. See
+``code-doc/0730 - single-venv container/INSTALL.md`` §1. ``env_server.py`` survives as
+a debugging surface (curl one tool call, drive one episode by hand) but is no longer
+on the training path.
 
-Pool semantics: one server holds exactly one booted activity and serves one
-session at a time, so a lease is (activity → server) and concurrency is bounded by
-how many servers are up. ``group_size`` GRPO samples of the same prompt therefore
-serialize on one server unless several servers are launched for that activity;
-size the launcher accordingly (``scripts/launch_behavior_env_servers.sh``).
+TWO OMNIGIBSON CONSTRAINTS SHAPE THIS FILE, and neither is about venvs:
+
+* **One activity per process.** OmniGibson locks the ``HEADLESS`` macro at first boot,
+  so a process that booted activity A cannot host activity B. This worker boots
+  lazily on the first ``session_start`` and *refuses* a second activity rather than
+  silently mutating the wrong scene. Multi-activity training therefore needs several
+  worker ranks, one activity each, plus routing by activity — not yet implemented, and
+  called out in ``_start`` rather than faked.
+* **One session at a time.** A concurrent second session would mutate the first's
+  scene. ``self._lock`` serialises them, so ``group_size`` rollouts of one prompt run
+  sequentially within a rank and concurrency comes from rank count.
+
+Every simulator call — boot, reset, tool dispatch — is blocking C++ that can run for
+minutes. They go through ``asyncio.to_thread`` because this worker's event loop also
+services the request channel; calling them inline would stall the loop and make a slow
+reset look like a hung worker. The HTTP version got this for free by having the
+simulator in a different process, so it is the one thing that got *harder* here.
 """
 from __future__ import annotations
 
@@ -31,7 +44,6 @@ import asyncio
 import json
 from typing import Any
 
-import aiohttp
 from omegaconf import DictConfig
 
 from rlinf.data.tool_call.tool_io_struct import (
@@ -43,54 +55,44 @@ from rlinf.workers.agent.tool_worker import ToolWorker
 
 
 class BehaviorToolWorker(ToolWorker):
-    """Dispatches semantic-tool calls to a pool of BEHAVIOR env servers."""
+    """Dispatches semantic-tool calls to an in-process BEHAVIOR environment."""
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
         tcfg = cfg.tools.behavior
-        # {activity: [base_url, ...]} — several servers per activity give the
-        # group_size samples somewhere to run in parallel.
-        self.servers: dict[str, list[str]] = {
-            str(a): [str(u) for u in urls]
-            for a, urls in (tcfg.get("servers") or {}).items()
-        }
-        self.request_timeout: float = float(tcfg.get("request_timeout_s", 300.0))
-        self.lease_timeout: float = float(tcfg.get("lease_timeout_s", 600.0))
+        self.obs_mode: str = str(tcfg.get("obs_mode", "full"))
+        self.instances_per_activity: int = int(tcfg.get("instances_per_activity", 1))
+        # Cameras off / partial scene load are the defaults for the same reason as in
+        # env_server.py: the semantic ACI reads no pixels, and camera load cost ~13 of
+        # ~16 boot minutes on a non-ray-tracing GPU.
+        self.rgb: bool = bool(tcfg.get("rgb", False))
+        self.partial_scene: bool = bool(tcfg.get("partial_scene", True))
 
-        self._free: dict[str, asyncio.Queue] = {}
-        self._leased: dict[str, tuple[str, str]] = {}   # session_id -> (url, remote_sid)
-        self._session: aiohttp.ClientSession | None = None
+        self._env: Any = None                  # BehaviorEnv, imported lazily
+        self._booted_activity: str | None = None
+        self._active_session: str | None = None
+        self._lock: asyncio.Lock | None = None
         self.request_processor_task: asyncio.Task | None = None
 
     # ---------------------------------------------------------------- lifecycle
 
     def init_worker(self, input_channel: Channel, output_channel: Channel):
         super().init_worker(input_channel, output_channel)
-        assert self.servers, (
-            "tools.behavior.servers is empty — launch env servers first with "
-            "scripts/launch_behavior_env_servers.sh and point the config at them"
-        )
 
     def start_server(self):
         loop = asyncio.get_running_loop()
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.request_timeout))
-        for activity, urls in self.servers.items():
-            q: asyncio.Queue = asyncio.Queue()
-            for u in urls:
-                q.put_nowait(u.rstrip("/"))
-            self._free[activity] = q
+        self._lock = asyncio.Lock()
         self.request_processor_task = loop.create_task(self._process_requests())
 
     def stop_server(self):
         if self.request_processor_task and not self.request_processor_task.done():
             self.request_processor_task.cancel()
-        if self._session is not None:
-            asyncio.create_task(self._session.close())
-            self._session = None
-        self._leased.clear()
-        self._free.clear()
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+        self._booted_activity = None
+        self._active_session = None
 
     async def _process_requests(self):
         while True:
@@ -112,15 +114,13 @@ class BehaviorToolWorker(ToolWorker):
             else:
                 response = ToolChannelResponse(
                     success=False, result=f"unknown_request:{request.request_type}")
-        except asyncio.TimeoutError:
-            # A hung server must not wedge the episode forever; the agent loop
-            # sees a failed tool response and the trajectory ends with the
-            # budget-exhausted reward rather than blocking the whole rollout.
-            await self._release(request.session_id)
-            response = ToolChannelResponse(success=False, result="env_timeout")
         except Exception as e:                                    # noqa: BLE001
-            await self._release(request.session_id)
-            response = ToolChannelResponse(success=False, result=f"{type(e).__name__}:{e}")
+            # A failed tool must not wedge the episode: the agent loop sees the
+            # failure, the trajectory ends, and the reward module scores it as a
+            # non-terminating episode rather than blocking the whole rollout.
+            self._release(request.session_id)
+            response = ToolChannelResponse(
+                success=False, result=f"{type(e).__name__}:{e}")
 
         await self.output_channel.put(
             response, key=request.session_id, async_op=True
@@ -132,32 +132,45 @@ class BehaviorToolWorker(ToolWorker):
             spec = json.loads(spec)
         spec = dict(spec or {})
         activity = spec["activity"]
-        if activity not in self._free:
-            return ToolChannelResponse(
-                success=False, result=f"no_env_server_for_activity:{activity}")
 
-        url = await asyncio.wait_for(self._free[activity].get(), self.lease_timeout)
+        assert self._lock is not None, "start_server() not called"
+        await self._lock.acquire()
         try:
-            body = await self._post(f"{url}/session/start",
-                                    {"instance_id": spec.get("instance_id")})
-        except Exception:
-            self._free[activity].put_nowait(url)      # never leak the lease
+            if self._booted_activity is None:
+                self._env = await asyncio.to_thread(self._boot, activity)
+                self._booted_activity = activity
+            elif activity != self._booted_activity:
+                # Refusing beats mutating: OmniGibson cannot rebuild the scene for a
+                # different activity in this process, so honouring the request would
+                # silently run the wrong task.
+                self._lock.release()
+                return ToolChannelResponse(
+                    success=False,
+                    result=(
+                        f"activity_mismatch: this worker booted "
+                        f"{self._booted_activity!r} and OmniGibson locks one activity "
+                        f"per process; {activity!r} needs its own worker rank"
+                    ),
+                )
+
+            body = await asyncio.to_thread(self._env.start, spec.get("instance_id"))
+        except BaseException:
+            self._lock.release()
             raise
-        self._leased[request.session_id] = (url, body["session_id"])
-        # `goal_lines` comes back from the env because the ground goal atoms are
-        # instance-resolved; keeping them out of the dataset keeps the RL dataset
-        # builder sim-free.
+
+        self._active_session = request.session_id
+        # `goal_lines` and `goal_nl` both come back from the env: the ground atoms are
+        # instance-resolved, which is what keeps the RL dataset builder sim-free. Which
+        # one reaches the policy is the agent loop's `goal_format` choice.
         return ToolChannelResponse(success=True, result=body)
 
     async def _execute(self, request: ToolChannelRequest) -> ToolChannelResponse:
-        lease = self._leased.get(request.session_id)
-        if lease is None:
+        if self._active_session != request.session_id or self._env is None:
             return ToolChannelResponse(success=False, result="unknown_session")
-        url, remote_sid = lease
         args = dict(request.tool_args or {})
         args.pop("_episode_id", None)                 # routing key, not a tool arg
-        body = await self._post(f"{url}/session/{remote_sid}/tool",
-                                {"name": request.tool_name or "", "arguments": args})
+        body = await asyncio.to_thread(
+            self._env.call, request.tool_name or "", args)
         return ToolChannelResponse(
             success=bool(body.get("payload", {}).get("ok", True)),
             result=body.get("payload"),
@@ -165,30 +178,31 @@ class BehaviorToolWorker(ToolWorker):
         )
 
     async def _end(self, request: ToolChannelRequest) -> ToolChannelResponse:
-        await self._release(request.session_id)
+        if self._active_session == request.session_id and self._env is not None:
+            await asyncio.to_thread(self._env.end)
+        self._release(request.session_id)
         return ToolChannelResponse(success=True, result={"ok": True})
 
-    async def _release(self, session_id: str) -> None:
-        lease = self._leased.pop(session_id, None)
-        if lease is None:
+    def _release(self, session_id: str) -> None:
+        """Free the single session slot. Idempotent — `_handle_one`'s error path and
+        `_end` can both reach it for the same session."""
+        if self._active_session != session_id:
             return
-        url, remote_sid = lease
-        try:
-            await self._post(f"{url}/session/{remote_sid}/end", {})
-        except Exception:
-            pass                                      # returning the lease matters more
-        for activity, urls in self.servers.items():
-            if url in [u.rstrip("/") for u in urls]:
-                self._free[activity].put_nowait(url)
-                break
+        self._active_session = None
+        if self._lock is not None and self._lock.locked():
+            self._lock.release()
 
-    async def _post(self, url: str, payload: dict) -> dict:
-        assert self._session is not None, "start_server() not called"
-        async with self._session.post(url, json=payload) as resp:
-            body = await resp.json()
-            if resp.status >= 400:
-                raise RuntimeError(f"env server {resp.status}: {body}")
-            return body
+    def _boot(self, activity: str):
+        """Blocking: boots Kit and loads the scene. Minutes, not seconds."""
+        from rlinf.envs.behavior.env_server import BehaviorEnv
+
+        return BehaviorEnv(
+            activity,
+            obs_mode=self.obs_mode,
+            instances_per_activity=self.instances_per_activity,
+            rgb=self.rgb,
+            partial_scene=self.partial_scene,
+        )
 
 
 def tool_names() -> list[str]:
