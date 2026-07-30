@@ -293,6 +293,8 @@ class SemanticACI:
              stacks and overflows.
         Pairs processed in order; per-target counter spreads the fallback ring.
         Returns {key: bool success}."""
+        import time as _t
+
         out = {}
         placed = {}
         for movable, target, pred in pairs:
@@ -301,26 +303,45 @@ class SemanticACI:
             k = placed.get(target, 0)
             placed[target] = k + 1
             ok = False
+            via = "unresolved"
+            _t0 = _t.time()
             if m is not None and t is not None and cls in getattr(m, "states", {}):
-                # 1) real-interior sampler (best for roomy/elevated containers)
-                try:
-                    sample_kinematics(self._SAMPLE_PRED[pred], m, t,
-                                      use_last_ditch_effort=True)
-                    ok = bool(m.states[cls].get_value(t))
-                except Exception:
-                    ok = False
-                # 2) fallback: ring-spread drop-in (tight multi-object bins).
-                #    sample_kinematics is rejection-based and flaky in deep
-                #    containers (a fridge shelf can miss on the 2nd item), so try
-                #    several ring slots before giving up on this pair.
+                # ORDER MATTERS, and it is the opposite of what it was until
+                # 2026-07-30. `sample_kinematics` is Monte-Carlo rejection sampling
+                # that burns its ENTIRE nested budget on failure -- HIGH(10) x LOW(10)
+                # physics steps at ~200ms plus raycasts and a full-scene load_state
+                # per outer retry, measured at 20-78s per failed pair (0710 doc §6).
+                # Running it first meant one activity's cache took >22 MINUTES.
+                #
+                # The drop-in is analytic: compute a pose on the target's AABB
+                # floor/top, set it, settle ~10 steps, then VERIFY with the real
+                # `get_value`. Cheap, and just as honest -- the acceptance test is
+                # the same geometric predicate either way.
+                #
+                # 1) analytic ring-spread drop-in (cheap; also better for tight
+                #    multi-object bins, where the sampler stacks and overflows)
+                for kk in (k, k + 2, k + 4, k + 1):
+                    if self._seat_dropin(m, t, cls, pred, kk):
+                        ok, via = True, "dropin"
+                        break
+                # 2) only now pay rejection sampling. It uses the target's real
+                #    interior volume, so it still earns its place on elevated /
+                #    shelved containers (fridge, cabinet) where a floor drop-in has
+                #    no valid slot.
                 if not ok:
-                    for kk in (k, k + 2, k + 4, k + 1):
-                        if self._seat_dropin(m, t, cls, pred, kk):
-                            ok = True
-                            break
+                    try:
+                        sample_kinematics(self._SAMPLE_PRED[pred], m, t,
+                                          use_last_ditch_effort=True)
+                        ok = bool(m.states[cls].get_value(t))
+                        via = "sample_kinematics" if ok else "failed"
+                    except Exception:
+                        ok, via = False, "failed"
                 if ok:
                     pos, orn = m.get_position_orientation()
                     self._pose_cache[(movable, target, pred)] = (pos.clone(), orn.clone())
+            print(f"[pose_cache] {movable} -> {target} {pred}: "
+                  f"{'ok' if ok else 'FAIL'} via={via} {_t.time() - _t0:.1f}s",
+                  flush=True)
             out[(movable, target, pred)] = ok
         return out
 

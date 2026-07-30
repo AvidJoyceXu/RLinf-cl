@@ -172,13 +172,34 @@ class BehaviorEnv:
         # half-objects, fill/spray instantiate particle systems -- because
         # hard=False ignores objects missing from the initial file. Ask the ACI
         # instead of always paying for it.
+        # Phase timing, printed unconditionally. `session/start` has been slow for
+        # three different reasons in a row, and each time a py-spy stack was ambiguous
+        # about WHICH phase owned the cost -- line attribution cannot separate the
+        # reset_to_instance called here from the one inside build_cache_on_instance.
+        # Two timers settle in one run what several profiling sessions did not.
+        import time as _t
+
         hard = bool(getattr(self.aci, "object_set_dirty", False))
+        _t0 = _t.time()
         reset_to_instance(self.aci, self.env, inst,
                           reset_scene=not self.fast_reset, hard_reset=hard)
+        d_reset = _t.time() - _t0
         self.aci.object_set_dirty = False
+
+        d_cache = 0.0
+        cache_built = False
         if self.cached_instance != inst.instance_id:
+            _t0 = _t.time()
             build_cache_on_instance(self.aci, self.env, self.plan, inst)
+            d_cache = _t.time() - _t0
+            cache_built = True
             self.cached_instance = inst.instance_id
+        print(
+            f"[start] instance={inst.instance_id} hard={hard} "
+            f"reset={d_reset:.1f}s pose_cache={d_cache:.1f}s "
+            f"(built={cache_built}) total={d_reset + d_cache:.1f}s",
+            flush=True,
+        )
 
         self.session_id = uuid4().hex
         return {

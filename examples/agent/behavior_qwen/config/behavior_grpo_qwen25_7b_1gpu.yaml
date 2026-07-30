@@ -41,6 +41,14 @@ algorithm:
 
 data:
   rollout_batch_size: 2
+  # ONE activity only. OmniGibson locks the activity at first boot, so a worker that
+  # booted picking_up_trash refuses anything else -- with the 22-activity train split
+  # every rollout after the first would fail on activity_mismatch. Built by filtering
+  # rl/train.jsonl; see the run log.
+  train_data_paths: ["/data/behavior-data/rl/train_1activity.jsonl"]
+  # Validation would hit the same wall (val_s2 spans 3 activities), but
+  # val_check_interval: 100 > max_steps: 2 means it never fires in the smoke.
+  val_data_paths: ["/data/behavior-data/rl/train_1activity.jsonl"]
 
 
 actor:
