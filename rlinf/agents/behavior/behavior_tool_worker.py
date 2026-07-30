@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import traceback
 from typing import Any
 
@@ -70,7 +71,21 @@ class BehaviorToolWorker(ToolWorker):
         self.rgb: bool = bool(tcfg.get("rgb", False))
         self.partial_scene: bool = bool(tcfg.get("partial_scene", True))
 
-        self._env: Any = None                  # BehaviorEnv, imported lazily
+        # Booting Kit on a worker thread does not work. Two main-thread assumptions
+        # were patchable (signal.signal, a missing event loop); the third was not --
+        # Kit's own `Loop` object gets poked by code expecting asyncio's interface,
+        # and the resulting per-frame traceback storm (29k errors) turned a 5:59 boot
+        # into >28 minutes with OmniGibson's own progress frozen at 00:04:45 while
+        # Kit's app clock ran to 1,674,419ms. Three strikes: Kit wants the main
+        # thread, so boot there.
+        #
+        # `activity` therefore has to be known at construction time. That is not a
+        # real loss: OmniGibson locks one activity per process, so a worker serves
+        # exactly one for its whole life -- the config merely states what was already
+        # true. Leave it unset to fall back to the lazy path (fine for a debugging
+        # process that is already on the main thread).
+        self.activity_cfg: str | None = tcfg.get("activity", None)
+        self._env: Any = None                  # BehaviorEnv
         self._booted_activity: str | None = None
         self._active_session: str | None = None
         # NOT `_lock`: the base Worker class owns `self._lock` (a threading.Lock,
@@ -80,6 +95,13 @@ class BehaviorToolWorker(ToolWorker):
         # request pump on its first channel recv and hung the whole run silently.
         self._session_lock: asyncio.Lock | None = None
         self.request_processor_task: asyncio.Task | None = None
+
+        if self.activity_cfg:
+            # Ray constructs the actor on the worker process's MAIN thread, before
+            # the asyncio loop thread exists -- the one place Kit's assumptions hold.
+            # Blocking here for the boot is deliberate: no request can arrive yet.
+            self._env = self._boot(self.activity_cfg)
+            self._booted_activity = self.activity_cfg
 
     # ---------------------------------------------------------------- lifecycle
 
@@ -272,9 +294,13 @@ class BehaviorToolWorker(ToolWorker):
         # Not cosmetic -- it never stops, and the boot never completes. Give the
         # thread a real loop. It is never run(); Kit only needs a loop OBJECT to
         # schedule onto, and call_soon_threadsafe on a non-running loop just queues.
-        if not getattr(self, "_thread_loop", None):
-            self._thread_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._thread_loop)
+        on_main = threading.current_thread() is threading.main_thread()
+        if not on_main:
+            # Fallback path only. These make a worker thread survivable, not fast --
+            # see the note in __init__ on why the main thread is the real answer.
+            if not getattr(self, "_thread_loop", None):
+                self._thread_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._thread_loop)
 
         real_signal = _signal.signal
         suppressed: list[int] = []
@@ -283,7 +309,8 @@ class BehaviorToolWorker(ToolWorker):
             suppressed.append(signum)
             return None
 
-        _signal.signal = _signal_noop
+        if not on_main:
+            _signal.signal = _signal_noop
         try:
             env = BehaviorEnv(
                 activity,

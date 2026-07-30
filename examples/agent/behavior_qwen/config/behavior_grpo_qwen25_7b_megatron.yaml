@@ -172,6 +172,13 @@ agentloop:
 tools:
   behavior:
     # In-process OmniGibson; no env-server pool, no HTTP.
+    # Known at CONSTRUCTION time so the worker can boot Kit on the actor's MAIN
+    # thread. Booting on an asyncio.to_thread worker does not work: Kit assumes the
+    # main thread in at least three places, and the third (its `Loop` object being
+    # poked by asyncio-shaped code) produces a per-frame traceback storm that turned
+    # a 5:59 boot into >28 min. Not a real constraint -- OmniGibson locks one
+    # activity per process anyway, so this states what was already true.
+    activity: picking_up_trash
     obs_mode: full
     # 0 = keep ALL discovered instances. This must not truncate: build_rl_dataset
     # samples arbitrary instance ids (59, 97, 124, ... for picking_up_trash) while
