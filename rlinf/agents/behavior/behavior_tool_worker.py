@@ -264,6 +264,18 @@ class BehaviorToolWorker(ToolWorker):
 
         from rlinf.envs.behavior.env_server import BehaviorEnv
 
+        # Kit's async engine calls asyncio.get_event_loop() during startup and then
+        # drives it every frame. A bare `to_thread` worker has NO loop, so Kit got
+        # None and spewed, once per frame, forever:
+        #     AttributeError: 'Loop' object has no attribute '_ready' / '_check_closed'
+        #     AttributeError: 'NoneType' object has no attribute 'call_soon_threadsafe'
+        # Not cosmetic -- it never stops, and the boot never completes. Give the
+        # thread a real loop. It is never run(); Kit only needs a loop OBJECT to
+        # schedule onto, and call_soon_threadsafe on a non-running loop just queues.
+        if not getattr(self, "_thread_loop", None):
+            self._thread_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._thread_loop)
+
         real_signal = _signal.signal
         suppressed: list[int] = []
 
