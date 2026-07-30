@@ -33,9 +33,15 @@ runner:
   task_type: sft
   logger:
     log_path: ${runner.output_dir}/${runner.experiment_name}
-    project_name: rlinf
+    project_name: behavior-toolcall
     experiment_name: ${runner.experiment_name}
-    logger_backends: ["tensorboard"]
+    # Both backends: tensorboard is the always-available local record, wandb is the
+    # cross-run comparison view. MetricLogger passes the FULLY RESOLVED config to
+    # `wandb.init(config=...)`, so every hyperparameter in this file is recorded per
+    # run automatically -- that is the run's hyperparameter log, not a doc to
+    # maintain by hand. See code-doc/human-plan/0730 - SFT & RL run log.md.
+    logger_backends: ["tensorboard", "wandb"]
+    wandb_proxy: null
 
   seq_length: 8192
   max_epochs: -1

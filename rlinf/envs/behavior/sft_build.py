@@ -157,13 +157,27 @@ def goal_atoms_to_lines(atoms: Any) -> list[str]:
 
 
 def build_prompt_messages(activity: str, goal_lines: list[str],
-                          obs_mode: str = "full") -> list[dict]:
-    goal_block = "\n".join(f"  - {g}" for g in goal_lines) or "  (none)"
+                          obs_mode: str = "full",
+                          goal_nl: str | None = None) -> list[dict]:
+    """The one prompt builder, shared by the SFT harvester and the GRPO rollout.
+
+    ``goal_nl`` selects the **natural-language goal condition** (see
+    ``nl_goal.py``): the sentence replaces the ground-atom block entirely, so the
+    policy has to infer which predicates and objects the instruction denotes
+    instead of transliterating atoms into same-named tools. Passing ``None`` keeps
+    the ground-atom condition, which is the ablation baseline and what the current
+    SFT checkpoint was trained on. Reward is identical either way -- it comes from
+    the simulator's BDDL evaluation, not from this text."""
+    if goal_nl is not None:
+        body = f"You are done when this is true: {goal_nl}"
+    else:
+        goal_block = "\n".join(f"  - {g}" for g in goal_lines) or "  (none)"
+        body = ("Complete the activity so that all of these goal conditions hold:\n"
+                f"{goal_block}")
     user = (
         f"Activity: {activity.replace('_', ' ')}\n"
         f"Observability: {obs_mode}\n"
-        f"Complete the activity so that all of these goal conditions hold:\n"
-        f"{goal_block}"
+        f"{body}"
     )
     return [
         {"role": "system", "content": BEHAVIOR_SYSTEM_PROMPT},
@@ -179,13 +193,18 @@ def _result_text(payload: Any) -> str:
 
 
 def trajectory_to_row(traj: Any, initial_obs: dict, goal_lines: list[str],
-                      obs_mode: str = "full") -> dict:
+                      obs_mode: str = "full", goal_nl: str | None = None) -> dict:
     """Transcribe one ExpertTrajectory (duck-typed) into an SFT row.
 
     ``traj`` needs ``.activity``, ``.task_description``, ``.success``,
     ``.unsupported`` and ``.steps`` (each with ``.tool``, ``.args``, ``.ok``,
     ``.reason``). ``initial_obs`` is ``aci.observe()`` captured at reset, BEFORE
     the planner mutates the scene.
+
+    ``goal_nl`` switches the prompt to the natural-language goal condition. Rows
+    already on disk do not need re-harvesting to change it -- the trajectory is
+    independent of how the goal was phrased, so ``relabel_sft_nl.py`` rewrites the
+    prompt in place.
     """
     tool_steps = [{
         "name": "observe", "arguments": {},
@@ -207,7 +226,8 @@ def trajectory_to_row(traj: Any, initial_obs: dict, goal_lines: list[str],
         "task": getattr(traj, "task_description", "") or activity_to_task(traj.activity),
         "success": bool(traj.success),
         "num_turns": len(tool_steps),
-        "prompt_messages": build_prompt_messages(traj.activity, goal_lines, obs_mode),
+        "prompt_messages": build_prompt_messages(traj.activity, goal_lines, obs_mode,
+                                                 goal_nl=goal_nl),
         "tool_steps": tool_steps,
         "unsupported_predicates": list(getattr(traj, "unsupported", []) or []),
         "answer": "",  # BEHAVIOR reward is BDDL success, not a categorical answer

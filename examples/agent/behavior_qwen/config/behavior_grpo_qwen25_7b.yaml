@@ -1,0 +1,286 @@
+# Integrated online GRPO for the BEHAVIOR semantic-tool planner.
+#
+# This is the config that replaces the ReST^EM loop (0716): sampling and the
+# policy update run in ONE process against fresh on-policy rollouts. The env lives
+# in separate OmniGibson processes because of the venv split, reached over
+# localhost by BehaviorToolWorker — an RPC hop, not a train/sample split.
+#
+# Init from the SFT cold-start, not from base: the cold-start is what makes the
+# policy speak the ACI at all, so a from-scratch GRPO run spends its whole budget
+# on rollouts that never emit a parseable tool call.
+defaults:
+  - ../../../reasoning/config/training_backend/fsdp@inference.fsdp_config
+  - ../../../reasoning/config/training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout: all
+
+
+runner:
+  task_type: reasoning
+  logger:
+    log_path: ${runner.output_dir}/${runner.experiment_name}
+    project_name: behavior-toolcall
+    experiment_name: ${runner.experiment_name}
+    # Both backends: tensorboard is the always-available local record, wandb is the
+    # cross-run comparison view. MetricLogger passes the FULLY RESOLVED config to
+    # `wandb.init(config=...)`, so every hyperparameter below -- goal_format, reward
+    # shaping, group_size, temperature, the checkpoint path -- is recorded per run
+    # automatically. `run_train.sh` falls back to WANDB_MODE=offline when no API key
+    # is present, so a logging credential can never kill a training run.
+    # Run log: code-doc/human-plan/0730 - SFT & RL run log.md
+    logger_backends: ["tensorboard", "wandb"]
+    wandb_proxy: null
+
+  experiment_name: behavior-grpo-qwen25-7b
+  output_dir: /data/behavior-data/rl_runs
+
+  max_epochs: 1
+  max_steps: -1
+  val_check_interval: 10
+  save_interval: 10
+
+  seq_length: 16384          # 12.5-turn episodes with ~2.7K peak context + headroom
+  enable_dynamic_batch_size: False
+  max_tokens_per_mbs: 11008
+  resume_dir: null
+
+
+algorithm:
+  # group_size samples of the SAME (activity, instance) — this is where GRPO's
+  # advantage variance comes from, and it is bounded by how many env-server
+  # replicas that activity has. Match --replicas in the launcher.
+  group_size: 4
+  n_minibatches: 2
+  training_batch_size_per_gpu: 1
+  rollout_batch_size_per_gpu: null
+
+  logprob_forward_micro_batch_size: 8
+  val_rollout_batch_size_per_gpu: 1
+
+  # Tool responses are spliced into the context between turns, which re-tokenizes
+  # the prefix — rollout logprobs would not match the actor's view.
+  recompute_logprobs: True
+  shuffle_rollout: False
+
+  loss_type: actor
+  loss_agg_func: "token-mean"
+  kl_beta: 0.001
+  kl_penalty_type: low_var_kl
+  ratio_clip_eps: 0.2
+  entropy_bonus: 0.0
+  calculate_entropy: False
+  clip_ratio_c: null
+  clip_ratio_low: null
+  clip_ratio_high: null
+
+  adv_type: grpo
+  normalize_advantages: False
+  early_stop_imp_ratio: 5.0
+  use_valid_token_scale: False
+
+  sampling_params:
+    do_sample: True
+    # The SFT policy reproduces the expert near-deterministically; without real
+    # temperature every sample in a group succeeds or fails together and the
+    # advantage is identically zero (0717 §5). This is the main variance knob.
+    temperature: 1.0
+    top_k: 1000000
+    top_p: 1.0
+    repetition_penalty: 1.0
+    max_new_tokens: 512
+    min_new_tokens: 1
+    stop: ["</tool_call>", "<|im_end|>"]
+
+
+data:
+  type: math                 # generic JSONL prompt/answer loader
+  max_prompt_length: 4096    # system + 17 tool schemas + goal ≈ 1.8K, grows per turn
+  filter_prompt_by_length: True
+  rollout_batch_size: 8
+  val_rollout_batch_size: null
+  num_workers: 2
+  prompt_key: prompt
+  answer_key: solutions      # carries the episode spec, not an answer
+  apply_chat_template: False
+  shuffle: True
+  validation_shuffle: False
+  seed: 1234
+  train_data_paths: ["/data/behavior-data/rl/train.jsonl"]
+  val_data_paths: ["/data/behavior-data/rl/val_s2.jsonl"]   # S2 = unseen activities
+
+
+agentloop:
+  group_name: "AgentLoopGroup"
+  # Format-level Qwen <tool_call> parser; not EQA-specific despite the name.
+  toolcall_parser: "eqa-qwen"
+  # Expert episodes are 12.5 turns on average, max 66. 30 bounds a wandering
+  # policy at ~2.4x the expert while still admitting the long tail of real plans.
+  max_turns: 30
+  max_tool_response_length: 3000     # observe() returns up to ~2.5K chars
+  tool_response_truncate_side: "right"
+  print_outputs: False
+  is_dynamic_rollout_batch: True
+  obs_mode: full
+  # nl    -> the goal arrives as an English sentence rendered from the unground
+  #          BDDL (rlinf/envs/behavior/nl_goal.py). This is the primary condition:
+  #          with ground atoms the policy can transliterate `inside(a, b)` into
+  #          `place_inside(a, b)` and never plan.
+  # atoms -> ground BDDL atoms; the ablation, and what SFT step 120 was trained on.
+  # Switching this to `nl` requires an NL-prompt cold-start -- re-render the SFT
+  # rows with `relabel_sft_nl.py` (sim-free) and re-run SFT, or the first RL step
+  # spends its budget on a prompt distribution the policy has never seen.
+  goal_format: nl
+  trace_dump_dir: ${runner.output_dir}/${runner.experiment_name}/traces
+
+
+reward:
+  # No reward *worker* is launched (AgentRunner gets reward=None) — the agent loop
+  # scores each trajectory itself from the BDDL goal status the tool responses
+  # carry, so `use_reward_model` stays off and there is no rule-based class to name.
+  group_name: "RewardGroup"
+  use_reward_model: False
+  reward_scale: 1.0
+
+  # `staged` = dominant terminal BDDL success + a small credit for the fraction of
+  # goal atoms satisfied. The coverage term exists to restore within-group
+  # variance when success is sparse, NOT to make the task easier.
+  #
+  # Deliberately absent: a precondition-violation penalty. The violation rate is
+  # the measurement (RQ3) — shaping it away by fiat destroys the phenomenon we
+  # want to observe RL reducing for task reasons. Run that only as an ablation.
+  type: staged
+  shaping:
+    success_reward: 1.0
+    no_end_penalty: -0.5
+    coverage_weight: 0.3
+
+
+tools:
+  behavior:
+    # Filled in by scripts/launch_behavior_env_servers.sh (servers.yaml).
+    # {activity: [url, ...]} — replicas per activity bound rollout parallelism.
+    servers: {}
+    request_timeout_s: 300
+    lease_timeout_s: 900
+
+
+rollout:
+  group_name: "RolloutGroup"
+  gpu_memory_utilization: 0.8
+  model:
+    # The SFT cold-start export, NOT the base model. See 0717.
+    model_path: /data2/joycexu/behavior-data/sft/hf_step120
+    model_type: qwen2.5
+    precision: ${actor.model.precision}
+  enforce_eager: False
+  distributed_executor_backend: mp
+  disable_log_stats: False
+  detokenize: True
+  padding: null
+  eos: null
+  return_logprobs: ${not:${algorithm.recompute_logprobs}}
+
+  rollout_backend: sglang
+  sglang:
+    attention_backend: triton
+    decode_log_interval: 500000
+    use_torch_compile: False
+    torch_compile_max_bs: 128
+  vllm:
+    attention_backend: FLASH_ATTN
+    enable_chunked_prefill: True
+    enable_prefix_caching: True
+    enable_flash_infer_sampler: True
+    max_num_batched_tokens: null
+    torch_profiler_dir: null
+
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_running_requests: 64
+  cuda_graph_max_bs: 64
+
+  validate_weight_first_sync: True
+  validate_weight: False
+  validate_save_dir: null
+  print_outputs: False
+
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: fsdp
+  enable_dp_load_balance: True
+  calculate_flops: False
+  seed: 1234
+
+  enable_offload: False
+
+  global_batch_size: 16
+  micro_batch_size: 1
+
+  model:
+    model_type: ${rollout.model.model_type}
+    model_path: ${rollout.model.model_path}
+    precision: bf16
+    sharding_strategy: full_shard
+    is_lora: False
+
+    seq_length: ${runner.seq_length}
+    encoder_seq_length: ${runner.seq_length}
+
+  optim:
+    optimizer: adam
+    bf16: True
+    fp16: False
+    lr: 1.0e-06
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-05
+    min_lr: 0.0
+    weight_decay: 0.01
+    use_distributed_optimizer: True
+    overlap_grad_reduce: False
+    overlap_param_gather: False
+    optimizer_enable_pin: False
+    overlap_param_gather_with_optimizer_step: False
+    clip_grad: 0.8
+    loss_scale: 65536
+
+  lr_sched:
+    lr_warmup_fraction: 0.05
+    lr_warmup_init: 0.0
+    lr_warmup_iters: 0
+    max_lr: 1.0e-06
+    min_lr: 0.0
+    lr_decay_style: constant
+    lr_decay_iters: 1000
+
+  tokenizer:
+    tokenizer_model: ${rollout.model.model_path}
+    use_fast: False
+    trust_remote_code: True
+    padding_side: 'right'
+
+
+inference:
+  model_type: ${rollout.model.model_type}
+  group_name: "InferenceGroup"
+  load_from_actor: True
+  model:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    sequence_parallel: False
+
+
+critic:
+  use_critic_model: False

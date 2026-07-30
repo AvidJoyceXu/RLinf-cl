@@ -1,0 +1,44 @@
+# BEHAVIOR iterative-RFT Phase-B config (RAFT / ReST^EM iteration 1).
+#
+# Reuses the PROVEN SFT trainer unchanged (FSDP + bf16, 2-GPU placement 4-5) to
+# fine-tune on the policy's OWN BDDL-successful rollouts sampled by
+# rlinf/envs/behavior/rft_sample.py + filtered by rft_filter.py (mode=raft).
+# This is Phase B of the iterative RFT loop chosen over online GRPO because the
+# env (OmniGibson) and the trainer (this FSDP stack) live in different venvs —
+# see memory behavior-grpo-venv-split. The env-in-loop work happens entirely in
+# Phase A (behavior-smoke); this phase is sim-free.
+#
+# Data staged into the repo data/ tree (visible to rlinf-eqa at /data/behavior):
+#   /data/behavior/rft/iter1_train.jsonl         (filtered successes)
+#   /data/behavior/rft/iter1_train.jsonl.tools.json  (same 17-tool sidecar as SFT)
+#   /data/behavior/rft/init_policy/              (HF export of the SFT cold-start)
+#
+# Init from the SFT cold-start (continue), NOT base: RFT iteration 1 refines the
+# cold-start on its successful rollouts. (ReST^EM-from-base is the alternative if
+# drift/over-fit shows; flip model_path to the base snapshot + raise max_steps.)
+#
+# Run (in rlinf-eqa):
+#   bash examples/sft/run_vlm_sft.sh behavior_rft_iter1_qwen25_7b
+defaults:
+  - behavior_sft_qwen25_7b
+
+runner:
+  experiment_name: behavior_rft_iter1
+  # Smaller horizon than the cold-start: the policy already knows the ACI; RFT
+  # nudges it toward its successful trajectories. Tune once the loss curve + the
+  # next sampling round's success-rate delta are in.
+  max_steps: 60
+  save_interval: 30
+
+data:
+  train_data_paths: "/data/behavior/rft/iter1_train.jsonl"
+  val_data_paths: "/data/behavior/rft/iter1_train.jsonl"
+  tool_schemas_path: "/data/behavior/rft/iter1_train.jsonl.tools.json"
+
+actor:
+  model:
+    # Continue from the SFT cold-start export (staged into the repo data tree).
+    model_path: "/data/behavior/rft/init_policy"
+  optim:
+    # Gentler than the cold-start (1e-5): refine, don't overwrite.
+    lr: 5e-6

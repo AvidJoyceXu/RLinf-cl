@@ -16,6 +16,14 @@ else
     CONFIG_NAME=$1
 fi
 
+# behavior_sft_qwen25_7b logs to tensorboard AND wandb. Without a key, `wandb.init`
+# would abort the run over a *logging* credential; offline mode records everything
+# locally and `wandb sync <dir>` uploads it later.
+if [ -z "$WANDB_API_KEY" ] && [ ! -f "$HOME/.netrc" ]; then
+    export WANDB_MODE=${WANDB_MODE:-offline}
+    echo "NOTE: no WANDB_API_KEY / ~/.netrc -> WANDB_MODE=$WANDB_MODE" >&2
+fi
+
 echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')" #/$(date +'%Y%m%d-%H:%M:%S')" d
 MEGA_LOG_FILE="${LOG_DIR}/run_vlm_sft.log"

@@ -1,0 +1,52 @@
+# Single-card smoke for the integrated online-GRPO loop.
+#
+# Purpose is to prove the loop closes end-to-end — prompt -> SGLang turn -> HTTP
+# tool call -> OmniGibson -> BDDL reward -> FSDP update — not to learn anything.
+# Point it at ONE activity with `--replicas 2` and read three numbers from the
+# first step: rollout/end_task_rate (does it terminate at all), rollout/goal_coverage
+# (does it make partial progress), rollout/success_rate.
+defaults:
+  - behavior_grpo_qwen25_7b
+
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout: 0
+
+
+runner:
+  experiment_name: behavior-grpo-1gpu-smoke
+  max_steps: 2
+  val_check_interval: 100        # skip validation during the smoke
+  save_interval: 100
+  # Dynamic batch packing assumes the left-padded RolloutResult layout while the
+  # agent loop produces right-padded DynamicRolloutResult, so pack indices land in
+  # pad regions and the actor's backward trips an illegal memory access. Same
+  # constraint as the EQA 1-GPU config.
+  enable_dynamic_batch_size: False
+
+
+algorithm:
+  # group_size must be <= the number of env-server replicas for the activity,
+  # otherwise the group's samples serialize behind one simulator.
+  group_size: 2
+
+
+data:
+  rollout_batch_size: 2
+
+
+actor:
+  # global_batch_size = rollout_batch_size * group_size / n_minibatches = 2*2/2 = 2
+  global_batch_size: 2
+  enable_offload: True           # swap the optimizer out while SGLang holds the GPU
+
+
+rollout:
+  gpu_memory_utilization: 0.5    # leave room for FSDP weights+grads+optimizer
+
+
+agentloop:
+  max_turns: 20
+  print_outputs: True
