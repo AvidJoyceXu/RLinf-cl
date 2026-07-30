@@ -241,16 +241,53 @@ class BehaviorToolWorker(ToolWorker):
             self._session_lock.release()
 
     def _boot(self, activity: str):
-        """Blocking: boots Kit and loads the scene. Minutes, not seconds."""
+        """Blocking: boots Kit and loads the scene. Minutes, not seconds.
+
+        Runs on a worker thread (see the module docstring on `asyncio.to_thread`),
+        and OmniGibson/Kit installs a SIGINT handler during boot. CPython allows
+        `signal.signal` ONLY from the main thread of the main interpreter, so the
+        boot died with:
+
+            ValueError: signal only works in main thread of the main interpreter
+
+        Neutralise `signal.signal` for the duration of the boot rather than moving
+        the boot back onto the event loop. Two reasons this is the right trade:
+        the offload exists because a multi-minute blocking call would otherwise
+        stall the request channel and make a slow boot look like a hung worker; and
+        the handler being installed is Kit's Ctrl-C convenience, which is meaningless
+        inside a Ray actor that is terminated by `ray.kill`, never by SIGINT.
+
+        Scoped tightly -- restored in `finally`, and only around the boot -- so no
+        other component silently loses its handlers.
+        """
+        import signal as _signal
+
         from rlinf.envs.behavior.env_server import BehaviorEnv
 
-        return BehaviorEnv(
-            activity,
-            obs_mode=self.obs_mode,
-            instances_per_activity=self.instances_per_activity,
-            rgb=self.rgb,
-            partial_scene=self.partial_scene,
-        )
+        real_signal = _signal.signal
+        suppressed: list[int] = []
+
+        def _signal_noop(signum, handler):
+            suppressed.append(signum)
+            return None
+
+        _signal.signal = _signal_noop
+        try:
+            env = BehaviorEnv(
+                activity,
+                obs_mode=self.obs_mode,
+                instances_per_activity=self.instances_per_activity,
+                rgb=self.rgb,
+                partial_scene=self.partial_scene,
+            )
+        finally:
+            _signal.signal = real_signal
+        if suppressed:
+            self.log_info(
+                f"BehaviorToolWorker: suppressed {len(suppressed)} signal handler(s) "
+                f"{sorted(set(suppressed))} during OmniGibson boot (worker thread)"
+            )
+        return env
 
 
 def tool_names() -> list[str]:
