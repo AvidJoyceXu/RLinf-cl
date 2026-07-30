@@ -160,7 +160,8 @@ def prep_plan(task, activity, inst_dir):
     return plan, files
 
 
-def reset_to_instance(aci, e0, inst, reset_scene: bool = True):
+def reset_to_instance(aci, e0, inst, reset_scene: bool = True,
+                      hard_reset: bool = False):
     """Load an instance's task-relevant object state and clear held-object bookkeeping.
 
     ``reset_scene=False`` skips the trailing ``env.scene.reset()``. That call is the

@@ -41,10 +41,17 @@ sensitive to wrong poses (a wrong pose leaves Inside=False and the object held).
 Declaring the cache clean is an existing OmniGibson idiom, not one invented here —
 `Simulator.render()` ends with `PoseAPI.mark_valid()` for the same reason.
 
-DO NOT wrap a physics loop in this. While physics steps, objects genuinely move, so
-suppressing invalidation would hand stale poses to anything that reads back — e.g. the
-`keep_still()` calls in `load_activity_instance_tro_state`, which would then fail to
-zero the right velocities. This is only for pose *writes*.
+PHYSICS STEPS STILL INVALIDATE. `scene.reset()` takes a physics step internally —
+`Simulator.removing_objects` moves each doomed object to a graveyard, steps physics, then
+restores the dumped state — so blanket suppression would let a post-step read see stale
+poses. The context manager therefore wraps `og.sim.step_physics` to invalidate for real,
+and suppresses only the pose-write churn that is actually quadratic. A restore takes a
+handful of steps, so this costs a handful of syncs rather than N.
+
+Even so, do not wrap a *caller's* physics loop in this: it would work, but batching buys
+nothing there (the steps dominate) while widening the window in which a subtle staleness
+bug could hide. The 25-step `keep_still()` loop in `load_activity_instance_tro_state` is
+left unbatched for that reason.
 """
 
 from __future__ import annotations
@@ -78,6 +85,7 @@ def batched_pose_writes(label: str = "restore"):
         with batched_pose_writes("scene.reset"):
             env.scene.reset()
     """
+    import omnigibson as og
     from omnigibson.utils.usd_utils import PoseAPI
 
     # One sync up front: after this, every parent world pose is valid, and parents do
@@ -95,10 +103,28 @@ def batched_pose_writes(label: str = "restore"):
     original = PoseAPI.__dict__["invalidate"]
     PoseAPI.invalidate = staticmethod(_suppressed_invalidate)
 
+    # A physics step DOES legitimately invalidate the cache, and `scene.reset()` takes
+    # one internally: `Simulator.removing_objects` moves each doomed object to the
+    # graveyard and then calls `step_physics()` before restoring the dumped state. So
+    # suppressing invalidation blindly across the whole block would let a post-step
+    # read see stale poses. Keep the real invalidation for physics motion and suppress
+    # only the pose-write churn, which is what is actually quadratic. There are a
+    # handful of steps per restore, so this costs a handful of syncs, not N.
+    sim = og.sim
+    orig_step_physics = sim.step_physics
+
+    def _step_physics_then_invalidate(*a, **k):
+        result = orig_step_physics(*a, **k)
+        PoseAPI.VALID = False          # what the real invalidate() does
+        return result
+
+    sim.step_physics = _step_physics_then_invalidate
+
     t0 = time.time()
     try:
         yield
     finally:
+        sim.step_physics = orig_step_physics
         PoseAPI.invalidate = original
         # The batch really did dirty the cache — mark it so, once.
         PoseAPI.invalidate()

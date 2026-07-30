@@ -158,6 +158,7 @@ def load_activity_instance_tro_state(
     instance_id: int,
     tro_file_path: str,
     reset_scene: bool = False,
+    hard_reset: bool = False,
 ) -> None:
     """Apply a cached tro_state file to an existing OmniGibson env.
 
@@ -167,6 +168,14 @@ def load_activity_instance_tro_state(
         tro_file_path: Path to a ``*_template-tro_state.json`` file.
         reset_scene: Whether to call ``env.scene.reset()`` after applying the
             cached state.
+        hard_reset: Passed to ``scene.reset(hard=...)``. OmniGibson defaults to
+            ``hard=True``, which routes through ``restore()`` -> ``batch_remove_objects``
+            -> ``removing_objects``, and that context manager dumps AND reloads the
+            whole scene state even when the remove list is empty -- so the state gets
+            written twice and one of them is pure waste. ``hard=False`` does a single
+            ``load_state`` of the initial file. It only differs when the object SET
+            changed (slice/dice/fill/spray), which is what ``aci.object_set_dirty``
+            tracks; a fresh instance load never has, hence the default.
     """
     import omnigibson as og
     from omnigibson.utils.python_utils import recursively_convert_to_torch
@@ -241,11 +250,10 @@ def load_activity_instance_tro_state(
 
     env.scene.update_initial_file()
     if reset_scene:
-        # This is the expensive one: reset() -> restore() walks EVERY object in the
-        # scene, thousands of prims on house_double_floor_lower. Unbatched it ran
-        # past 90 minutes.
-        with batched_pose_writes("scene.reset"):
-            env.scene.reset()
+        # The expensive one. Even with hard=False this writes every object's pose, so
+        # keep the pose batching; hard=False is what removes the DOUBLED write.
+        with batched_pose_writes(f"scene.reset(hard={hard_reset})"):
+            env.scene.reset(hard=hard_reset)
 
 
 class ActivityInstanceLoader:

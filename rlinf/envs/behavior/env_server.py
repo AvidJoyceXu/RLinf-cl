@@ -77,15 +77,27 @@ class BehaviorEnv:
         OmegaConf.update(cfg, "omni_config.task.activity_name", activity, force_add=True)
         OmegaConf.update(cfg, "omni_config.scene.scene_model", self.scene, force_add=True)
         if partial_scene:
-            # Load only the rooms the activity's BDDL mentions. Without this the
-            # whole house is instantiated, and every per-episode `scene.reset()`
-            # then walks *all* of it: the restore path calls
-            # `set_position_orientation` -> `set_attribute` per prim, and on
-            # house_double_floor_lower that turned one reset into >1 h of
-            # single-process CPU (measured 2026-07-30, picking_up_trash). Room
-            # filtering is upstream's own recommendation for startup cost; it also
-            # bounds reset, which is what a rollout pays every episode.
-            OmegaConf.update(cfg, "omni_config.scene.partial_scene_load", True,
+            # `load_task_relevant_only` loads the task-relevant objects plus the
+            # building structure and skips every other object in the house. This is
+            # the ONLY lever that reduces N, and N is what makes reset expensive:
+            # `scene.reset()` -> `load_state` writes every object's pose through USD
+            # (`set_attribute`), so cost is linear in scene population and is paid
+            # EVERY episode, unlike boot.
+            #
+            # NOTE (2026-07-30): this replaces `scene.partial_scene_load`, which does
+            # not exist in OmniGibson 3.7.1 -- grep finds zero readers. It was added
+            # with `force_add=True`, so it silently created a key nothing consumed and
+            # the whole house loaded anyway. Earlier claims in INSTALL.md/DEBUG-LOG
+            # that it "bounds N" were wrong. If a key here ever looks load-bearing,
+            # grep OmniGibson for a reader before believing it.
+            #
+            # TRADEOFF, and it is not purely a speedup: with non-task objects absent,
+            # `observe()` returns fewer candidate objects, which makes the partial-
+            # observability condition EASIER than a fully furnished house. The BDDL
+            # goal only references task-relevant objects, so scoring is unaffected --
+            # but solvability is. Keep this OFF for headline S2 numbers; it is for
+            # pipeline work and for ablations where the cost is prohibitive.
+            OmegaConf.update(cfg, "omni_config.scene.load_task_relevant_only", True,
                              force_add=True)
         if not rgb:
             # The semantic ACI never reads pixels, and loading the R1's head+wrist
@@ -153,7 +165,17 @@ class BehaviorEnv:
         # `contaminated` field below is the guard: if skipping it left stale state
         # that already satisfies the goal, the episode is flagged and scored zero
         # rather than silently handing the policy a free success.
-        reset_to_instance(self.aci, self.env, inst, reset_scene=not self.fast_reset)
+        # hard=True is OmniGibson's default and costs a doubled full-scene state
+        # write (restore -> batch_remove_objects -> removing_objects dumps AND
+        # reloads everything even when the remove list is empty). It is only NEEDED
+        # when the previous episode changed the object SET -- slice/dice add
+        # half-objects, fill/spray instantiate particle systems -- because
+        # hard=False ignores objects missing from the initial file. Ask the ACI
+        # instead of always paying for it.
+        hard = bool(getattr(self.aci, "object_set_dirty", False))
+        reset_to_instance(self.aci, self.env, inst,
+                          reset_scene=not self.fast_reset, hard_reset=hard)
+        self.aci.object_set_dirty = False
         if self.cached_instance != inst.instance_id:
             build_cache_on_instance(self.aci, self.env, self.plan, inst)
             self.cached_instance = inst.instance_id

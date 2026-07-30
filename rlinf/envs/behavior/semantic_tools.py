@@ -86,6 +86,11 @@ class SemanticACI:
         self.obs_mode = obs_mode
         self._pred = self.task._termination_conditions["predicate"]
         self._held = None          # name of the object currently grasped, or None
+        # slice/dice create half-objects and fill/spray instantiate particle systems,
+        # all of which change the scene's OBJECT SET. scene.reset(hard=False) ignores
+        # objects absent from the initial file, so it is only sound while this is
+        # False; env_server reads and clears it to pick the reset mode.
+        self.object_set_dirty = False
         # (movable_name, target_name, predicate) -> (pos, orn) valid placement,
         # built OFFLINE via build_pose_cache(); rollout place tools only read it.
         self._pose_cache = {}
@@ -431,6 +436,7 @@ class SemanticACI:
             return self._result(False, tool, {"name": name, "system": system_name},
                                 f"no such system {system_name} ({type(ex).__name__})")
         obj.states[Covered].set_value(system, value)
+        self.object_set_dirty = True      # particle system instantiated
         og.sim.step_physics()
         got = bool(obj.states[Covered].get_value(system))
         return self._result(got == value, tool, {"name": name, "system": system_name},
@@ -483,6 +489,7 @@ class SemanticACI:
         results = rule.transition({filter_key: [obj]})
         api = self.scene.transition_rule_api
         api.execute_transition(added_obj_attrs=results.add, removed_objs=results.remove)
+        self.object_set_dirty = True      # slice/dice add half-objects, remove whole
         # One full sim step applies the added-object init callbacks (which propagate
         # cooked/saturated onto the parts) and lets scope rebind / systems init.
         og.sim.step()
