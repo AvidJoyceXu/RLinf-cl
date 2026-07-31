@@ -141,6 +141,21 @@ class BehaviorToolWorker(ToolWorker):
             def _boot_thread():
                 loop = asyncio.SelectorEventLoop()   # NOT new_event_loop(): see (b)
                 asyncio.set_event_loop(loop)
+                # BLOCK the job-control signals. Kit touches terminal state during
+                # startup; with SIGTTOU/SIGTTIN neither ignored nor handled, the
+                # kernel's default action is to STOP the process -- which is exactly
+                # what happened: State: T (stopped), wchan: do_signal_stop, frozen in
+                # __init__ for an hour after "[69.560s] app ready", looking identical
+                # to a hang. SIGCONT resumed it, which is what proved the diagnosis.
+                #
+                # Kit would normally protect itself by installing handlers, but
+                # `signal.signal` raises off the main thread and this code suppresses
+                # it (see _boot) -- so we owe Kit the protection it could not install.
+                # `pthread_sigmask` works from ANY thread, and POSIX says a blocked
+                # SIGTTOU lets the terminal operation proceed instead of stopping.
+                import signal as _sig
+                _sig.pthread_sigmask(
+                    _sig.SIG_BLOCK, {_sig.SIGTTOU, _sig.SIGTTIN, _sig.SIGTSTP})
                 try:
                     box["env"] = self._boot(self.activity_cfg)
                 except BaseException as e:           # noqa: BLE001
