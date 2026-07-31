@@ -205,8 +205,15 @@ reward:
 
 rollout:
   group_name: "RolloutGroup"
-  # Headroom for Megatron weights+grads+optimizer when offload swaps back in.
-  gpu_memory_utilization: 0.5
+  # 0.35, not 0.5. This is a fraction of TOTAL GPU memory, not free memory, so 0.5
+  # reserves ~72 GB of the H20's 143 GB and leaves ~42 GB -- against a Megatron actor
+  # that needs ~43 GB (28.37 GB DDP grad buffer for 7.6B params + ~15 GB bf16
+  # weights). That is under water before any co-tenant appears, and this host is
+  # shared: a neighbour's job briefly took 67 GB and produced
+  #     torch.OutOfMemoryError: Tried to allocate 28.37 GiB ... 10.21 GiB is free
+  # 0.35 -> ~50 GB for SGLang, ~64 GB for the actor. Raise it once the loop is proven
+  # and the machine is quiet; drop seq_length before raising this if it OOMs again.
+  gpu_memory_utilization: 0.35
   model:
     # BASE instruct weights (see header). Container path; the host HF cache is
     # mounted at /data/hf_home. Converted to Megatron on the fly by ckpt_convertor.
