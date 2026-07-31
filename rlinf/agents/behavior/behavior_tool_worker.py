@@ -114,6 +114,28 @@ class BehaviorToolWorker(ToolWorker):
             #
             # Blocking until the boot finishes is deliberate: no request can arrive
             # before start_server, and a half-booted env is worse than a slow one.
+            # Setting a loop on the BOOT THREAD is not enough, and the first attempt
+            # proved it: 3.9 MILLION `'Loop' object has no attribute '_ready'`. Kit
+            # spawns its own threads and calls asyncio.get_event_loop() there, which
+            # goes through the GLOBAL POLICY -- and inside a Ray actor that policy is
+            # uvloop's (Ray installs it; sglang alone does not -- verified). So every
+            # Kit thread got a uvloop Loop no matter what this thread held.
+            #
+            # Switch the process policy to CPython's and LEAVE IT. Ray's own loop was
+            # created under the old policy and keeps running untouched -- a policy
+            # governs loops created AFTER it -- so this only affects loops made from
+            # here on, which in this process means Kit's. uvloop is a throughput
+            # optimisation for Ray, not a requirement, and this worker's job is to host
+            # a simulator that cannot tolerate it.
+            if not isinstance(asyncio.get_event_loop_policy(),
+                              asyncio.DefaultEventLoopPolicy):
+                self.log_info(
+                    "BehaviorToolWorker: switching asyncio policy "
+                    f"{type(asyncio.get_event_loop_policy()).__module__} -> asyncio "
+                    "(Kit reaches into CPython loop internals uvloop does not have)"
+                )
+                asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
             box: dict[str, Any] = {}
 
             def _boot_thread():
