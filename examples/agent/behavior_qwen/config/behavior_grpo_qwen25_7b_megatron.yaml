@@ -70,7 +70,12 @@ runner:
   # + collocated SGLang on one card is exactly the combination that OOMed during the
   # EQA bring-up. Raise this first once the loop is proven, and drop it first if it
   # OOMs.
-  seq_length: 8192
+  # 6144, dropped from 8192 after a second OOM. The config note's own advice is to
+  # drop seq_length before raising gpu_memory_utilization, and activation memory
+  # scales with it. max_prompt_length stays 4096 (system + 17 tool schemas + NL goal
+  # is ~1.8K and grows per turn), leaving 2048 for generation -- ample at 512
+  # max_new_tokens per turn.
+  seq_length: 6144
 
   # The Megatron MA path handles ragged batches via get_batch_pad + pack_traj_batch
   # and does NOT use the FSDP dynamic-pack path. Leave the global flag off;
@@ -213,7 +218,7 @@ rollout:
   #     torch.OutOfMemoryError: Tried to allocate 28.37 GiB ... 10.21 GiB is free
   # 0.35 -> ~50 GB for SGLang, ~64 GB for the actor. Raise it once the loop is proven
   # and the machine is quiet; drop seq_length before raising this if it OOMs again.
-  gpu_memory_utilization: 0.35
+  gpu_memory_utilization: 0.22
   model:
     # BASE instruct weights (see header). Container path; the host HF cache is
     # mounted at /data/hf_home. Converted to Megatron on the fly by ckpt_convertor.
