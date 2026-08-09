@@ -107,7 +107,7 @@ env:
   # n_chunk_steps = max_steps_per_rollout_epoch / num_action_chunks
   # max_steps_per_rollout_epoch (10) must be divisible by num_action_chunks (5)
   train:
-    specific_reset_id: 0
+    specific_reset_id: 1
     max_trials_per_task: 1
     total_num_envs: 32
     auto_reset: True
@@ -120,7 +120,7 @@ env:
     reset_gripper_open: False
 
   eval:
-    specific_reset_id: 0
+    specific_reset_id: 1
     max_trials_per_task: 1
     total_num_envs: 32
     auto_reset: True
