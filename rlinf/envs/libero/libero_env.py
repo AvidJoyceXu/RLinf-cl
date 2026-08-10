@@ -61,6 +61,21 @@ class LiberoEnv(gym.Env):
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
 
+        # "privileged": residual obs is proprio + object-to-eef relative poses.
+        # "rgb": residual obs is frozen-ViT features of the third-person camera
+        # plus proprio, both stacked over `num_stack_frames` consecutive steps.
+        # The privileged object relations are not emitted at all in "rgb" mode.
+        self.obs_mode = cfg.get("obs_mode", "privileged")
+        if self.obs_mode not in ("privileged", "rgb"):
+            raise ValueError(f"Invalid env obs_mode: {self.obs_mode}")
+        self.num_stack_frames = cfg.get("num_stack_frames", 2)
+        # Frame at the previous agent-visible step, and at the current one.
+        # `_cur_frame` is refreshed by every `_wrap_obs` call; `_prev_frame` is
+        # advanced explicitly in `step` so that the double `_wrap_obs` of the
+        # auto-reset path cannot collapse the stack onto a single frame.
+        self._prev_frame = None
+        self._cur_frame = None
+
         self._generator = np.random.default_rng(seed=self.seed)
         self._generator_ordered = np.random.default_rng(seed=0)
         self.start_idx = 0
@@ -419,7 +434,35 @@ class LiberoEnv(gym.Env):
             "object_to_robot_relations": object_to_robot_relations,
         }
 
-    def _wrap_obs(self, obs_list):
+    def _advance_frame_stack(self, main_images, proprio_states, reset_env_idx=None):
+        """Update the frame-stack buffers and return the previous frame.
+
+        ``_prev_frame`` holds the observation of the previous agent-visible
+        step. On a reset the previous frame is undefined, so it is filled with
+        the current one, which makes the stacked observation start from a
+        duplicated frame instead of leaking across the episode boundary.
+        """
+        # Clone into the buffer: the tensors handed out in `obs` must stay
+        # immutable, since a later reset writes into the buffered frame.
+        cur_frame = {
+            "main_images": main_images.clone(),
+            "proprio": proprio_states.clone(),
+        }
+
+        if self._prev_frame is None:
+            prev_frame = {k: v.clone() for k, v in cur_frame.items()}
+        else:
+            prev_frame = self._prev_frame
+            if reset_env_idx is not None and len(reset_env_idx) > 0:
+                idx = torch.as_tensor(np.asarray(reset_env_idx), dtype=torch.long)
+                for key, value in cur_frame.items():
+                    prev_frame[key][idx] = value[idx]
+
+        self._prev_frame = prev_frame
+        self._cur_frame = cur_frame
+        return prev_frame
+
+    def _wrap_obs(self, obs_list, reset_env_idx=None):
         images_and_states_list = []
         rl_obs_list = []
 
@@ -442,7 +485,6 @@ class LiberoEnv(gym.Env):
         )
 
         robot_proprio_states = to_tensor(np.stack([r["robot_proprio_state"] for r in rl_obs_list])) # [num_envs, robot_proprio_state_dim]
-        object_to_robot_relations = to_tensor(np.stack([r["object_to_robot_relations"] for r in rl_obs_list]))
 
         states = images_and_states["state"]
 
@@ -452,8 +494,23 @@ class LiberoEnv(gym.Env):
             "states": states,
             "task_descriptions": self.task_descriptions,
             "robot_proprio_state": robot_proprio_states,
-            "object_to_robot_relations": object_to_robot_relations,
         }
+
+        if self.obs_mode == "privileged":
+            obs["object_to_robot_relations"] = to_tensor(
+                np.stack([r["object_to_robot_relations"] for r in rl_obs_list])
+            )
+        else:
+            # RGB mode: no privileged object state is emitted at all. The
+            # visual half of the observation is produced downstream by the
+            # frozen encoder, which needs both stacked frames.
+            prev_frame = self._advance_frame_stack(
+                full_image_tensor, robot_proprio_states, reset_env_idx=reset_env_idx
+            )
+            obs["prev_main_images"] = prev_frame["main_images"]
+            obs["rl_proprio_stacked"] = torch.cat(
+                [prev_frame["proprio"], robot_proprio_states], dim=-1
+            )
         return obs
 
     def _reconfigure(self, reset_state_ids, env_idx):
@@ -505,7 +562,7 @@ class LiberoEnv(gym.Env):
         for i, idx in enumerate(env_idx):
             self.current_raw_obs[idx] = raw_obs[i]
 
-        obs = self._wrap_obs(self.current_raw_obs)
+        obs = self._wrap_obs(self.current_raw_obs, reset_env_idx=env_idx)
         self._reset_metrics(env_idx)
         infos = {}
         return obs, infos
@@ -517,6 +574,9 @@ class LiberoEnv(gym.Env):
 
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
+        # `_cur_frame` still describes step t-1 here, so promoting it makes the
+        # stack advance by exactly one agent-visible step.
+        self._prev_frame = self._cur_frame
         self.current_raw_obs = raw_obs
         infos = list_of_dict_to_dict_of_list(info_lists)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps

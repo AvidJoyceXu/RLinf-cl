@@ -1215,16 +1215,27 @@ class EnvOutput:
         )
         robot_proprio_state = obs["robot_proprio_state"] if "robot_proprio_state" in obs else None
         object_to_robot_relations = obs["object_to_robot_relations"] if "object_to_robot_relations" in obs else None
+        # RGB observation mode: the env stacks proprio over consecutive frames
+        # and ships the previous camera frame; the frozen visual encoder in the
+        # rollout worker prepends the visual half of `rl_flatten_obs`.
+        rl_proprio_stacked = obs["rl_proprio_stacked"] if "rl_proprio_stacked" in obs else None
+        prev_image_tensor = obs["prev_main_images"] if "prev_main_images" in obs else None
 
-        rl_flatten_obs = torch.cat([robot_proprio_state, object_to_robot_relations], dim=-1) if robot_proprio_state is not None and object_to_robot_relations is not None else None
+        if rl_proprio_stacked is not None:
+            rl_flatten_obs = rl_proprio_stacked
+        elif robot_proprio_state is not None and object_to_robot_relations is not None:
+            rl_flatten_obs = torch.cat([robot_proprio_state, object_to_robot_relations], dim=-1)
+        else:
+            rl_flatten_obs = None
 
         return {
             "main_images": image_tensor,  # [N_ENV, H, W, C]
+            "prev_main_images": prev_image_tensor,  # [N_ENV, H, W, C], RGB obs mode only
             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
-            "rl_flatten_obs": rl_flatten_obs,  # [N_ENV, N_ROBOT_PROP_STATE + N_OBJECT_TO_ROBOT_RELATIONS]
+            "rl_flatten_obs": rl_flatten_obs,  # privileged: proprio + object relations; rgb: stacked proprio (visual half added downstream)
         }
 
     def to_dict(self):

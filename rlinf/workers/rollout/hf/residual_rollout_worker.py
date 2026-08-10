@@ -55,6 +55,15 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             self.actor_input = cfg.get("network", {}).get("actor_input", "obs")
             self.critic_input = cfg.get("network", {}).get("critic_input", "res")
 
+            # RGB observation mode: a frozen ViT turns the stacked camera
+            # frames into the visual half of the residual observation. It lives
+            # on the rollout worker rather than inside the policy so that the
+            # actor worker neither instantiates nor shards it, and so that only
+            # encoded features enter the replay buffer.
+            self.visual_encoder_cfg = cfg.get("visual_encoder", {})
+            self.use_visual_encoder = self.visual_encoder_cfg.get("enabled", False)
+            self.visual_encoder = None
+
             # Base model will be loaded in init_worker
             self.base_model = None
             self.base_model_config = None
@@ -119,9 +128,55 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             )
             print(f"[ResidualRolloutWorker] Residual policy enabled with res_scale={self.res_scale}")
 
+            if self.use_visual_encoder:
+                from rlinf.models.embodiment.residual_policy.frozen_visual_encoder import (
+                    DEFAULT_VISUAL_ENCODER,
+                    FrozenVisualEncoder,
+                )
+
+                self.visual_encoder = FrozenVisualEncoder(
+                    model_path=self.visual_encoder_cfg.get(
+                        "model_path", DEFAULT_VISUAL_ENCODER
+                    ),
+                    image_size=self.visual_encoder_cfg.get("image_size", 224),
+                    pooling=self.visual_encoder_cfg.get("pooling", "cls"),
+                )
+                self.visual_encoder.eval().to(self.device)
+                print(
+                    f"[ResidualRolloutWorker] Frozen visual encoder "
+                    f"({self.visual_encoder.model_path}) enabled, "
+                    f"feature_dim={self.visual_encoder.feature_dim}"
+                )
+
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    def _encode_visual_obs(self, obs: dict[str, Any]) -> dict[str, Any]:
+        """Prepend frozen visual features to ``rl_flatten_obs`` in RGB obs mode.
+
+        The env ships the stacked proprioception in ``rl_flatten_obs`` together
+        with the previous camera frame; here the two frames are encoded and
+        concatenated in front of it, giving
+        ``[f(I_{t-1}), f(I_t), p_{t-1}, p_t]``. In privileged obs mode this is
+        a no-op.
+        """
+        if self.visual_encoder is None or obs is None:
+            return obs
+        if obs.get("prev_main_images") is None:
+            return obs
+
+        visual_features = self.visual_encoder.encode_frames(
+            obs["prev_main_images"], obs["main_images"]
+        )
+        proprio = obs["rl_flatten_obs"].to(
+            device=visual_features.device, dtype=visual_features.dtype
+        )
+        obs["rl_flatten_obs"] = torch.cat([visual_features, proprio], dim=-1)
+        # Consume the stacked frame so re-encoding the same dict is a no-op
+        # and the raw frame stops being carried around once encoded.
+        obs["prev_main_images"] = None
+        return obs
 
     def predict(self, env_obs, mode="train", global_step=None, raw_env_obs=None):
         """
@@ -304,7 +359,9 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             if hasattr(self.hf_model, "value_head") or hasattr(self.hf_model, "q_head"):
                 final_obs = env_output["final_obs"]
                 with torch.no_grad():
-                    final_extracted_obs = self.hf_model.preprocess_env_obs(final_obs)
+                    final_extracted_obs = self.hf_model.preprocess_env_obs(
+                        self._encode_visual_obs(final_obs)
+                    )
                     if hasattr(self.hf_model, "q_head"):
                         real_extracted_obs = init_real_obs(final_extracted_obs)
                     # For residual policy, predict() needs raw final_obs (with task_descriptions) for base model
@@ -381,7 +438,9 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                             env_output, last_forward_inputs[stage_id]
                         )
 
-                    residual_extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                    residual_extracted_obs = self.hf_model.preprocess_env_obs(
+                        self._encode_visual_obs(env_output["obs"])
+                    )
                     # Use residual_extracted_obs for get_dones_and_rewards (same as original codebase)
                     # This ensures compatibility with init_real_obs which expects residual policy format
                     dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
@@ -447,7 +506,9 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
                     env_output, last_forward_inputs[stage_id]
                 )
 
-                extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                extracted_obs = self.hf_model.preprocess_env_obs(
+                    self._encode_visual_obs(env_output["obs"])
+                )
                 dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                     env_output, extracted_obs
                 )
@@ -508,7 +569,9 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
             for _ in range(n_chunk_steps):
                 for _ in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
-                    extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
+                    extracted_obs = self.hf_model.preprocess_env_obs(
+                        self._encode_visual_obs(env_output["obs"])
+                    )
                     # For residual policy, predict() needs raw env_output["obs"] (with task_descriptions) for base model
                     if self.use_residual:
                         actions, _ = self.predict(
@@ -529,6 +592,8 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         self.hf_model = self.hf_model.to("cpu")
         if self.use_residual and self.base_model is not None:
             self.base_model = self.base_model.to("cpu")
+        if self.visual_encoder is not None:
+            self.visual_encoder = self.visual_encoder.to("cpu")
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -537,6 +602,8 @@ class ResidualRolloutWorker(MultiStepRolloutWorker):
         self.hf_model = self.hf_model.to(self.device)
         if self.use_residual and self.base_model is not None:
             self.base_model = self.base_model.to(self.device)
+        if self.visual_encoder is not None:
+            self.visual_encoder = self.visual_encoder.to(self.device)
 
     def set_global_step(self, global_step):
         """Set global step for progressive exploration."""

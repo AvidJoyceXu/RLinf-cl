@@ -78,14 +78,22 @@ class SimpleLiberoWrapper:
     """
     简化的LIBERO环境包装器，复用rlinf的观察提取逻辑
     确保接口与rlinf的LiberoEnv一致
+
+    obs_mode:
+      - "privileged": rl_flatten_obs = proprio + object_to_robot_relations
+      - "rgb":        rl_flatten_obs = [f(I_{t-1}), f(I_t), p_{t-1}, p_t]，
+                      与 LiberoEnv 的 RGB 模式一致。这里是单环境顺序 rollout，
+                      所以帧堆叠直接在 wrapper 内维护即可。
     """
-    def __init__(self, raw_env, task_description):
+    def __init__(self, raw_env, task_description, visual_encoder=None):
         self.raw_env = raw_env
         self.task_description = task_description
-        
+        self.visual_encoder = visual_encoder
+        self._prev_frame = None
+
         # 复用rlinf的观察提取方法
         from rlinf.envs.libero.utils import get_libero_image, get_libero_wrist_image, quat2axisangle
-        
+
         self.get_libero_image = get_libero_image
         self.get_libero_wrist_image = get_libero_wrist_image
         self.quat2axisangle = quat2axisangle
@@ -150,11 +158,29 @@ class SimpleLiberoWrapper:
         
         # 构建rl_flatten_obs (numpy array for consistency)
         # 使用copy()确保数组是连续的（避免负stride问题）
-        rl_flatten_obs = np.concatenate([
-            rl_obs["robot_proprio_state"],
-            rl_obs["object_to_robot_relations"]
-        ]).copy()  # [74]
-        
+        main_image = images_and_states["full_image"].copy()
+        proprio = rl_obs["robot_proprio_state"].copy()
+
+        if self.visual_encoder is None:
+            rl_flatten_obs = np.concatenate([
+                proprio,
+                rl_obs["object_to_robot_relations"]
+            ]).copy()  # [74]
+        else:
+            # 每个 episode 的第一帧没有前一帧，用当前帧复制填充，与 LiberoEnv 一致
+            if self._prev_frame is None:
+                self._prev_frame = {"main_image": main_image.copy(), "proprio": proprio.copy()}
+            visual_features = self.visual_encoder.encode_frames(
+                self._prev_frame["main_image"][None], main_image[None]
+            )  # [1, 2 * feature_dim]
+            rl_flatten_obs = np.concatenate([
+                visual_features[0].cpu().numpy(),
+                self._prev_frame["proprio"],
+                proprio,
+            ]).astype(np.float32)
+            self._prev_frame = {"main_image": main_image.copy(), "proprio": proprio.copy()}
+
+
         wrapped_obs = {
             "main_images": images_and_states["full_image"].copy(),  # [H, W, C] numpy (for base model) - copy()确保连续
             "wrist_images": images_and_states["wrist_image"].copy(),  # [H, W, C] numpy (for base model) - copy()确保连续
@@ -172,6 +198,8 @@ class SimpleLiberoWrapper:
     def reset(self):
         """重置环境并返回包装后的观察"""
         raw_obs = self.raw_env.reset()
+        # 清空帧堆叠，避免跨 episode 泄漏
+        self._prev_frame = None
         wrapped_obs = self._wrap_obs(raw_obs)
         return wrapped_obs
     
@@ -186,15 +214,16 @@ class SimpleLiberoWrapper:
         self.raw_env.close()
 
 
-def create_simple_libero_env(task_suite_name, task_id, seed=42):
+def create_simple_libero_env(task_suite_name, task_id, seed=42, visual_encoder=None):
     """
     创建简化的LIBERO环境用于状态收集
-    
+
     Args:
         task_suite_name: 任务suite名称
         task_id: 任务ID
         seed: 随机种子
-    
+        visual_encoder: FrozenVisualEncoder实例（RGB observation模式），None表示privileged模式
+
     Returns:
         env: SimpleLiberoWrapper实例
         task_description: 任务描述
@@ -213,8 +242,8 @@ def create_simple_libero_env(task_suite_name, task_id, seed=42):
     raw_env.seed(seed)
     
     # 包装环境
-    env = SimpleLiberoWrapper(raw_env, task.language)
-    
+    env = SimpleLiberoWrapper(raw_env, task.language, visual_encoder=visual_encoder)
+
     return env, task.language
 
 
@@ -846,6 +875,13 @@ def main():
     parser.add_argument('--state_method', type=str, default='base_rollout',
                        choices=['demo', 'both_demo', 'base_rollout'],
                        help='State collection method: demo (single reference task), both_demo (both tasks from demo), base_rollout (both tasks from base model rollout)')
+    parser.add_argument('--obs_mode', type=str, default='privileged',
+                       choices=['privileged', 'rgb'],
+                       help='Residual observation space: privileged (proprio + object-to-eef relations) '
+                            'or rgb (frozen-ViT features + proprio, 2 stacked frames). Must match the '
+                            'observation space the residual checkpoints were trained with.')
+    parser.add_argument('--visual_encoder_path', type=str, default=None,
+                       help='Frozen ViT to use in rgb obs_mode (default: facebook/dinov2-small)')
     args = parser.parse_args()
     
     # 加载配置
@@ -875,7 +911,22 @@ def main():
     
     # 获取任务suite名称
     task_suite_name = cfg.env.train.task_suite_name if hasattr(cfg.env, 'train') else cfg.env.task_suite_name
-    
+
+    # RGB observation模式：加载与训练时相同的冻结视觉编码器
+    visual_encoder = None
+    if args.obs_mode == 'rgb':
+        from rlinf.models.embodiment.residual_policy.frozen_visual_encoder import (
+            DEFAULT_VISUAL_ENCODER,
+            FrozenVisualEncoder,
+        )
+
+        visual_encoder = FrozenVisualEncoder(
+            model_path=args.visual_encoder_path or DEFAULT_VISUAL_ENCODER
+        )
+        visual_encoder.eval().to(device)
+        print(f"✅ Frozen visual encoder loaded (feature_dim={visual_encoder.feature_dim})")
+
+
     # Step 1: 根据state_method收集state samples
     print(f"\n=== Collecting States (Method: {args.state_method}) ===")
     
@@ -885,7 +936,7 @@ def main():
             args.reference_task = args.task_i
             print(f"Using task_i ({args.task_i}) as reference_task")
         
-        env_ref, _ = create_simple_libero_env(task_suite_name, args.reference_task)
+        env_ref, _ = create_simple_libero_env(task_suite_name, args.reference_task, visual_encoder=visual_encoder)
         states = collect_state_samples_from_demo(
             task_suite_name,
             args.reference_task,
@@ -904,7 +955,7 @@ def main():
         
     elif args.state_method == 'both_demo':
         # 方法2: 从两个任务的演示数据收集并合并
-        env_i, _ = create_simple_libero_env(task_suite_name, args.task_i)
+        env_i, _ = create_simple_libero_env(task_suite_name, args.task_i, visual_encoder=visual_encoder)
         states_i = collect_state_samples_from_demo(
             task_suite_name,
             args.task_i,
@@ -917,7 +968,7 @@ def main():
             print(f"Error: Failed to collect state samples from task {args.task_i}!")
             return
         
-        env_j, _ = create_simple_libero_env(task_suite_name, args.task_j)
+        env_j, _ = create_simple_libero_env(task_suite_name, args.task_j, visual_encoder=visual_encoder)
         states_j = collect_state_samples_from_demo(
             task_suite_name,
             args.task_j,
@@ -941,7 +992,7 @@ def main():
         # 方法3: 从Base Model rollout收集（两个任务合并）
         print(f"Key insight: RL sees states determined by Base Model (IL), not demo trajectories")
         
-        env_i, _ = create_simple_libero_env(task_suite_name, args.task_i)
+        env_i, _ = create_simple_libero_env(task_suite_name, args.task_i, visual_encoder=visual_encoder)
         states_i = collect_state_samples_from_base_rollout(
             base_model,
             task_suite_name,
@@ -958,7 +1009,7 @@ def main():
             print(f"Error: Failed to collect state samples from task {args.task_i}!")
             return
         
-        env_j, _ = create_simple_libero_env(task_suite_name, args.task_j)
+        env_j, _ = create_simple_libero_env(task_suite_name, args.task_j, visual_encoder=visual_encoder)
         states_j = collect_state_samples_from_base_rollout(
             base_model,
             task_suite_name,
