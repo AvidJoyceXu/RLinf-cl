@@ -94,6 +94,10 @@ class FrozenVisualEncoder(nn.Module):
         """Convert raw ``[B, H, W, C]`` uint8 frames to normalized ``[B, 3, S, S]``."""
         if isinstance(images, np.ndarray):
             images = torch.from_numpy(np.ascontiguousarray(images))
+        # Some base-model preprocessors rewrite frames as [B, N_IMG, H, W, C];
+        # a single view is equivalent to [B, H, W, C].
+        if images.ndim == 5 and images.shape[1] == 1:
+            images = images[:, 0]
         if images.ndim != 4:
             raise ValueError(
                 f"Expected images of shape [B, H, W, C], got {tuple(images.shape)}"

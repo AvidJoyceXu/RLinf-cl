@@ -149,15 +149,40 @@ bash examples/embodiment/run_embodiment.sh libero_object_task1_lora_residual_sac
 - 训练脚本自己会 `export MUJOCO_GL=egl`、`PYTHONPATH`、`EMBODIED_PATH`，不用手动设。
 - 正文用的是 `global_step_2000`（个别任务 3000）。
 
-⚠️ **占几张卡**：config 里 `cluster.component_placement: {actor,env,rollout: all}`，会吃掉进程可见的**全部** GPU。要限制就在启动前设 `CUDA_VISIBLE_DEVICES`：
+⚠️ **占几张卡 / 怎么限制**：config 里 `cluster.component_placement: {actor,env,rollout: all}` 会吃掉节点上的**全部** GPU。
 
-```bash
-CUDA_VISIBLE_DEVICES=0,1 bash examples/embodiment/run_embodiment.sh <config>
+**`CUDA_VISIBLE_DEVICES` 不起作用**——调度器自己探测节点硬件，设了也照样看到 8 张卡（日志里会打印 `Using flexible placement with hardware ranks: [[0],...,[7]]`）。唯一的办法是改 config 里的 placement：
+
+```yaml
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: "0"      # 只用 0 号卡；"0-3" = 用 0~3 号卡
 ```
 
-（第一次这么跑时确认一下日志里打印的 accelerator 数量对不对。）
+这个 key 带逗号，**没法用 hydra 命令行 override**（`++cluster.component_placement={"actor,env,rollout":"0"}` 会报 `no viable alternative at input`）。要临时限卡就复制一份 config 改掉：
+
+```bash
+sed 's/^    actor,env,rollout: all$/    actor,env,rollout: "0"/' \
+  examples/embodiment/config/libero_object_task1_lora_residual_sac_openvlaoft_rgb.yaml \
+  > examples/embodiment/config/_tmp_1gpu.yaml
+```
+
+⚠️ 改了卡数就要同步改 batch：`actor.global_batch_size` 必须能被 `actor.micro_batch_size × actor_world_size`（= GPU 数）整除，否则启动时直接 assert 失败。
 
 显存不够时可调的旋钮，按影响从小到大：`env.train.total_num_envs`（64→32→16）、`actor.enable_offload=True`、`rollout.enable_offload=True`。
+
+**实测显存占用**（H20，bf16，`rebuttal/probe_gpu_footprint.py` 测的）：
+
+| 项目 | 显存 |
+|---|---|
+| OpenVLA-OFT base model 权重 | 14.1 GiB |
+| + 冻结 ViT + residual policy | 14.2 GiB（residual 只加 0.09） |
+| rollout batch 8（峰值） | 18.7 GiB |
+| rollout batch 16（峰值） | 23.3 GiB |
+| rollout batch 32 | OOM（该卡当时空闲 ~30 GiB） |
+
+也就是**每张卡至少要留 ~20 GiB**（对应每卡 8 个 env）。
 
 ### 5.2 单任务评测
 
@@ -346,6 +371,9 @@ export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
 | EGL / mujoco 渲染错误 | 换 `MUJOCO_GL=osmesa`；确认容器带 `NVIDIA_DRIVER_CAPABILITIES=...,graphics` |
 | CUDA OOM | 减 `env.train.total_num_envs`、开 `enable_offload`、用 `CUDA_VISIBLE_DEVICES` 挑空卡 |
 | 跨任务评测结果里缺了想要的任务 | `batch_eval_cross_task.sh:76` 的 `SKIP_TASKS` 硬编码，见 §5.3 |
+| `global_batch_size must be divisible by ...` | 改了卡数没同步改 batch，见 §5.1 |
+| `no viable alternative at input '{"actor,env,rollout"'` | placement 的 key 带逗号，不能命令行 override，见 §5.1 |
+| 限制 GPU 数没生效 | `CUDA_VISIBLE_DEVICES` 对本调度器无效，必须改 config placement，见 §5.1 |
 | RFC 输出全是 `CANNOT MERGE` | 硬编码阈值 0.7 太高，见 §5.4，看 `Mean` 自己比 τ |
 
 ---
