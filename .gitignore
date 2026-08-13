@@ -41,3 +41,5 @@ rebuttal/baselines/RETAIN/
 rebuttal/baselines/TIES/
 # Provided SFT checkpoints (~75 GB).
 libero-object-checkpoints/
+# Checkpoint archive staged for HuggingFace upload (78 MB of safetensors).
+rebuttal/checkpoints-archive/*/
