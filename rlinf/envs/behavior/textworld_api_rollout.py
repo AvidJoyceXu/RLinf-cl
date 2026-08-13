@@ -65,6 +65,30 @@ NUDGE = ("Continue working on the task. Respond with a tool call, not prose. "
          "If the goal is already achieved, call end_task.")
 
 
+def _assistant_msg(msg, **extra) -> dict:
+    """Echo an assistant turn back into the transcript, keeping `reasoning_content`.
+
+    DeepSeek's thinking mode REQUIRES it: drop it and the *next* request fails with
+
+        400 ... "The `reasoning_content` in the thinking mode must be passed back
+        to the API."
+
+    Measured 2026-08-13: this killed 21 of 164 episodes, and it did so
+    asymmetrically -- 10-11 per `object` arm against 1 per `full` arm -- because the
+    error only fires on turns where the model actually reasoned, which correlates
+    with episode difficulty. An API failure that tracks difficulty is not a datum,
+    it is a bias against whichever condition is harder. Baselines we intend to beat
+    must not be handicapped by our own loop.
+    """
+    out = {"role": "assistant", "content": msg.content or "", **extra}
+    reasoning = getattr(msg, "reasoning_content", None)
+    if reasoning is None and getattr(msg, "model_extra", None):
+        reasoning = msg.model_extra.get("reasoning_content")
+    if reasoning:
+        out["reasoning_content"] = reasoning
+    return out
+
+
 def openai_tools() -> list[dict]:
     """The same 17 schemas, in OpenAI function-calling shape.
 
@@ -129,6 +153,7 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
     steps: list[dict] = []
     ended = False
     stop_reason = "max_turns"
+    api_error = ""
     nudges = 0
     turns = 0
 
@@ -141,7 +166,11 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
             usage.add(getattr(resp, "usage", None))
         except Exception as ex:                                    # noqa: BLE001
             usage.add(None, errored=True)
+            # Keep the message, not just the class. A run where 25% of one arm died
+            # as `api_error:BadRequestError` was undiagnosable without it, and an
+            # asymmetric error rate silently biases the arm it hits.
             stop_reason = f"api_error:{type(ex).__name__}"
+            api_error = str(ex)[:400]
             break
 
         msg = resp.choices[0].message
@@ -156,11 +185,10 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
             except Exception:                                      # noqa: BLE001
                 args = {}
             call_id = call.id
-            messages.append({"role": "assistant", "content": msg.content or "",
-                             "tool_calls": [{"id": call_id, "type": "function",
-                                             "function": {"name": name,
-                                                          "arguments":
-                                                          call.function.arguments}}]})
+            messages.append(_assistant_msg(
+                msg, tool_calls=[{"id": call_id, "type": "function",
+                                  "function": {"name": name,
+                                               "arguments": call.function.arguments}}]))
         else:
             parsed = _parse_text_tool_call(msg.content or "")
             if parsed is None:
@@ -175,13 +203,13 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
                 if nudges > MAX_NUDGES:
                     stop_reason = "no_tool_call"
                     break
-                messages.append({"role": "assistant", "content": msg.content or ""})
+                messages.append(_assistant_msg(msg))
                 messages.append({"role": "user", "content": NUDGE})
                 continue
             nudges = 0
             name, args = parsed
             call_id = None
-            messages.append({"role": "assistant", "content": msg.content or ""})
+            messages.append(_assistant_msg(msg))
 
         fn = getattr(aci, name, None)
         if fn is None or name.startswith("_"):
@@ -209,6 +237,7 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
     return {
         "activity": activity, "obs_mode": obs_mode, "goal_format": goal_format,
         "n_steps": len(steps), "ended": ended, "stop_reason": stop_reason,
+        "api_error": api_error,
         "coverage": (n_sat / n_goal) if n_goal else 0.0,
         "success": bool(n_goal and not gs["unsatisfied"] and n_sat > 0),
         "tools": [s["name"] for s in steps],
