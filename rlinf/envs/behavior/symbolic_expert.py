@@ -27,6 +27,7 @@ from rlinf.envs.behavior.symbolic_world import (
     SymbolicACI,
     SymbolicWorld,
     lemma_of,
+    producer_of,
     properties_of,
 )
 
@@ -42,27 +43,14 @@ def _split(atom) -> tuple[bool, str, list]:
 
 
 def _whole_object_for(world: SymbolicWorld, product: str) -> str | None:
-    """Find the real object whose slice/dice yields @product.
+    """The real object whose slice/dice yields @product, or None.
 
-    ``half__apple.n.01_3`` and ``diced__apple.n.01_1`` both come from some real
-    ``apple.n.01_*``; ``diced__`` may also come from a ``half__`` that a slice
-    produced, but planning from the whole object covers both since ``dice`` runs the
-    slice stage itself.
-
-    Matched on the lemma, because BEHAVIOR does not carry the WordNet sense number
-    through a transform: ``bell_pepper.n.02`` dices into ``diced__bell_pepper.n.01``.
+    Thin wrapper over ``symbolic_world.producer_of``, which the ACI also needs for
+    its refusal message; keeping one implementation means the plan and the refusal
+    can never disagree about what creates a future object.
     """
-    lemma = lemma_of(product)
-    for prefix in ("cooked__diced__", "diced__", "half__"):
-        if lemma.startswith(prefix):
-            base = lemma[len(prefix):]
-            break
-    else:
-        return None
-    for name in world.scope_names:
-        if lemma_of(name) == base and world.is_real(name):
-            return name
-    return None
+    made = producer_of(world, product)
+    return made[0] if made else None
 
 
 def _reach(world: SymbolicWorld, obj: str) -> list:

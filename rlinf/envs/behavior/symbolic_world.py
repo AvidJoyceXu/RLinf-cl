@@ -136,6 +136,33 @@ def lemma_of(scope_name: str) -> str:
     return _word(synset_of(scope_name))
 
 
+# Prefix -> the tool that produces it. `dice` runs the slice stage itself, so a
+# `diced__` product is reachable from the whole object either way.
+_TRANSFORM_PREFIXES = (("cooked__diced__", "dice"), ("diced__", "dice"),
+                       ("half__", "slice"))
+
+
+def producer_of(world, product: str):
+    """``(whole_object, tool)`` that would bring @product into existence, or None.
+
+    Lives here rather than in ``symbolic_expert`` because the ACI needs it too: a
+    refusal that says an object does not exist yet without saying what makes it exist
+    is the one refusal shape this environment measured a policy looping on (five of
+    the five worst repeat-loops in the 164-episode run were exactly that message).
+    """
+    lemma = lemma_of(product)
+    for prefix, tool in _TRANSFORM_PREFIXES:
+        if lemma.startswith(prefix):
+            base = lemma[len(prefix):]
+            break
+    else:
+        return None
+    for name in world.scope_names:
+        if lemma_of(name) == base and world.is_real(name):
+            return name, tool
+    return None
+
+
 def display_names(scope_names) -> tuple[dict, dict]:
     """Map BDDL scope names to the shorter names the policy sees, and back.
 
@@ -497,6 +524,24 @@ class SymbolicACI:
         return ToolResult(ok=ok, tool=tool, args=args, reason=reason,
                           observation=self.observe())
 
+    def _future_reason(self, name: str, scope_name: str) -> str:
+        """Why @name does not exist yet, AND what would create it.
+
+        Measured on the 164-episode run: 63% of episodes hit at least one refusal but
+        only 10% ever repeated an identical one -- except for this message, which
+        accounted for **all five** of the worst repeat-loops (up to 5 identical calls
+        in one episode). The refusals that name a repair (`not near X; go_to(X)
+        first`) did not loop. Stating the repair is the whole mechanism, so the one
+        refusal that omitted it is the one the policy got stuck on.
+        """
+        made = producer_of(self.world, scope_name)
+        if made is None:
+            return (f"{name} does not exist yet (it is a future object) and no tool "
+                    f"in this environment creates it")
+        whole, how = made
+        return (f"{name} does not exist yet (it is a future object); "
+                f"{how}({self._disp(whole)}) creates it")
+
     def _require(self, tool, args, name, prop=None, prop_msg=""):
         """Resolve @name and check existence / realness / proximity / property.
 
@@ -508,8 +553,8 @@ class SymbolicACI:
         if scope_name is None:
             return None, self._result(False, tool, args, f"no such object {name!r}")
         if not self.world.is_real(scope_name):
-            return None, self._result(
-                False, tool, args, f"{name} does not exist yet (it is a future object)")
+            return None, self._result(False, tool, args, self._future_reason(name,
+                                                                            scope_name))
         if not self._is_near(scope_name):
             return None, self._result(
                 False, tool, args,
@@ -628,7 +673,7 @@ class SymbolicACI:
             return self._result(False, "go_to", args, f"no such object {name!r}")
         if not self.world.is_real(scope_name):
             return self._result(False, "go_to", args,
-                                f"{name} does not exist yet (it is a future object)")
+                                self._future_reason(name, scope_name))
         self._at = scope_name
         # Keep the agent's own literal coherent with `_at`; nothing reads it today,
         # but a state dump that disagrees with the robot's position is a trap.
