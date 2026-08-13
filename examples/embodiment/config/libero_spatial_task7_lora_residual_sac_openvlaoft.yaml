@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_task3_single_trial_lora_openvlaoft"
+    experiment_name: "libero_spatial_task7_single_trial_lora_openvlaoft"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 20000
@@ -108,7 +108,7 @@ env:
   # Note: max_steps_per_rollout_epoch must be divisible by num_action_chunks (8)
   # Alternative: For longer rollouts, use total_num_envs=64, max_steps_per_rollout_epoch=16, update_epoch=256
   train:
-    specific_reset_id: 3
+    specific_reset_id: 7
     max_trials_per_task: 1
     total_num_envs: 32 # Adjusted to achieve 4:1 ratio (256 transitions per global step)
     auto_reset: True
@@ -121,7 +121,7 @@ env:
     reset_gripper_open: False
   
   eval:
-    specific_reset_id: 3
+    specific_reset_id: 7
     max_trials_per_task: 1
     total_num_envs: 32 # Increased for more comprehensive evaluation (must be divisible by env_world_size)
     auto_reset: True

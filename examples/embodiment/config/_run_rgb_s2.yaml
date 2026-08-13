@@ -1,7 +1,7 @@
 defaults:
   - env/libero_spatial_task0@env.train
   - env/libero_spatial_task0@env.eval
-  - model/lora_residual_policy@actor.model
+  - model/lora_residual_policy_rgb@actor.model
   - model/openvla_oft@actor.base_model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
@@ -24,15 +24,15 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_task3_single_trial_lora_openvlaoft"
-    logger_backends: ["wandb"] # wandb, swanlab
+    experiment_name: "libero_spatial_task2_single_trial_lora_openvlaoft_rgb"
+    logger_backends: ["tensorboard"]
 
-  max_epochs: 20000
+  max_epochs: 2000
   max_steps: -1
 
   only_eval: False
   val_check_interval: 100
-  save_interval: 1000
+  save_interval: 500
 
 algorithm:
   update_epoch: 64  # 每个global step更新64次
@@ -89,6 +89,16 @@ residual_policy:
   prog_explore: 500 # Progressive exploration steps
   prog_explore_threshold: 100  # Threshold for progressive exploration
 
+# Frozen visual encoder (RGB observation mode)
+# Single third-person camera frame -> frozen ViT -> 384-d feature, mirroring the
+# real-robot residual input. Two consecutive frames are stacked by the env and
+# encoded in the rollout worker; the encoder is never trained.
+visual_encoder:
+  enabled: True
+  model_path: "facebook/dinov2-small"
+  image_size: 224
+  pooling: "cls"
+
 # Network Configuration
 network: # NOTE: 和libero-sac对齐
   actor_input: "obs"  # ["obs", "obs_base_action"] - Input mode for residual policy
@@ -108,7 +118,8 @@ env:
   # Note: max_steps_per_rollout_epoch must be divisible by num_action_chunks (8)
   # Alternative: For longer rollouts, use total_num_envs=64, max_steps_per_rollout_epoch=16, update_epoch=256
   train:
-    specific_reset_id: 3
+    specific_reset_id: 2
+    obs_mode: "rgb"
     max_trials_per_task: 1
     total_num_envs: 32 # Adjusted to achieve 4:1 ratio (256 transitions per global step)
     auto_reset: True
@@ -121,7 +132,8 @@ env:
     reset_gripper_open: False
   
   eval:
-    specific_reset_id: 3
+    specific_reset_id: 2
+    obs_mode: "rgb"
     max_trials_per_task: 1
     total_num_envs: 32 # Increased for more comprehensive evaluation (must be divisible by env_world_size)
     auto_reset: True
@@ -172,7 +184,7 @@ actor:
     
     # LIBERO observation dimension
     # LIBERO RL obs: robot_proprio_state (39-dim) + object_to_robot_relations (35-dim) = 74-dim
-    obs_dim: 74 
+    obs_dim: 846 # RGB obs: 2 x 384 frozen-ViT features + 2 x 39 robot0_proprio-state
   base_model:
     model_type: "openvla_oft"
     precision: ${actor.model.precision}

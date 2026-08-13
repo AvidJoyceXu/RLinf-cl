@@ -287,6 +287,28 @@ python rebuttal/make_rgb_configs.py --suite libero_spatial --tasks 0 2 3 6 7
 
 这个脚本从 privileged config 派生，只改 5 处（backbone 引用、experiment_name、`obs_mode`×2、`obs_dim`、`visual_encoder` 块），其余超参逐字不变，保证是 controlled comparison。生成后可以 `diff` 一下自查。
 
+⚠️ **两个 suite 的 `experiment_name` 命名约定和 `obs_dim` 注释都不一样**，所以这两个锚点在脚本里是按正则匹配的，不是字面匹配。改动 config 模板时别把它们写死。
+
+### 6.1 两个 suite 各 5 个 RGB checkpoint（2026-08-11 新增范围）
+
+目标是拿到 **10 个 RL-finetuned RGB checkpoint**：`libero_object [1,6,7,8,9]` + `libero_spatial [0,2,3,6,7]`。这一版范围比原方案（只做 object）大，spatial 不再是「时间富裕才做」的可选项。
+
+⚠️ 开跑前必须知道的两件事：
+
+1. **仓库里原本只有 `libero_spatial_task0` 和 `task3` 两个 privileged config**，正文任务集里的 2/6/7 根本不存在，`make_rgb_configs.py` 会因为找不到源文件而失败。
+2. **仅有的这两个还互相不一致**：task0 是 `micro_batch_size: 128`，task3 是 64；task3 还少了 `max_trials_per_task`。
+
+处理方式：**5 个 spatial 的 privileged config 全部从 task0 模板重写成一致的版本**，只有 `specific_reset_id` 和 `experiment_name` 不同，并统一 `micro_batch_size: 64`（与 libero_object 全套一致）、`total_num_envs: 32`。理由是这 5 个 residual 之后要互相算 RFC 并 merge，跨任务超参必须一致才有可比性。
+
+`micro_batch_size` 只影响梯度累积粒度，`global_batch_size` 两边都是 1024，数学上等价；但它会改变显存占用，换机器时注意。
+
+⚠️ `total_num_envs` **统一用 32**。`libero_object_task1` 是全场唯一用 64 的（privileged 原版和 RGB 版都是，属于论文自带的不对称），而它恰好是收敛最差的一个 run，所以新增的 spatial 实验不沿用这个特例。
+
+| suite | 任务 | 源 config | GPU |
+|---|---|---|---|
+| libero_object | 1, 6, 7, 8, 9 | 仓库原有（task1 的 `total_num_envs=64` 逐字保留） | 每 run 1 卡（task1 用 2 卡，因为 64 env） |
+| libero_spatial | 0, 2, 3, 6, 7 | 由 task0 模板统一重写 | 每 run 1 卡 |
+
 开关位置：
 - `env.{train,eval}.obs_mode: rgb`（默认 `privileged`，不写就是老行为）
 - `visual_encoder.{enabled,model_path,image_size,pooling}`
@@ -307,6 +329,51 @@ python rebuttal/make_rgb_configs.py --suite libero_spatial --tasks 0 2 3 6 7
 | RGB 模式（任意 suite） | 846 | 2×384 视觉 + 2×39 proprio |
 
 privileged 模式下**跨 suite 的 residual 无法 merge**——不是效果差，是张量形状对不上。RGB 模式下宽度与场景物体数无关，才能跨 suite。
+
+### 7.1b ⚠️ 并行跑多个训练必须一个 run 一个容器
+
+在**同一个容器**里同时起多个训练，它们会共用一个 Ray cluster：RLinf 的调度器通过扫 `/proc` 里带 `--gcs-address` 的进程来发现已有的 GCS（`ray/_private/services.py:_find_address_from_flag`），同一个 PID namespace 下后启动的 run 会 attach 到先启动的那个 cluster 上。
+
+后果有两个，都很贵：
+
+1. **杀掉任意一个 run 会拆掉整个 cluster**，其余 run 全部经 `rlinf/scheduler/cluster/cluster.py:signal_handler` 一起死，日志里表现为 `requests.exceptions.JSONDecodeError` 或 `The actor is dead because it was killed by ray.kill`——看不出是被连坐的。
+2. **`cluster.component_placement` 的限卡在共享 cluster 下不起作用**，实测过一个 run 的 rollout 从 12 s 恶化到 397 s（30×）。
+
+正确做法是**一个 run 一个容器**，并用 `--gpus device=N` 在设备层面限卡（这样调度器探测到的就是真实卡数，`component_placement` 保持 config 原样的 `all` 即可）：
+
+```bash
+docker run -d --gpus '"device=2"' --shm-size 64g --name rlinf-t6 \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+  -e HF_HOME=/workspace/hf -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -v $RLINF_DIR:/workspace/RLinf -v $HF_HOME:/workspace/hf \
+  rlinf/rlinf:agentic-rlinf0.1-torch2.6.0-openvla-openvlaoft-pi0 sleep infinity
+```
+
+⚠️ 训练容器**不要**加 `--net=host`，否则多个容器的 Ray 端口会撞车。模型都在挂载的 `HF_HOME` 里，训练不需要外网，加 `HF_HUB_OFFLINE=1` 即可。
+
+完整的启动脚本见 `rebuttal/launch_rgb_runs.sh`。
+
+⚠️ 另外，`save_interval` 默认是 1000，跑到 2000 步只有两个 checkpoint。并行跑多个 run 时建议降到 500，否则中途挂掉可能一个 checkpoint 都没有（实测被这条坑掉过 4 个 run × 4.5 小时）。
+
+⚠️ **`docker exec ... bash -lc` 不会激活 venv**。镜像里那行 `source /opt/venv/openvla/bin/activate` 写在 `/root/.bashrc` 顶部的交互式分支之后，非交互 shell 读不到，表现是 `run_embodiment.sh: line 39: python: command not found`。启动训练一律显式加 PATH：
+
+```bash
+docker exec -w /workspace/RLinf rlinf-t6 bash -c \
+  'export PATH=/opt/venv/openvla-oft/bin:$PATH; bash examples/embodiment/run_embodiment.sh <config>'
+```
+
+### 7.1c ⚠️ 「某个 run 莫名慢 10 倍」几乎总是外部资源争抢
+
+实测过三次：t1 的 rollout 449 s、t7 280 s、s0 286 s，而健康值是 12–30 s。三次的共同点都是**同机另一个用户在 8 张卡上各占了 ~47 GB 的任务**，与 suite、config、任务 id 全都无关（同一份 spatial config，别人退出前 286 s、退出后 13 s）。
+
+判断方法：看 tensorboard 的 `time/time/generate_rollouts`，它占 `time/time/step` 的绝大部分就是 rollout 被拖慢，而不是训练侧的问题。**不要因此去改 config**——`total_num_envs`、`max_trials_per_task`、env 基文件的继承关系都不是原因。
+
+⚠️ 长期资源饥饿之后 run 可能**静默死掉**：mujoco 的 EnvWorker 子进程崩溃 → `venv.py:recv` 抛 `EOFError` → 整个 Ray cluster `ray.kill`。日志里没有任何 mujoco 侧的报错，只有一串 traceback。这类失败不会自愈，并行跑多个 run 时必须有独立的存活监控，否则会白等几小时：
+
+```bash
+docker exec rlinf-<run> pgrep -cf train_embodied_agent   # 0 = 已死
+grep -aE "EOFError|Exiting main process|CUDA out of memory" rebuttal/runlogs/<run>.log
+```
 
 ### 7.2 评测协议：32 个 episode ≠ 32 个初始状态
 
@@ -375,6 +442,9 @@ export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
 | `no viable alternative at input '{"actor,env,rollout"'` | placement 的 key 带逗号，不能命令行 override，见 §5.1 |
 | 限制 GPU 数没生效 | `CUDA_VISIBLE_DEVICES` 对本调度器无效，必须改 config placement，见 §5.1 |
 | RFC 输出全是 `CANNOT MERGE` | 硬编码阈值 0.7 太高，见 §5.4，看 `Mean` 自己比 τ |
+| `run_embodiment.sh: line 39: python: command not found` | `docker exec bash -lc` 不激活 venv，要显式 `export PATH=/opt/venv/openvla-oft/bin:$PATH`，见 §7.1b |
+| 某个 run 的 `generate_rollouts` 比别的慢 10 倍 | 同机他人占卡，不是 config 问题，见 §7.1c |
+| 训练日志停在一串 traceback、`EOFError` + `ray.kill` | mujoco EnvWorker 子进程静默崩溃（常见于长期资源饥饿后），见 §7.1c；必须靠监控发现 |
 
 ---
 

@@ -1,0 +1,52 @@
+{
+  "1|6": {
+    "mean_dir": -0.0188,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "1|7": {
+    "mean_dir": -0.27,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "1|8": {
+    "mean_dir": 0.1856,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "1|9": {
+    "mean_dir": -0.2649,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "6|7": {
+    "mean_dir": 0.0081,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "6|8": {
+    "mean_dir": 0.3859,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "6|9": {
+    "mean_dir": 0.0251,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "7|8": {
+    "mean_dir": -0.4122,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "7|9": {
+    "mean_dir": -0.1027,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  },
+  "8|9": {
+    "mean_dir": -0.1178,
+    "mean_log_scale": 0.0,
+    "p_bad": 0.0
+  }
+}

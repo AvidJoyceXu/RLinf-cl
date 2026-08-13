@@ -29,3 +29,15 @@ outputs/*
 .venv
 uv.lock
 rlinf/envs/maniskill/assets
+
+# --- rebuttal experiment artefacts (2026-08) ---
+# Temp eval configs: run_eval.sh derives one per (policy, task) cell; regenerated on demand.
+examples/embodiment/config/_eval_*.yaml
+# Submitted paper PDF: the remote is public.
+rebuttal/*.pdf
+# Third-party baseline repos, vendored for reference only (RETAIN/openpi, TIES, openvla-oft SFT).
+rebuttal/baselines/BL-openvla-oft/
+rebuttal/baselines/RETAIN/
+rebuttal/baselines/TIES/
+# Provided SFT checkpoints (~75 GB).
+libero-object-checkpoints/

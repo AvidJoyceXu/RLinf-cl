@@ -1,7 +1,7 @@
 defaults:
-  - env/libero_spatial_task0@env.train
-  - env/libero_spatial_task0@env.eval
-  - model/lora_residual_policy@actor.model
+  - env/libero_object@env.train
+  - env/libero_object@env.eval
+  - model/lora_residual_policy_rgb@actor.model
   - model/openvla_oft@actor.base_model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
@@ -19,20 +19,20 @@ cluster:
     actor,env,rollout: all
 
 runner:
-  eval_policy_path: "/workspace/RLinf/logs/20260117-15:06:53-libero_spatial_task0_lora_residual_sac_openvlaoft/libero_spatial_task0_rand_trials_lora_residual_sac_openvlaoft/checkpoints/global_step_9000/actor/huggingface_model"
+  eval_policy_path: ""
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_task3_single_trial_lora_openvlaoft"
-    logger_backends: ["wandb"] # wandb, swanlab
+    experiment_name: "libero_object_task7_single_trial_lora_openvlaoft_rgb"
+    logger_backends: ["tensorboard"]
 
-  max_epochs: 20000
+  max_epochs: 2000
   max_steps: -1
 
   only_eval: False
   val_check_interval: 100
-  save_interval: 1000
+  save_interval: 500
 
 algorithm:
   update_epoch: 64  # 每个global step更新64次
@@ -84,10 +84,20 @@ algorithm:
 # Residual Policy: MLP (fine-tunes policy in state space)
 residual_policy:
   enabled: True
-  base_model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"  # Path to pre-trained OpenVLA-OFT model
+  base_model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-object-traj1/snapshots/62e5a8daba3f619c993f23b248ae04b0d9677bb5" 
   res_scale: 0.05  # Scaling factor for residual action
   prog_explore: 500 # Progressive exploration steps
   prog_explore_threshold: 100  # Threshold for progressive exploration
+
+# Frozen visual encoder (RGB observation mode)
+# Single third-person camera frame -> frozen ViT -> 384-d feature, mirroring the
+# real-robot residual input. Two consecutive frames are stacked by the env and
+# encoded in the rollout worker; the encoder is never trained.
+visual_encoder:
+  enabled: True
+  model_path: "facebook/dinov2-small"
+  image_size: 224
+  pooling: "cls"
 
 # Network Configuration
 network: # NOTE: 和libero-sac对齐
@@ -108,7 +118,8 @@ env:
   # Note: max_steps_per_rollout_epoch must be divisible by num_action_chunks (8)
   # Alternative: For longer rollouts, use total_num_envs=64, max_steps_per_rollout_epoch=16, update_epoch=256
   train:
-    specific_reset_id: 3
+    specific_reset_id: 7
+    obs_mode: "rgb"
     max_trials_per_task: 1
     total_num_envs: 32 # Adjusted to achieve 4:1 ratio (256 transitions per global step)
     auto_reset: True
@@ -121,7 +132,8 @@ env:
     reset_gripper_open: False
   
   eval:
-    specific_reset_id: 3
+    specific_reset_id: 7
+    obs_mode: "rgb"
     max_trials_per_task: 1
     total_num_envs: 32 # Increased for more comprehensive evaluation (must be divisible by env_world_size)
     auto_reset: True
@@ -152,7 +164,7 @@ actor:
   training_backend: "fsdp"
 
   # Aligned with target config: batch_size=256 per update
-  micro_batch_size: 64 # unified with libero_object across all 10 RGB runs
+  micro_batch_size: 64 # Aligned with target batch_size=256
   global_batch_size: 1024  # Aligned with target batch_size=256
   seed: 1234
   enable_offload: False  # Disabled for better performance with FSDP full_shard
@@ -171,13 +183,13 @@ actor:
     actor_input: ${network.actor_input}  # Pass through from network config
     
     # LIBERO observation dimension
-    # LIBERO RL obs: robot_proprio_state (39-dim) + object_to_robot_relations (35-dim) = 74-dim
-    obs_dim: 74 
+    # LIBERO RL obs: 
+    obs_dim: 846 # RGB obs: 2 x 384 frozen-ViT features + 2 x 39 robot0_proprio-state
   base_model:
     model_type: "openvla_oft"
     precision: ${actor.model.precision}
-    model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-spatial-traj1/snapshots/39e5240e879c80b6cda6b3a83763dad717f5c05d"
-    unnorm_key: libero_spatial_no_noops
+    model_path: "/workspace/hf/hub/models--Haozhan72--Openvla-oft-SFT-libero-object-traj1/snapshots/62e5a8daba3f619c993f23b248ae04b0d9677bb5"
+    unnorm_key: libero_object_no_noops
     max_prompt_length: 128
     add_q_head: False
     add_value_head: False

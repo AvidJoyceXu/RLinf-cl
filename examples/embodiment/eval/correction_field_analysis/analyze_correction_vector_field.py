@@ -463,19 +463,47 @@ def load_residual_policy(checkpoint_path, cfg, device):
     
     # rlinf的checkpoint是huggingface格式，需要加载state_dict
     if checkpoint_path.is_dir():
-        # Huggingface格式：包含config.json和pytorch_model.bin或model.safetensors
-        from transformers import AutoModel
-        
-        # 创建模型配置
+        # RLinf checkpoint dir: model{-000xx-of-000yy}.safetensors (+ index json).
+        #
+        # get_model() only *builds* a randomly initialised module from the config;
+        # it never reads model_path. Without the explicit load below the probe runs
+        # on random weights, which silently turns DC/MC into noise around zero.
         model_cfg = cfg.actor.model.copy()
         model_cfg.model_path = str(checkpoint_path)
-        
-        # 加载模型
+
         model = get_model(model_cfg)
+
+        shards = sorted(checkpoint_path.glob("*.safetensors"))
+        if not shards:
+            raise FileNotFoundError(
+                f"No .safetensors found in {checkpoint_path}; cannot load residual weights"
+            )
+
+        from safetensors.torch import load_file
+
+        state_dict = {}
+        for shard in shards:
+            state_dict.update(load_file(str(shard)))
+
+        target_dtype = next(model.parameters()).dtype
+        state_dict = {
+            k: (v.to(target_dtype) if v.is_floating_point() else v)
+            for k, v in state_dict.items()
+        }
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Residual checkpoint does not match the model built from config.\n"
+                f"  missing (left at random init): {sorted(missing)}\n"
+                f"  unexpected (ignored): {sorted(unexpected)}"
+            )
+
         model.eval()
         model.to(device)
-        
-        print(f"✅ Residual Policy loaded from HuggingFace format")
+
+        print(f"✅ Residual Policy loaded: {len(state_dict)} tensors from "
+              f"{len(shards)} shard(s)")
     else:
         # 可能是直接的checkpoint文件
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
@@ -600,6 +628,26 @@ def compute_scale_consistency(a1, a2, epsilon=1e-8):
     return log_scale
 
 
+def compute_magnitude_consistency(a1, a2, epsilon=1e-8):
+    """
+    Magnitude Consistency, paper Eq. (4): bounded harmonic-mean ratio
+
+        MC_i = 2 * min(||a1||, ||a2||) / (||a1|| + ||a2|| + eps)
+
+    Bounded in [0, 1], symmetric, well-defined when one residual is near zero,
+    and equal to 1 only when the two pointwise magnitudes match.
+
+    Note this is a *similarity* (higher is better). It is not the same quantity
+    as compute_scale_consistency, which returns |log(||a1||/||a2||)|, an
+    unbounded dissimilarity kept here only for backward compatibility with the
+    older summary files.
+    """
+    norm1 = np.linalg.norm(a1)
+    norm2 = np.linalg.norm(a2)
+
+    return float(2.0 * min(norm1, norm2) / (norm1 + norm2 + epsilon))
+
+
 def pointwise_probe(residual1, residual2, states, device):
     """
     在states上pointwise probing两个residual policies
@@ -638,13 +686,17 @@ def pointwise_probe(residual1, residual2, states, device):
             
             # 计算scale consistency
             log_scale = compute_scale_consistency(a1_j, a2_j)
-            
+
+            # Magnitude Consistency, paper Eq. (4)
+            mc = compute_magnitude_consistency(a1_j, a2_j)
+
             results.append({
                 'state_idx': i + j,
                 'state': batch_states[j].copy(),
                 'a1': a1_j.copy(),
                 'a2': a2_j.copy(),
                 'dir': dir_sim,
+                'mc': mc,
                 'log_scale': log_scale,
                 'a1_norm': np.linalg.norm(a1_j),
                 'a2_norm': np.linalg.norm(a2_j),
@@ -670,11 +722,17 @@ def safety_aggregation(results, delta_dir=0.5):
     
     dirs = np.array([r['dir'] for r in results])
     log_scales = np.array([r['log_scale'] for r in results])
-    
+    mcs = np.array([r['mc'] for r in results])
+
     # ① Overall alignment check
     mean_dir = np.mean(dirs)
     std_dir = np.std(dirs)
     median_dir = np.median(dirs)
+
+    # Paper Eq. (3)-(5): DC and MC are each averaged over the probe set first,
+    # and RFC is the product of the two averages (not the average of products).
+    mean_mc = np.mean(mcs)
+    rfc = mean_dir * mean_mc
     
     # ② Scale safety check
     mean_log_scale = np.mean(log_scales)
@@ -700,6 +758,11 @@ def safety_aggregation(results, delta_dir=0.5):
         'median_dir': median_dir,
         'min_dir': np.min(dirs),
         'max_dir': np.max(dirs),
+
+        # Paper Eq. (4)-(5): magnitude consistency and the composite RFC score
+        'mean_mc': mean_mc,
+        'std_mc': np.std(mcs),
+        'rfc': rfc,
         
         # Scale statistics
         'mean_log_scale': mean_log_scale,
@@ -716,65 +779,77 @@ def safety_aggregation(results, delta_dir=0.5):
         
         # Raw data for visualization
         'dirs': dirs,
+        'mcs': mcs,
         'log_scales': log_scales,
         'dangerous_mask': dangerous_mask,
     }
-    
+
     print(f"Overall Direction Consistency: {mean_dir:.4f} ± {std_dir:.4f}")
+    print(f"Magnitude Consistency (MC): {mean_mc:.4f} ± {np.std(mcs):.4f}")
+    print(f"RFC (DC * MC): {rfc:.4f}")
     print(f"Overall Scale Consistency (log): {mean_log_scale:.4f} ± {std_log_scale:.4f}")
     print(f"Dangerous States: {dangerous_states}/{len(results)} ({p_bad*100:.2f}%)")
     
     return aggregation
 
 
-def merge_decision(aggregation, thresholds=None):
+def merge_decision(aggregation, tau=0.5):
     """
-    融合决策
-    
+    Merge decision, paper Eq. (5)-(6): merge iff RFC = DC * MC >= tau.
+
     Args:
         aggregation: Dict, safety aggregation的结果
-        thresholds: Dict, 阈值配置
-    
+        tau: float, the single safety threshold on the composite RFC score
+
     Returns:
         decision: Dict, 包含决策结果和原因
+
+    The legacy three-threshold rule (mean_dir >= 0.7 AND mean_log_scale <= 1.0
+    AND p_bad <= 0.05) is not the paper's criterion; its per-term verdicts are
+    still reported under 'legacy' for continuity with older summary files, but
+    they do not affect can_merge.
     """
-    if thresholds is None:
-        thresholds = {
-            'threshold_dir': 0.7,      # 整体方向一致性阈值
-            'threshold_scale': 1.0,    # log scale阈值（约2.7x差异）
-            'threshold_bad': 0.05,     # 危险state比例阈值（5%）
-        }
-    
+    rfc = aggregation['rfc']
     mean_dir = aggregation['mean_dir']
-    mean_log_scale = aggregation['mean_log_scale']
-    p_bad = aggregation['p_bad']
-    
+    mean_mc = aggregation['mean_mc']
+
+    can_merge = bool(rfc >= tau)
+
     reasons = []
-    
-    # 检查整体方向一致性
-    if mean_dir < thresholds['threshold_dir']:
-        reasons.append(f"Overall direction misalignment (mean_dir={mean_dir:.4f} < {thresholds['threshold_dir']})")
-    
-    # 检查尺度一致性
-    if mean_log_scale > thresholds['threshold_scale']:
-        reasons.append(f"Scale mismatch too large (mean_log_scale={mean_log_scale:.4f} > {thresholds['threshold_scale']})")
-    
-    # 检查危险state比例
-    if p_bad > thresholds['threshold_bad']:
-        reasons.append(f"Too many dangerous states ({p_bad*100:.2f}% > {thresholds['threshold_bad']*100}%)")
-    
-    # 决策
-    can_merge = len(reasons) == 0
-    
+    if not can_merge:
+        reasons.append(
+            f"RFC={rfc:.4f} < tau={tau} (DC={mean_dir:.4f}, MC={mean_mc:.4f})"
+        )
+
+    legacy_thresholds = {
+        'threshold_dir': 0.7,
+        'threshold_scale': 1.0,
+        'threshold_bad': 0.05,
+    }
+    legacy_reasons = []
+    if mean_dir < legacy_thresholds['threshold_dir']:
+        legacy_reasons.append(f"mean_dir={mean_dir:.4f} < {legacy_thresholds['threshold_dir']}")
+    if aggregation['mean_log_scale'] > legacy_thresholds['threshold_scale']:
+        legacy_reasons.append(f"mean_log_scale={aggregation['mean_log_scale']:.4f} > {legacy_thresholds['threshold_scale']}")
+    if aggregation['p_bad'] > legacy_thresholds['threshold_bad']:
+        legacy_reasons.append(f"p_bad={aggregation['p_bad']*100:.2f}% > {legacy_thresholds['threshold_bad']*100}%")
+
     decision = {
         'can_merge': can_merge,
         'reasons': reasons,
+        'rfc': rfc,
+        'tau': tau,
         'mean_dir': mean_dir,
-        'mean_log_scale': mean_log_scale,
-        'p_bad': p_bad,
-        'thresholds': thresholds,
+        'mean_mc': mean_mc,
+        'mean_log_scale': aggregation['mean_log_scale'],
+        'p_bad': aggregation['p_bad'],
+        'legacy': {
+            'thresholds': legacy_thresholds,
+            'reasons': legacy_reasons,
+            'can_merge': len(legacy_reasons) == 0,
+        },
     }
-    
+
     return decision
 
 
@@ -832,16 +907,13 @@ def visualize_correction_field_analysis(results, aggregation, decision, output_d
     
     decision_text = f"""
     Merge Decision: {'✅ CAN MERGE' if decision['can_merge'] else '❌ CANNOT MERGE'}
-    
+    RFC = DC x MC = {decision['rfc']:.4f}   (tau = {decision['tau']})
+
     Statistics:
-    • Mean Direction: {aggregation['mean_dir']:.4f}
-    • Mean Log Scale: {aggregation['mean_log_scale']:.4f}
+    • DC (direction consistency): {aggregation['mean_dir']:.4f}
+    • MC (magnitude consistency): {aggregation['mean_mc']:.4f}
+    • Mean Log Scale (legacy):    {aggregation['mean_log_scale']:.4f}
     • Dangerous States: {aggregation['dangerous_count']}/{aggregation['num_states']} ({aggregation['p_bad']*100:.2f}%)
-    
-    Thresholds:
-    • Direction: {decision['thresholds']['threshold_dir']}
-    • Scale: {decision['thresholds']['threshold_scale']}
-    • Dangerous: {decision['thresholds']['threshold_bad']*100}%
     """
     
     if decision['reasons']:
@@ -882,6 +954,20 @@ def main():
                             'observation space the residual checkpoints were trained with.')
     parser.add_argument('--visual_encoder_path', type=str, default=None,
                        help='Frozen ViT to use in rgb obs_mode (default: facebook/dinov2-small)')
+    parser.add_argument('--probe_tasks', type=int, nargs='+', default=None,
+                       help='Tasks whose base rollouts form the probe set, overriding '
+                            '(task_i, task_j). Needed when one side is a merged expert: '
+                            'the probe set should cover every task that expert serves, '
+                            'e.g. --task_i 7 --task_j 1 --probe_tasks 1 6 7 for '
+                            'RFC(task7, merged[1-6]). Each task contributes '
+                            '--num_probe_states states.')
+    parser.add_argument('--tau', type=float, default=0.5,
+                       help='Merge threshold on the composite RFC score (paper Eq. 6). '
+                            'The real-robot experiments use 0.5.')
+    parser.add_argument('--num_probe_states', type=int, default=None,
+                       help='Trim each task to exactly this many probe states (base_rollout only). '
+                            'Keeps N identical across every pair of a matrix; --max_demos must be '
+                            'large enough to produce at least this many.')
     args = parser.parse_args()
     
     # 加载配置
@@ -989,50 +1075,53 @@ def main():
         print(f"Total combined states: {len(states)}")
         
     elif args.state_method == 'base_rollout':
-        # 方法3: 从Base Model rollout收集（两个任务合并）
+        # 方法3: 从Base Model rollout收集
         print(f"Key insight: RL sees states determined by Base Model (IL), not demo trajectories")
-        
-        env_i, _ = create_simple_libero_env(task_suite_name, args.task_i, visual_encoder=visual_encoder)
-        states_i = collect_state_samples_from_base_rollout(
-            base_model,
-            task_suite_name,
-            args.task_i,
-            env_i,
-            cfg,
-            device,
-            num_episodes=args.max_demos,
-            max_steps=cfg.env.train.max_episode_steps if hasattr(cfg.env.train, 'max_episode_steps') else 240
-        )
-        env_i.close()
-        
-        if states_i is None:
-            print(f"Error: Failed to collect state samples from task {args.task_i}!")
-            return
-        
-        env_j, _ = create_simple_libero_env(task_suite_name, args.task_j, visual_encoder=visual_encoder)
-        states_j = collect_state_samples_from_base_rollout(
-            base_model,
-            task_suite_name,
-            args.task_j,
-            env_j,
-            cfg,
-            device,
-            num_episodes=args.max_demos,
-            max_steps=cfg.env.train.max_episode_steps if hasattr(cfg.env.train, 'max_episode_steps') else 240
-        )
-        env_j.close()
-        
-        if states_j is None:
-            print(f"Error: Failed to collect state samples from task {args.task_j}!")
-            return
-        
-        # 合并两个任务的states
-        states = np.concatenate([states_i, states_j], axis=0)
+
+        # Which tasks contribute probe states. Defaults to the compared pair; an
+        # explicit list is needed when a side is a merged expert serving more
+        # than one task, so that the probe set covers all of them.
+        probe_tasks = args.probe_tasks if args.probe_tasks else [args.task_i, args.task_j]
+        print(f"Probe tasks: {probe_tasks}")
+
+        per_task = []
+        for t in probe_tasks:
+            env_t, _ = create_simple_libero_env(task_suite_name, t, visual_encoder=visual_encoder)
+            s_t = collect_state_samples_from_base_rollout(
+                base_model,
+                task_suite_name,
+                t,
+                env_t,
+                cfg,
+                device,
+                num_episodes=args.max_demos,
+                max_steps=cfg.env.train.max_episode_steps if hasattr(cfg.env.train, 'max_episode_steps') else 240
+            )
+            env_t.close()
+
+            if s_t is None:
+                print(f"Error: Failed to collect state samples from task {t}!")
+                return
+
+            # Trim every task to the same probe count so that N is identical across
+            # pairs. Episodes that terminate early otherwise make N depend on how
+            # well the base policy happens to do on that task, which would confound
+            # RFC comparisons.
+            if args.num_probe_states is not None:
+                if len(s_t) < args.num_probe_states:
+                    print(f"Warning: task {t} yielded only {len(s_t)} states "
+                          f"(< requested {args.num_probe_states}); raise --max_demos")
+                s_t = s_t[:args.num_probe_states]
+
+            per_task.append(s_t)
+
+        states_i, states_j = per_task[0], per_task[-1]
+        states = np.concatenate(per_task, axis=0)
         print(f"\n=== Combined States ===")
-        print(f"Task {args.task_i} states: {len(states_i)}")
-        print(f"Task {args.task_j} states: {len(states_j)}")
+        for t, s_t in zip(probe_tasks, per_task):
+            print(f"Task {t} states: {len(s_t)}")
         print(f"Total combined states: {len(states)}")
-    
+
     # Step 2: 加载两个residual policies
     # 确定checkpoint路径
     if args.checkpoint_i:
@@ -1050,6 +1139,18 @@ def main():
             raise ValueError("checkpoint_j must be specified or provided in config.runner.eval_policy_path")
         print(f"Warning: checkpoint_j not specified, using same as checkpoint_i")
     
+    # The residual policy is built from cfg.actor.model, whose obs_dim is written
+    # for the privileged observation space (88 for libero_object, 74 for spatial).
+    # In rgb mode the probe states are [2*feature_dim + 2*proprio_dim] wide, so
+    # take the width from the states actually collected -- that is by construction
+    # the width the checkpoint's fc1_A expects, and it avoids hard-coding 846.
+    if args.obs_mode == 'rgb':
+        rgb_obs_dim = int(states.shape[-1])
+        if cfg.actor.model.obs_dim != rgb_obs_dim:
+            print(f"obs_mode=rgb: overriding actor.model.obs_dim "
+                  f"{cfg.actor.model.obs_dim} -> {rgb_obs_dim}")
+            cfg.actor.model.obs_dim = rgb_obs_dim
+
     residual_i = load_residual_policy(checkpoint_i_path, cfg, device)
     residual_j = load_residual_policy(checkpoint_j_path, cfg, device)
     
@@ -1060,8 +1161,26 @@ def main():
     aggregation = safety_aggregation(results, delta_dir=args.delta_dir)
     
     # Step 5: Merge decision
-    decision = merge_decision(aggregation)
-    
+    decision = merge_decision(aggregation, tau=args.tau)
+
+    # Persist the per-state quantities. Re-running a pair costs a full base-policy
+    # rollout, so keeping the raw dirs/mcs/norms makes re-thresholding, bootstrap
+    # CIs and cross-repeat variance analysis possible without touching the GPU.
+    raw_path = os.path.join(log_base_path, "pointwise_raw.npz")
+    np.savez_compressed(
+        raw_path,
+        dirs=aggregation['dirs'],
+        mcs=aggregation['mcs'],
+        log_scales=aggregation['log_scales'],
+        a1_norms=np.array([r['a1_norm'] for r in results]),
+        a2_norms=np.array([r['a2_norm'] for r in results]),
+        task_i=args.task_i,
+        task_j=args.task_j,
+        num_probe_states=len(aggregation['dirs']),
+    )
+    print(f"Saved per-state raw data to: {raw_path}")
+
+
     # Step 6: 可视化
     visualize_correction_field_analysis(results, aggregation, decision, 
                                        log_base_path, args.task_i, args.task_j)
@@ -1114,16 +1233,24 @@ def main():
             f.write(f"  Dangerous States Mean Log Scale: {aggregation['dangerous_mean_log_scale']:.4f}\n")
         f.write(f"\n")
         
-        f.write(f"Merge Decision:\n")
+        f.write(f"Magnitude Consistency (paper Eq. 4):\n")
+        f.write(f"  Mean MC: {aggregation['mean_mc']:.4f}\n")
+        f.write(f"  Std MC: {aggregation['std_mc']:.4f}\n\n")
+
+        f.write(f"RFC Score (paper Eq. 5, DC * MC):\n")
+        f.write(f"  RFC: {aggregation['rfc']:.4f}\n\n")
+
+        f.write(f"Merge Decision (paper Eq. 6, RFC >= tau):\n")
         f.write(f"  {'✅ CAN MERGE' if decision['can_merge'] else '❌ CANNOT MERGE'}\n")
-        f.write(f"  Thresholds:\n")
-        f.write(f"    Direction: {decision['thresholds']['threshold_dir']}\n")
-        f.write(f"    Scale: {decision['thresholds']['threshold_scale']}\n")
-        f.write(f"    Dangerous: {decision['thresholds']['threshold_bad']*100}%\n")
+        f.write(f"  tau: {decision['tau']}\n")
         if decision['reasons']:
             f.write(f"  Reasons:\n")
             for reason in decision['reasons']:
                 f.write(f"    - {reason}\n")
+        f.write(f"  [legacy three-threshold rule, not the paper's criterion]: "
+                f"{'pass' if decision['legacy']['can_merge'] else 'fail'}\n")
+        for reason in decision['legacy']['reasons']:
+            f.write(f"    - {reason}\n")
     
     print(f"\n{'='*60}")
     print(f"Analysis Complete!")

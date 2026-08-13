@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import os
+import re
 
 CONFIG_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -35,11 +36,23 @@ visual_encoder:
   pooling: "cls"
 """
 
-OBS_DIM_OLD = "obs_dim: 88 # NOTE: from 74 to 88"
-
 OBS_DIM_NEW = (
     "obs_dim: 846 # RGB obs: 2 x 384 frozen-ViT features + 2 x 39 robot0_proprio-state"
 )
+
+# The two suites do not share an experiment_name convention (libero_object uses
+# "<suite>_task<id>_single_trial_lora_openvlaoft", libero_spatial uses
+# "task<id>_single_trial_lora_residual_sac_openvlaoft"), and obs_dim differs per
+# suite, so both anchors are matched by pattern rather than by literal.
+EXPERIMENT_NAME_RE = re.compile(r'(experiment_name:\s*")([^"]+)(")')
+OBS_DIM_RE = re.compile(r"obs_dim:\s*\d+[^\n]*")
+
+
+def sub_once(pattern, repl, text, suite, task_id, what):
+    text, n = pattern.subn(repl, text, count=1)
+    if n != 1:
+        raise ValueError(f"Anchor not found in {suite} task {task_id}: {what}")
+    return text
 
 
 def convert(text: str, suite: str, task_id: int) -> str:
@@ -48,17 +61,16 @@ def convert(text: str, suite: str, task_id: int) -> str:
             "- model/lora_residual_policy@actor.model",
             "- model/lora_residual_policy_rgb@actor.model",
         ),
-        (
-            f'experiment_name: "{suite}_task{task_id}_single_trial_lora_openvlaoft"',
-            f'experiment_name: "{suite}_task{task_id}_single_trial_lora_openvlaoft_rgb"',
-        ),
-        (OBS_DIM_OLD, OBS_DIM_NEW),
         ("\n# Network Configuration", f"{VISUAL_ENCODER_BLOCK}\n# Network Configuration"),
     ]
     for old, new in replacements:
         if old not in text:
             raise ValueError(f"Anchor not found in {suite} task {task_id}: {old!r}")
         text = text.replace(old, new, 1)
+
+    text = sub_once(EXPERIMENT_NAME_RE, r"\1\2_rgb\3", text, suite, task_id,
+                    "experiment_name")
+    text = sub_once(OBS_DIM_RE, OBS_DIM_NEW, text, suite, task_id, "obs_dim")
 
     # `obs_mode: rgb` makes the env emit stacked frames and stop emitting the
     # privileged object-to-eef relations entirely.

@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "task0_single_trial_lora_residual_sac_openvlaoft"
+    experiment_name: "libero_spatial_task0_single_trial_lora_openvlaoft"
     logger_backends: ["wandb"] # wandb, swanlab
 
   max_epochs: 20000
@@ -152,7 +152,7 @@ actor:
   training_backend: "fsdp"
 
   # Aligned with target config: batch_size=256 per update
-  micro_batch_size: 128 # Aligned with target batch_size=256
+  micro_batch_size: 64 # unified with libero_object across all 10 RGB runs
   global_batch_size: 1024  # Aligned with target batch_size=256
   seed: 1234
   enable_offload: False  # Disabled for better performance with FSDP full_shard
