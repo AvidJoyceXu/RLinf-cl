@@ -70,6 +70,63 @@ def discover(activities: list[str], per_activity: int, seed: int) -> list[dict]:
     return rows
 
 
+def discover_textworld(verified_path: str) -> list[str]:
+    """Activities for the BEHAVIOR-TextWorld benchmark.
+
+    Read from the file ``symbolic_expert --all`` writes rather than recomputed here:
+    membership means "the symbolic expert actually reached the BDDL goal", which
+    costs a full solve over ~800 activities. Provenance beats convenience -- a
+    benchmark whose membership rule is a ten-minute side effect of the dataset
+    builder is one nobody can reproduce.
+    """
+    if not os.path.exists(verified_path):
+        raise SystemExit(
+            f"{verified_path} not found. Produce it first:\n"
+            f"  python -m rlinf.envs.behavior.symbolic_expert --all "
+            f"--out {verified_path}"
+        )
+    with open(verified_path) as f:
+        return sorted(json.load(f)["solved"])
+
+
+def build_textworld(out_dir: str, verified_path: str, s2_frac: float,
+                    seed: int) -> None:
+    """Write train / val_s2 for the symbolic benchmark.
+
+    ONLY those two splits exist here, and that is a property of the backend rather
+    than a shortcut. S1 (unseen instance) and S3 (unseen scene) are meaningless
+    without geometry: BDDL ships exactly one definition per activity, so there is
+    one start state each and no scene at all. S2 -- held-out ACTIVITIES -- is the
+    primary metric anyway, and this backend is the first one that can measure it at
+    scale: hundreds of held-out activities instead of four.
+    """
+    activities = discover_textworld(verified_path)
+    rng = random.Random(seed)
+    shuffled = list(activities)
+    rng.shuffle(shuffled)
+    n_s2 = max(1, int(round(len(shuffled) * s2_frac)))
+    s2_acts = sorted(shuffled[:n_s2])
+    train_acts = sorted(shuffled[n_s2:])
+
+    os.makedirs(out_dir, exist_ok=True)
+    for name, acts in (("train", train_acts), ("val_s2", s2_acts)):
+        specs = [{"activity": a, "instance_id": 0} for a in acts]
+        path = os.path.join(out_dir, f"{name}.jsonl")
+        with open(path, "w") as f:
+            for row in to_dataset_rows(specs):
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        print(f"{name:8s} {len(specs):5d} rows  {len(acts):4d} activities  -> {path}")
+
+    with open(os.path.join(out_dir, "split.json"), "w") as f:
+        json.dump({"backend": "textworld",
+                   "train_activities": train_acts,
+                   "s2_heldout_activities": s2_acts,
+                   "verified_source": verified_path,
+                   "seed": seed}, f, indent=2)
+    print(f"\nS2 = {len(s2_acts)} held-out activities, never trained on.")
+    print("Freeze this split now — it is the primary metric and cannot be re-drawn later.")
+
+
 def to_dataset_rows(specs: list[dict]) -> list[dict]:
     return [
         {"prompt": spec["activity"].replace("_", " "),
@@ -91,7 +148,19 @@ def main():
     ap.add_argument("--val-instances-per-activity", type=int, default=2)
     ap.add_argument("--heldout-activities", default=",".join(DEFAULT_HELDOUT_ACTIVITIES))
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--backend", default="omnigibson",
+                    choices=["omnigibson", "textworld"],
+                    help="textworld: activity-level splits over the verified-solvable "
+                         "symbolic benchmark; no instances, no scenes")
+    ap.add_argument("--verified", default="/data/behavior-data/tw_verified.json",
+                    help="textworld only: output of `symbolic_expert --all`")
+    ap.add_argument("--s2-frac", type=float, default=0.2,
+                    help="textworld only: fraction of activities held out as S2")
     args = ap.parse_args()
+
+    if args.backend == "textworld":
+        build_textworld(args.out, args.verified, args.s2_frac, args.seed)
+        return
 
     if args.activities and args.activities.startswith("@"):
         activities = [l.strip() for l in open(args.activities[1:]) if l.strip()]

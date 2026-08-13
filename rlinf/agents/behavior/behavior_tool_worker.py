@@ -20,6 +20,14 @@ RPC boundary had nothing to bridge. See
 a debugging surface (curl one tool call, drive one episode by hand) but is no longer
 on the training path.
 
+TWO BACKENDS. ``tools.behavior.backend`` selects between the OmniGibson simulator
+(``env_server.BehaviorEnv``) and the symbolic BEHAVIOR-TextWorld layer
+(``textworld_env.BehaviorTextWorld``). They are interface-compatible, so the choice
+is one config key. The constraints documented below are OMNIGIBSON's and do not
+apply to ``textworld``: with no Kit there is no activity lock, so one rank hosts
+every activity, and every simulator workaround in ``__init__`` and ``_boot`` is
+skipped.
+
 TWO OMNIGIBSON CONSTRAINTS SHAPE THIS FILE, and neither is about venvs:
 
 * **One activity per process.** OmniGibson locks the ``HEADLESS`` macro at first boot,
@@ -63,6 +71,12 @@ class BehaviorToolWorker(ToolWorker):
         super().__init__()
         self.cfg = cfg
         tcfg = cfg.tools.behavior
+        # `textworld` swaps the OmniGibson simulator for the symbolic BDDL dynamics
+        # layer (rlinf/envs/behavior/symbolic_world.py). The env objects are
+        # interface-compatible, so everything below this line that is not explicitly
+        # guarded works for both.
+        self.backend: str = str(tcfg.get("backend", "omnigibson"))
+        assert self.backend in ("omnigibson", "textworld"), self.backend
         self.obs_mode: str = str(tcfg.get("obs_mode", "full"))
         self.instances_per_activity: int = int(tcfg.get("instances_per_activity", 1))
         # Cameras off / partial scene load are the defaults for the same reason as in
@@ -85,7 +99,12 @@ class BehaviorToolWorker(ToolWorker):
         # true. Leave it unset to fall back to the lazy path (fine for a debugging
         # process that is already on the main thread).
         self.activity_cfg: str | None = tcfg.get("activity", None)
-        self._env: Any = None                  # BehaviorEnv
+        self._env: Any = None                  # BehaviorEnv | BehaviorTextWorld
+        # textworld only: activity -> env. There is no Kit to lock a scene, so one
+        # rank hosts every activity and the one-activity-per-rank rule below does
+        # not apply. This is what makes multi-activity training and the S2
+        # held-out-activity split runnable on a single worker.
+        self._envs: dict[str, Any] = {}
         self._booted_activity: str | None = None
         self._active_session: str | None = None
         # NOT `_lock`: the base Worker class owns `self._lock` (a threading.Lock,
@@ -96,7 +115,13 @@ class BehaviorToolWorker(ToolWorker):
         self._session_lock: asyncio.Lock | None = None
         self.request_processor_task: asyncio.Task | None = None
 
-        if self.activity_cfg:
+        if self.backend == "textworld":
+            # Nothing to pre-boot: constructing a symbolic world is ~1 ms and needs
+            # no main thread, no event loop and no signal handling, so every
+            # workaround below is inapplicable. Worlds are built on demand in
+            # `_start`.
+            pass
+        elif self.activity_cfg:
             # Boot on a DEDICATED thread carrying a plain CPython event loop.
             #
             # Kit needs three things at once, and each previous attempt supplied only
@@ -217,9 +242,11 @@ class BehaviorToolWorker(ToolWorker):
     def stop_server(self):
         if self.request_processor_task and not self.request_processor_task.done():
             self.request_processor_task.cancel()
-        if self._env is not None:
-            self._env.close()
-            self._env = None
+        for env in ({id(e): e for e in [*self._envs.values(), self._env]
+                     if e is not None}).values():
+            env.close()
+        self._envs.clear()
+        self._env = None
         self._booted_activity = None
         self._active_session = None
 
@@ -263,6 +290,19 @@ class BehaviorToolWorker(ToolWorker):
             response, key=request.session_id, async_op=True
         ).async_wait()
 
+    async def _run(self, fn, *args):
+        """Call a blocking env method off the event loop -- unless there is nothing
+        to block on.
+
+        The OmniGibson methods are multi-minute C++ and MUST be offloaded or a slow
+        reset looks like a hung worker. The symbolic ones are tens of microseconds,
+        where a thread-pool hop costs several times the call itself, so run them
+        inline.
+        """
+        if self.backend == "textworld":
+            return fn(*args)
+        return await asyncio.to_thread(fn, *args)
+
     async def _start(self, request: ToolChannelRequest) -> ToolChannelResponse:
         spec = request.tool_args
         if isinstance(spec, str):
@@ -273,7 +313,13 @@ class BehaviorToolWorker(ToolWorker):
         assert self._session_lock is not None, "start_server() not called"
         await self._session_lock.acquire()
         try:
-            if self._booted_activity is None:
+            if self.backend == "textworld":
+                # Every activity gets its own cached world; no mismatch to refuse.
+                if activity not in self._envs:
+                    self._envs[activity] = self._boot(activity)
+                self._env = self._envs[activity]
+                self._booted_activity = activity
+            elif self._booted_activity is None:
                 self._env = await asyncio.to_thread(self._boot, activity)
                 self._booted_activity = activity
             elif activity != self._booted_activity:
@@ -290,7 +336,7 @@ class BehaviorToolWorker(ToolWorker):
                     ),
                 )
 
-            body = await asyncio.to_thread(self._env.start, spec.get("instance_id"))
+            body = await self._run(self._env.start, spec.get("instance_id"))
         except BaseException:
             self._session_lock.release()
             raise
@@ -306,8 +352,7 @@ class BehaviorToolWorker(ToolWorker):
             return ToolChannelResponse(success=False, result="unknown_session")
         args = dict(request.tool_args or {})
         args.pop("_episode_id", None)                 # routing key, not a tool arg
-        body = await asyncio.to_thread(
-            self._env.call, request.tool_name or "", args)
+        body = await self._run(self._env.call, request.tool_name or "", args)
         return ToolChannelResponse(
             success=bool(body.get("payload", {}).get("ok", True)),
             result=body.get("payload"),
@@ -316,7 +361,7 @@ class BehaviorToolWorker(ToolWorker):
 
     async def _end(self, request: ToolChannelRequest) -> ToolChannelResponse:
         if self._active_session == request.session_id and self._env is not None:
-            await asyncio.to_thread(self._env.end)
+            await self._run(self._env.end)
         self._release(request.session_id)
         return ToolChannelResponse(success=True, result={"ok": True})
 
@@ -350,6 +395,13 @@ class BehaviorToolWorker(ToolWorker):
         other component silently loses its handlers.
         """
         import signal as _signal
+
+        if self.backend == "textworld":
+            # ~1 ms, pure Python, no Kit: none of the signal/event-loop contortions
+            # below apply, so take the short path rather than dressing it up as one.
+            from rlinf.envs.behavior.textworld_env import BehaviorTextWorld
+
+            return BehaviorTextWorld(activity, obs_mode=self.obs_mode)
 
         from rlinf.envs.behavior.env_server import BehaviorEnv
 

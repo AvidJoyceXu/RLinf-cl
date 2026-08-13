@@ -174,9 +174,18 @@ def build_prompt_messages(activity: str, goal_lines: list[str],
         goal_block = "\n".join(f"  - {g}" for g in goal_lines) or "  (none)"
         body = ("Complete the activity so that all of these goal conditions hold:\n"
                 f"{goal_block}")
+    # The mode word alone does not say what `object` gates on, and a policy that
+    # cannot know a shut cupboard has an inside is being tested on guessing, not
+    # planning. Stating the rule is not goal leakage -- it says nothing about which
+    # objects matter. `full` and `partial` keep a byte-identical prompt so the
+    # measured 0801 numbers stay comparable.
+    obs_line = f"Observability: {obs_mode}"
+    if obs_mode == "object":
+        obs_line += (" -- you see only what is in this room and not shut inside a "
+                     "closed container; open a container to see what is in it")
     user = (
         f"Activity: {activity.replace('_', ' ')}\n"
-        f"Observability: {obs_mode}\n"
+        f"{obs_line}\n"
         f"{body}"
     )
     return [
