@@ -251,10 +251,18 @@ def dump_tro_state(env, output_path: Path, overwrite: bool) -> None:
 
     from omnigibson.utils.config_utils import TorchEncoder
 
+    # The agent is excluded by SYNSET, and the synset is "agent.n.01", not "agent" --
+    # `BDDLEntity.synset` is built as `"_".join(bddl_inst.split("_")[:-1])`, so
+    # "agent.n.01_1" yields "agent.n.01". Comparing against "agent" never matches, and
+    # the robot was being written into the instance at its *staging* pose
+    # (`--robot-staging-position`, parked far off-scene) as if it were task state. None
+    # of the 40 official cached instances carries an agent entry; ours did.
+    # OmniGibson's own `behavior_task.py` has the same comparison, where it only means a
+    # cosmetic highlight, which is likely where this was copied from.
     tro_state = {
         bddl_name: bddl_inst.dump_state(serialized=False)
         for bddl_name, bddl_inst in env.task.object_scope.items()
-        if bddl_inst.exists and getattr(bddl_inst, "synset", None) != "agent"
+        if bddl_inst.exists and getattr(bddl_inst, "synset", None) != "agent.n.01"
     }
     robot_poses = env.scene.get_task_metadata(key="robot_poses")
     if robot_poses is not None:
