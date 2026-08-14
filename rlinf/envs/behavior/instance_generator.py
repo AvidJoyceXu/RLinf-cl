@@ -471,7 +471,13 @@ def main() -> None:
             overwrite=args.overwrite,
         )
     except Exception as e:
+        # Print the traceback, not just the message. Sampling failures surface as bare
+        # messages like "'NoneType' object has no attribute 'is_system'" that are
+        # untraceable to a line without this, and each attempt costs ~15 min of
+        # OmniGibson boot to reproduce.
+        import traceback
         print(f"Error during instance generation: {e}", flush=True)
+        traceback.print_exc()
     finally:
         if env is not None:
             env.close()
