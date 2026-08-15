@@ -1,0 +1,156 @@
+"""Is `obs_mode=fov` solvable at all? A reference search, and the audit that uses it.
+
+A harder observation condition is only a benchmark if a competent agent can still win.
+Otherwise it is not difficulty, it is a broken environment -- and the difference is
+invisible from a success rate alone, which is why this exists before any baseline is
+run under `fov`. Same role `symbolic_expert --all` plays for the base benchmark: it
+answers "solvable" by *solving*, not by arguing.
+
+THE SEARCH. Sweep in place, and whenever the sweep turns up somewhere new to stand,
+walk there and sweep again -- frontier expansion over the objects discovered so far:
+
+    seen = sweep(here)
+    frontier = [things seen]
+    while frontier and budget:
+        go_to(next unvisited thing)      # navigation is still the oracle
+        seen |= sweep(here)
+
+Turning is free of side effects and `go_to` only works on something already seen, so
+this is exactly the loop the interface affords a policy. It is deliberately NOT
+privileged: it reads `observe()` and nothing else, so a number it produces is an upper
+bound a policy could in principle reach, not one only an oracle could.
+"""
+from __future__ import annotations
+
+import json
+
+from rlinf.envs.behavior.symbolic_world import (
+    SymbolicACI,
+    SymbolicWorld,
+    properties_of,
+)
+
+TURNS_PER_SWEEP = 4          # 4 x 90 degrees = full circle
+# Level and down only. A third (upward) pitch was measured to add nothing to
+# coverage and ~10 steps to the median sweep -- most BEHAVIOR objects sit at or
+# below camera height. `look_up` stays in the tool set so the policy can undo a
+# `look_down`; the reference search just never needs it.
+PITCHES = (0, -1)
+
+
+def sweep(aci: SymbolicACI) -> int:
+    """Turn a full circle at three pitches. Returns steps spent."""
+    steps = 0
+    for pitch in PITCHES:
+        if pitch == -1:
+            aci.look_down(); steps += 1
+        for _ in range(TURNS_PER_SWEEP):
+            aci.observe(); steps += 1
+            aci.turn_left(); steps += 1
+    aci.look_up()            # back to level
+    return steps + 1
+
+
+def explore(activity: str, layout_prefer: str = "generated",
+            budget: int = 400) -> dict:
+    """Search until nothing new is found or the budget runs out."""
+    world = SymbolicWorld(activity)
+    aci = SymbolicACI(world, obs_mode="fov", layout_prefer=layout_prefer)
+    targets = {n for n in world.scope_names
+               if n != world.agent and world.is_real(n)}
+    # Substances with no host have no coordinates and are always reported; counting
+    # them as "found" would flatter the search, so they are excluded from the target
+    # set rather than silently satisfied.
+    locatable = {n for n in targets if aci.layout.pos(n) is not None}
+
+    steps = sweep(aci)
+    visited: set = set()
+    while steps < budget:
+        frontier = [n for n in aci.view.seen if n not in visited
+                    and aci.layout.pos(n) is not None]
+        if not frontier or locatable <= aci.view.seen:
+            break
+        # Nearest unvisited first: a cheap heuristic, and one a policy could follow
+        # from the ordinal `where` field alone.
+        frontier.sort(key=lambda n: aci.view.range_to(aci.layout.pos(n))
+                      if hasattr(aci.view, "range_to") else 0)
+        target = frontier[0]
+        visited.add(target)
+        res = aci.go_to(world.to_display.get(target, target))
+        steps += 1
+        if not res.ok:
+            continue
+        # Open what you arrive at, if it shuts things away. `fov` keeps `object`
+        # mode's rule that a closed container hides its contents, so looking alone can
+        # never find the butter in the fridge -- a search that only turns its head
+        # scores those activities as unsolvable when they are merely unopened. This
+        # is the same move `symbolic_expert._reach` makes for the same reason.
+        if "openable" in properties_of(target) and not world.sim.get_open(
+                (world.scope[target],)):
+            steps += 1
+            if aci.open(world.to_display.get(target, target)).ok:
+                steps += sweep(aci)
+                continue
+        steps += sweep(aci)
+
+    found = aci.view.seen & locatable
+    return {
+        "activity": activity,
+        "source": aci.layout.source,
+        "locatable": len(locatable),
+        "found": len(found),
+        "complete": locatable <= aci.view.seen,
+        "steps": steps,
+        "missing": sorted(world.to_display.get(n, n) for n in (locatable - found))[:5],
+    }
+
+
+def _main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("activity", nargs="?")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--n", type=int, default=0, help="limit --all to the first N")
+    ap.add_argument("--prefer", default="generated", choices=["sampled", "generated"])
+    ap.add_argument("--budget", type=int, default=400)
+    args = ap.parse_args()
+
+    if not args.all:
+        print(json.dumps(explore(args.activity, args.prefer, args.budget), indent=1))
+        return
+
+    acts = json.load(open("/data/behavior-data/tw_verified.json"))["solved"]
+    if args.n:
+        acts = acts[:args.n]
+    complete = partial = fail = 0
+    steps_ok, worst = [], []
+    for a in acts:
+        try:
+            r = explore(a, args.prefer, args.budget)
+        except Exception as ex:                                    # noqa: BLE001
+            fail += 1
+            continue
+        if r["complete"]:
+            complete += 1
+            steps_ok.append(r["steps"])
+        else:
+            partial += 1
+            worst.append((r["found"] / max(r["locatable"], 1), a, r["missing"]))
+    n = len(acts)
+    print(f"activities            : {n}   (prefer={args.prefer}, budget={args.budget})")
+    print(f"  ALL objects found   : {complete} = {complete / n:.1%}")
+    print(f"  incomplete          : {partial}")
+    print(f"  errored             : {fail}")
+    if steps_ok:
+        steps_ok.sort()
+        print(f"  search steps        : median {steps_ok[len(steps_ok) // 2]}  "
+              f"p90 {steps_ok[int(0.9 * len(steps_ok))]}  max {steps_ok[-1]}")
+    if worst:
+        worst.sort()
+        print("  worst coverage:")
+        for frac, a, missing in worst[:5]:
+            print(f"    {a:<44} {frac:.0%}  missing e.g. {missing[:3]}")
+
+
+if __name__ == "__main__":
+    _main()

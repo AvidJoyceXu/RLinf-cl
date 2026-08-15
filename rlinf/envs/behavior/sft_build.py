@@ -117,6 +117,38 @@ def tool_schemas() -> list[dict]:
     ]
 
 
+# The camera primitives are a SEPARATE group, offered only under `obs_mode=fov`. They
+# are not part of the 17 semantic tools: they change no BDDL literal, only what the
+# next `observe` reports, so every expert plan and every earlier baseline stays valid.
+# Keeping them out of `tool_schemas()` is what guarantees the other modes are
+# byte-identical to the runs already reported.
+def camera_schemas() -> list[dict]:
+    """Viewpoint control. Order is stable, same as `tool_schemas`."""
+    return [
+        {"name": "turn_left",
+         "description": "Rotate the camera 45 degrees to the left, in place.",
+         "parameters": _obj({}, [])},
+        {"name": "turn_right",
+         "description": "Rotate the camera 45 degrees to the right, in place.",
+         "parameters": _obj({}, [])},
+        {"name": "move_ahead",
+         "description": "Step 0.5 m in the direction you are facing.",
+         "parameters": _obj({}, [])},
+        {"name": "look_down",
+         "description": "Tilt the camera 30 degrees down, to see low surfaces "
+                        "and the floor.",
+         "parameters": _obj({}, [])},
+        {"name": "look_up",
+         "description": "Tilt the camera 30 degrees up, undoing a look_down.",
+         "parameters": _obj({}, [])},
+    ]
+
+
+def all_schemas(obs_mode: str = "full") -> list[dict]:
+    """Every tool the policy may call under @obs_mode."""
+    return tool_schemas() + (camera_schemas() if obs_mode == "fov" else [])
+
+
 def dump_tool_schemas(path: str) -> None:
     with open(path, "w") as f:
         json.dump(tool_schemas(), f, indent=1)
@@ -183,6 +215,15 @@ def build_prompt_messages(activity: str, goal_lines: list[str],
     if obs_mode == "object":
         obs_line += (" -- you see only what is in this room and not shut inside a "
                      "closed container; open a container to see what is in it")
+    elif obs_mode == "fov":
+        # Same principle as `object`: state the RULE, never the contents. Telling the
+        # policy that it has a camera and must aim it is not goal leakage -- it names
+        # no object. Withholding it would test whether the policy guesses the
+        # interface, which is not the question.
+        obs_line += (" -- you see only what is in the camera's field of view. Use "
+                     "turn_left / turn_right to sweep, move_ahead to approach, "
+                     "look_down for low surfaces, then observe again. You can only "
+                     "go_to an object you have already seen.")
     user = (
         f"Activity: {activity.replace('_', ' ')}\n"
         f"{obs_line}\n"

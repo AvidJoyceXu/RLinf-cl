@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -465,8 +466,9 @@ class SymbolicACI:
     loop are unchanged and the SFT cold start transfers.
     """
 
-    def __init__(self, world: SymbolicWorld, obs_mode: str = "full"):
-        assert obs_mode in ("full", "partial", "object"), obs_mode
+    def __init__(self, world: SymbolicWorld, obs_mode: str = "full",
+                 layout_prefer: str = "sampled"):
+        assert obs_mode in ("full", "partial", "object", "fov"), obs_mode
         self.world = world
         self.obs_mode = obs_mode
         self._held: Optional[str] = None          # scope name
@@ -474,6 +476,17 @@ class SymbolicACI:
         # `observe` is not an empty room in partial mode.
         sup = world.support_of(world.agent)
         self._at: Optional[str] = sup[1] if sup else None
+
+        # `fov` is the only mode that needs metric coordinates, so the layout and the
+        # camera are built only for it. Every other mode stays byte-identical, which
+        # is what keeps the 0801 baselines reproducible.
+        self.layout = None
+        self.view = None
+        if obs_mode == "fov":
+            from rlinf.envs.behavior.layout import build_layout
+            from rlinf.envs.behavior.viewpoint import Viewpoint
+            self.layout = build_layout(world.activity, world, prefer=layout_prefer)
+            self.view = Viewpoint(x=self.layout.robot_xy[0], y=self.layout.robot_xy[1])
 
     # ------------------------------------------------------------------ #
     # helpers
@@ -633,6 +646,19 @@ class SymbolicACI:
             return True
         if self.obs_mode == "full":
             return True
+        if self.obs_mode == "fov":
+            # Shut containers hide their contents here too: a camera cannot see
+            # through a closed fridge door any more than `object` mode can.
+            if self.world.enclosing_closed(name):
+                return False
+            pos = self.layout.pos(name)
+            if pos is None:
+                # No coordinates -- substances with no host. They are scene-global in
+                # BEHAVIOR rather than objects sitting somewhere, so a viewpoint gate
+                # has nothing to test and hiding them would be an artifact, not
+                # occlusion. Same reasoning as the `object` branch below.
+                return True
+            return self.view.in_view(pos)
         if self.obs_mode == "object":
             if self.world.enclosing_closed(name):
                 return False
@@ -652,16 +678,33 @@ class SymbolicACI:
         exists are documented there.
         """
         here = self.world.room_of(self._at) if self._at else None
-        objs = [self._obj_report(name) for name in self.world.scope_names
-                if name != self.world.agent and self.world.is_real(name)
-                and self._visible(name, here)]
-        return {
+        names = [n for n in self.world.scope_names
+                 if n != self.world.agent and self.world.is_real(n)
+                 and self._visible(n, here)]
+        objs = [self._obj_report(name) for name in names]
+        out = {
             "obs_mode": self.obs_mode,
             "held": self._disp(self._held),
             "at": self._disp(self._at),
             "room": here,
             "objects": objs,
         }
+        if self.obs_mode == "fov":
+            # Remember what has been seen: `go_to` refuses an unseen target, so this
+            # set is the record of what discovery has bought. Held and current-anchor
+            # objects come through `_visible` too, so they land here as well.
+            self.view.seen.update(names)
+            out["view"] = self.view.state()
+            metric = self.layout.is_real
+            for rep, name in zip(objs, names):
+                pos = self.layout.pos(name)
+                if pos is not None:
+                    rep["where"] = self.view.describe(pos, metric)
+            # Say which it is. A policy reading "2.3 m" off a generated layout would
+            # be reading an invention; under `generated` no metre value is emitted at
+            # all, and this field says why.
+            out["geometry"] = "measured" if metric else "schematic"
+        return out
 
     # ------------------------------------------------------------------ #
     # navigation
@@ -674,6 +717,15 @@ class SymbolicACI:
         if not self.world.is_real(scope_name):
             return self._result(False, "go_to", args,
                                 self._future_reason(name, scope_name))
+        if self.obs_mode == "fov" and scope_name not in self.view.seen:
+            # You cannot navigate to what you have not found. This is the whole point
+            # of the mode: navigation stays an oracle, DISCOVERY does not. Without it
+            # the policy reads a name out of the goal and teleports to it, and the
+            # camera is decoration.
+            return self._result(
+                False, "go_to", args,
+                f"you have not seen {name} yet; look around first "
+                f"(turn_left / turn_right / move_ahead / look_down, then observe)")
         self._at = scope_name
         # Keep the agent's own literal coherent with `_at`; nothing reads it today,
         # but a state dump that disagrees with the robot's position is a trap.
@@ -681,7 +733,48 @@ class SymbolicACI:
         self.world.clear_position(self.world.agent)
         if ground is not None and ground != self.world.agent:
             self.world.sim.set_ontop((self.world.agent, ground), True)
+        if self.obs_mode == "fov":
+            # Arriving puts the camera at the object, facing it. Navigation is still
+            # the oracle; only finding the target was work.
+            pos = self.layout.pos(scope_name)
+            if pos is not None:
+                yaw = math.atan2(pos[1] - self.view.y, pos[0] - self.view.x)
+                self.view.teleport(pos[0], pos[1], yaw)
         return self._result(True, "go_to", args, f"now at {name}")
+
+    # ------------------------------------------------------------------ #
+    # camera control -- `fov` mode only
+    # ------------------------------------------------------------------ #
+    def _camera(self, tool: str) -> ToolResult:
+        """The five viewpoint primitives.
+
+        They mutate the camera and NOTHING else: no BDDL literal changes, so every
+        expert plan stays valid and the 17 semantic tools keep their meaning. The only
+        effect is on what the next `observe()` reports -- which is the point.
+        """
+        if self.obs_mode != "fov":
+            return self._result(False, tool, {},
+                                f"{tool} is only available with obs_mode=fov")
+        getattr(self.view, tool)()
+        st = self.view.state()
+        return self._result(True, tool, {},
+                            f"facing {st['facing_deg']} deg, "
+                            f"pitch {st['pitch_deg']} deg")
+
+    def turn_left(self) -> ToolResult:
+        return self._camera("turn_left")
+
+    def turn_right(self) -> ToolResult:
+        return self._camera("turn_right")
+
+    def move_ahead(self) -> ToolResult:
+        return self._camera("move_ahead")
+
+    def look_up(self) -> ToolResult:
+        return self._camera("look_up")
+
+    def look_down(self) -> ToolResult:
+        return self._camera("look_down")
 
     # ------------------------------------------------------------------ #
     # manipulation
