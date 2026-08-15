@@ -156,13 +156,27 @@ def _explore_detect(world, aci, locatable, steps, budget) -> dict:
             aci.observe()
             steps += 1
             harvest()
+            # Open EVERY shut container here, not just the first. With true asset
+            # sizes a cabinet is large and its contents are fully covered, so a
+            # search that opens one container per stop leaves the rest sealed.
             shut = [x for x in aci._dets
                     if x.key.startswith("scope:")
                     and "openable" in properties_of(x.key[len("scope:"):])]
-            for x in shut[:1]:
+            for x in shut:
                 aci.open(x.det)
                 steps += 1
             steps += sweep(aci, on_view=harvest)
+            # Step back and sweep again. Occlusion is asymmetric coverage from ONE
+            # viewpoint, so a small object hidden behind large furniture from where we
+            # arrived may be plainly visible half a metre away. Turning alone cannot
+            # recover it -- only translation can, which is the difficulty the true
+            # sizes introduced and the reason a turn-only search under-reports.
+            for _ in range(2):
+                aci.turn_left()
+                aci.turn_left()
+                aci.move_ahead()
+                steps += 3
+                steps += sweep(aci, on_view=harvest)
         else:
             steps += 1
     return {

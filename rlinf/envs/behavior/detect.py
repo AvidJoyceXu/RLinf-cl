@@ -48,6 +48,95 @@ AMBIGUOUS_MARGIN = 0.15          # two candidates this close in IoU are not dist
 
 SCENE_ROOT = "/data/behavior-data/behavior-1k-assets/scenes"
 
+# TRUE per-model bounding boxes, extracted from the asset USDs' `ig:nativeBB` -- the
+# same attribute OmniGibson reads via `DatasetObject.native_bbox`. Nothing here is
+# estimated or nominal.
+#
+# An earlier version used one hardcoded 15 cm half-extent for every task object, then a
+# hand-written per-category table. Both were inventions and both were wrong in the same
+# direction: a refrigerator, a floor and a sheet of plywood modelled at the same size
+# are invisible across a room and are dropped by the occlusion test the moment anything
+# stands in front of them. Per-MODEL matters too, not just per-category --
+# bottle__of__detergent_1 and _2 in one activity are models qjkmhq and gkpmii with
+# different boxes.
+#
+# Extraction: `scratchpad/extract_bbox.py`. Assets are Fernet-encrypted usdz; the key
+# ships with the dataset and decryption needs only `cryptography`, so no Kit boot.
+# 8662 models, 1829 categories, 0 failures.
+NATIVE_BBOX_PATH = "/data/behavior-data/native_bbox.json"
+
+
+@functools.lru_cache(maxsize=1)
+def _native_bbox() -> dict:
+    with open(NATIVE_BBOX_PATH) as f:
+        return json.load(f)
+
+
+@functools.lru_cache(maxsize=4)
+def scope_models(instance_path: str) -> dict:
+    """BDDL scope name -> asset model id, for one task instance.
+
+    Chain: the instance's sibling `*_template.json` carries `metadata.task.inst_to_name`
+    (scope -> scene object name) and `objects_info.init_info[name].args.model`. Both are
+    written by the sampler, so this is recorded data rather than a guess.
+    """
+    # The template is PER ACTIVITY and lives one directory up; the tro_state files are
+    # per instance inside `<scene>_task_<activity>_instances/`. Measured on the shipped
+    # tree: 37 templates against 301 instances in one scene. Looking for a sibling
+    # returns nothing, which is why an earlier version reported 0 of 31 official
+    # instances as having a model map when in fact all of them do.
+    tmpl = instance_path.replace("-tro_state.json", ".json")
+    if not os.path.exists(tmpl):
+        base = os.path.basename(tmpl)
+        parent = os.path.dirname(os.path.dirname(instance_path))
+        cands = sorted(glob.glob(os.path.join(parent, base)))
+        if not cands:
+            # instance index differs from the template's (…_0_187_ vs …_0_0_)
+            head = base.split("_task_")[0] + "_task_" + \
+                base.split("_task_")[1].rsplit("_", 2)[0]
+            cands = sorted(glob.glob(os.path.join(parent, head + "_*_template.json")))
+        if not cands:
+            return {}
+        tmpl = cands[0]
+    with open(tmpl) as f:
+        d = json.load(f)
+    i2n = d.get("metadata", {}).get("task", {}).get("inst_to_name") or {}
+    init = d.get("objects_info", {}).get("init_info", {})
+    out = {}
+    for inst, name in i2n.items():
+        model = (init.get(name) or {}).get("args", {}).get("model")
+        if model:
+            out[inst] = model
+    return out
+
+
+def extent_for_model(model: str):
+    """Half-extent from the asset's own native bbox, or None if the model is unknown."""
+    bb = _native_bbox()["by_model"].get(model)
+    return tuple(max(v / 2.0, MIN_EXTENT_M) for v in bb["bbox"]) if bb else None
+
+
+def offset_for_model(model: str) -> tuple:
+    """Recorded base-link -> bbox-centre offset, `ig:offsetBaseLink`.
+
+    A scene or instance file records the BASE LINK pose, not the bbox centre. 89% of
+    the 8662 assets have a non-zero offset and some are metres (`floors` is
+    (6.72, 8.44, 0)), so treating the recorded pose as the centre puts every box in
+    the wrong place. This is data we already had and were not using.
+    """
+    bb = _native_bbox()["by_model"].get(model)
+    return tuple(bb["offset"]) if bb and "offset" in bb else (0.0, 0.0, 0.0)
+
+
+def extent_for_category(category: str):
+    """Half-extent from the per-category median of real model boxes, or None.
+
+    Used only where a model id is genuinely unrecorded. Still measured data -- the
+    median of that category's real assets -- never a hand-written number.
+    """
+    bb = _native_bbox()["by_category"].get(category)
+    return tuple(max(v / 2.0, MIN_EXTENT_M) for v in bb) if bb else None
+
 
 @dataclass
 class Detection:
@@ -64,13 +153,14 @@ def scene_furniture(scene_model: str) -> tuple:
     """Every non-`stuff` object in a BEHAVIOR scene as (category, pos, extent).
 
     These are the distractors, and they are REAL -- read from the shipped scene json,
-    not invented. Only the task objects' positions may come from a generated layout.
+    not invented. Only the task objects' positions may come from a sampled instance.
     """
     hits = glob.glob(os.path.join(SCENE_ROOT, scene_model, "json",
                                   f"{scene_model}_best.json"))
     if not hits:
         return ()
-    d = json.load(open(hits[0]))
+    with open(hits[0]) as f:
+        d = json.load(f)
     reg = d.get("state", {}).get("registry", {}).get("object_registry", {})
     init = d.get("objects_info", {}).get("init_info", {})
     out = []
@@ -82,13 +172,17 @@ def scene_furniture(scene_model: str) -> tuple:
         pos = (reg.get(name) or {}).get("root_link", {}).get("pos")
         if not pos:
             continue
-        # `scale` is a per-axis factor, not a size, and the shipped json carries no
-        # bbox. Using it directly as metres is crude and deliberately so: overlap and
-        # occlusion only need RELATIVE size to be roughly right, and a wrong absolute
-        # scale shifts every box together. Flagged rather than hidden.
-        sc = args.get("scale") or [0.3, 0.3, 0.3]
-        ext = tuple(max(float(v) / 2.0, MIN_EXTENT_M) for v in sc)
-        out.append((cat, (float(pos[0]), float(pos[1]), float(pos[2])), ext))
+        # TRUE size: the asset's own native bbox for THIS model, times the instance's
+        # per-axis scale. `scale` alone is a factor, not a size.
+        base = _native_bbox()["by_model"].get(str(args.get("model")))
+        if base is None:
+            continue                  # unknown model: omit rather than invent a size
+        sc = args.get("scale") or [1.0, 1.0, 1.0]
+        ext = tuple(max(float(b) * float(v) / 2.0, MIN_EXTENT_M)
+                    for b, v in zip(base["bbox"], sc))
+        off = base.get("offset") or (0.0, 0.0, 0.0)
+        centre = tuple(float(pos[k]) + float(off[k]) * float(sc[k]) for k in range(3))
+        out.append((cat, centre, ext))
     return tuple(out)
 
 
@@ -122,11 +216,16 @@ def _project(view, pos, ext) -> tuple | None:
                 cyy = wx * sin_y + wy * cos_y
                 fwd = cx * cos_p - wz * sin_p
                 up = cx * sin_p + wz * cos_p
-                if fwd <= 0.05:
-                    continue
-                xs.append(IMAGE_W / 2 - fx * cyy / fwd)
-                ys.append(IMAGE_H / 2 - fx * up / fwd)
-                depths.append(fwd)
+                # CLAMP to the near plane rather than dropping corners behind the
+                # camera. Dropping them silently collapses the box of any object that
+                # straddles the camera: standing on a 12 m floor, the four corners in
+                # front all sit at the same depth, the projected y-extent becomes a
+                # line, and the floor you are standing on reports as invisible. That
+                # cost 68 points of solvability before it was found.
+                near = max(fwd, 0.05)
+                xs.append(IMAGE_W / 2 - fx * cyy / near)
+                ys.append(IMAGE_H / 2 - fx * up / near)
+                depths.append(near)
     if not xs:
         return None
     x0, x1 = max(0.0, min(xs)), min(float(IMAGE_W), max(xs))
@@ -134,6 +233,18 @@ def _project(view, pos, ext) -> tuple | None:
     if x1 - x0 < 1 or y1 - y0 < 1:
         return None
     return (int(x0), int(y0), int(x1), int(y1)), min(depths)
+
+
+def _frac_covered(a, b) -> float:
+    """Fraction of box @a that box @b covers. Asymmetric, unlike IoU -- which is the
+    point: a small object behind a large one is hidden, a large one behind a small one
+    is not."""
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    return ((ix1 - ix0) * (iy1 - iy0) / area_a) if area_a > 0 else 0.0
 
 
 def _iou(a, b) -> float:
@@ -156,32 +267,62 @@ def detect(view, entries) -> list:
     covered by nearer boxes is not reported. That is what makes discovery depend on
     where you stand rather than on a gate someone has to describe.
     """
-    from rlinf.envs.behavior.viewpoint import FOV_RANGE_M
+    from rlinf.envs.behavior.viewpoint import CAMERA_HEIGHT_M, FOV_RANGE_M
 
     projected = []
     for key, cat, pos, ext in entries:
-        # Range first: the frustum alone would report the far wall of the house, and
-        # the first run of this did exactly that -- 224 detections from one viewpoint.
-        if math.hypot(pos[0] - view.x, pos[1] - view.y) > FOV_RANGE_M:
+        # Range to the NEAREST PART of the object, not to its centroid. A centroid
+        # test drops anything large whose middle is far away -- measured: with proper
+        # extents it made every `floor` invisible from the floor you were standing on,
+        # and solvability fell from 77% to 9%.
+        radius = math.hypot(ext[0], ext[1])
+        if math.hypot(pos[0] - view.x, pos[1] - view.y) - radius > FOV_RANGE_M:
             continue
         pr = _project(view, pos, ext)
         if pr is None:
             continue
         box, depth = pr
-        projected.append((depth, key, cat, box))
+        # A near-horizontal surface at or below foot level -- a floor, a lawn, a
+        # driveway -- cannot hide what rests ON it, however near and large its
+        # projection is. Without this the floor you are standing on is the nearest,
+        # biggest box in the frame and occludes the entire scene: measured, it took
+        # `bringing_in_wood` to 0 of 5 objects found with every object plainly in
+        # range. Decided by geometry, not by category name.
+        flat = (ext[2] <= 0.25 and max(ext[0], ext[1]) >= 1.0
+                and pos[2] + ext[2] < CAMERA_HEIGHT_M - 0.5)
+        projected.append((depth, key, cat, box, flat))
     projected.sort()
 
     out, occluders = [], []
-    for i, (depth, key, cat, box) in enumerate(projected):
-        covered = max((_iou(box, nb) for nb in occluders), default=0.0)
-        if covered > 0.85:
-            continue                    # hidden behind something nearer
-        area = (box[2] - box[0]) * (box[3] - box[1])
+    for depth, key, cat, box, flat in projected:
+        # Occlusion is measured as the fraction of THIS box covered by a nearer one,
+        # not as IoU. IoU is symmetric, so two large coplanar surfaces -- two floor
+        # tiles of a single room, say -- score 1.0 against each other and the second
+        # was being reported as hidden behind the first. Measured: this is why
+        # `floor_1` was missing from almost every failed activity once true asset
+        # sizes made floor boxes large.
+        #
+        # A nearer object of the SAME category is also not an occluder here: it is the
+        # same surface continuing, and BDDL scopes one of them.
+        # PARTIAL OCCLUSION. A segmentation stack returns a partially hidden object
+        # with a smaller mask and lower confidence; it does not silently omit it. All
+        # or nothing was our simplification, and it was measurably too harsh -- with
+        # true asset sizes it removed most task objects from view. Only near-total
+        # cover drops a detection now; anything less shrinks the reported box and the
+        # score, which is both more faithful and still a real cost to the policy,
+        # since a sliver of a box is harder to select against and easier to confuse.
+        covered = max((_frac_covered(box, nb) for nb, ncat in occluders
+                       if ncat != cat), default=0.0)
+        if covered > 0.95:
+            continue                    # essentially entirely hidden
+        area = (box[2] - box[0]) * (box[3] - box[1]) * (1.0 - covered)
         out.append(Detection(
             det=f"d{len(out) + 1}", bbox=box, category=cat,
-            score=round(min(1.0, 0.35 + 0.65 * math.sqrt(area / (IMAGE_W * IMAGE_H))), 2),
+            score=round(min(1.0, (0.35 + 0.65 * math.sqrt(
+                max(area, 1) / (IMAGE_W * IMAGE_H))) * (1.0 - covered)), 2),
             key=key, depth=round(depth, 2)))
-        occluders.append(box)
+        if not flat:
+            occluders.append((box, cat))
     return out
 
 

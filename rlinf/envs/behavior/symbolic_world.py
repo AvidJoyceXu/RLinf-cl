@@ -492,6 +492,20 @@ class SymbolicACI:
             from rlinf.envs.behavior.layout import build_layout
             from rlinf.envs.behavior.viewpoint import Viewpoint
             self.layout = build_layout(world.activity, world, prefer=layout_prefer)
+            if obs_mode == "detect" and not self.layout.is_real:
+                # NO INVENTED POSES IN `detect`. Every pose must come from BEHAVIOR's
+                # sampler, which is the only source that puts task objects in the
+                # SCENE's frame and satisfies the BDDL initial conditions
+                # geometrically. A generated layout satisfies neither: `inside(can,
+                # ashcan)` can hold symbolically while the can sits three metres away,
+                # and mixing invented task poses with real furniture makes every
+                # occlusion and every bearing an accident. `fov` tolerates a generated
+                # layout because it reports no furniture and claims no scene; `detect`
+                # cannot.
+                raise ValueError(
+                    f"obs_mode=detect requires a sampled instance for "
+                    f"{world.activity!r}; none found. Generate one with "
+                    f"rlinf/envs/behavior/instance_generator.py.")
             self.view = Viewpoint(x=self.layout.robot_xy[0], y=self.layout.robot_xy[1])
 
     # ------------------------------------------------------------------ #
@@ -789,7 +803,16 @@ class SymbolicACI:
         No name, no instance index, no `is_near`, no `Cooked` -- `0815 - interface
         audit` records why none of those could come from a camera.
         """
-        from rlinf.envs.behavior.detect import detect, scene_furniture
+        from rlinf.envs.behavior.detect import (
+            detect,
+            extent_for_category,
+            extent_for_model,
+            offset_for_model,
+            scene_furniture,
+            scope_models,
+        )
+
+        models = scope_models(self.layout.instance_path or "")
 
         entries = []
         for name in self.world.scope_names:
@@ -800,8 +823,21 @@ class SymbolicACI:
             pos = self.layout.pos(name)
             if pos is None:
                 continue                  # substances have no location by construction
-            entries.append((f"scope:{name}", _word(synset_of(name)), pos,
-                            (0.15, 0.15, 0.15)))
+            cat = _word(synset_of(name))
+            # Size comes from the asset, per MODEL where the instance recorded one and
+            # per category otherwise -- never from a hand-written table. An object we
+            # cannot size is omitted rather than guessed, because a wrong size is
+            # silently wrong: it changes what occludes what and what is visible from
+            # where.
+            ext = (extent_for_model(models[name]) if name in models else None) \
+                or extent_for_category(cat)
+            if ext is None:
+                continue
+            # The instance file records the BASE LINK pose; the bbox is centred at
+            # pose + ig:offsetBaseLink.
+            off = offset_for_model(models[name]) if name in models else (0.0, 0.0, 0.0)
+            centre = tuple(pos[k] + off[k] for k in range(3))
+            entries.append((f"scope:{name}", cat, centre, ext))
         for i, (cat, pos, ext) in enumerate(scene_furniture(self.layout.scene or "")):
             entries.append((f"scene:{i}", cat, pos, ext))
 
