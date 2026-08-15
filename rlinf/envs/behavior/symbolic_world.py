@@ -467,11 +467,14 @@ class SymbolicACI:
     """
 
     def __init__(self, world: SymbolicWorld, obs_mode: str = "full",
-                 layout_prefer: str = "sampled"):
-        assert obs_mode in ("full", "partial", "object", "fov"), obs_mode
+                 layout_prefer: str = "sampled", reason_mode: str = "terse"):
+        assert obs_mode in ("full", "partial", "object", "fov", "detect"), obs_mode
+        assert reason_mode in ("verbose", "terse", "silent"), reason_mode
+        self.reason_mode = reason_mode
         self.world = world
         self.obs_mode = obs_mode
         self._held: Optional[str] = None          # scope name
+        self._resolve_error: Optional[str] = None  # why the last selection failed
         # Start where the agent's own initial condition puts it, so the first
         # `observe` is not an empty room in partial mode.
         sup = world.support_of(world.agent)
@@ -482,7 +485,10 @@ class SymbolicACI:
         # is what keeps the 0801 baselines reproducible.
         self.layout = None
         self.view = None
-        if obs_mode == "fov":
+        self._dets: list = []          # detect mode: last observation
+        self._view_epoch = 0           # bumped by any camera mutation
+        self._det_epoch = -1           # epoch the handles in `_dets` belong to
+        if obs_mode in ("fov", "detect"):
             from rlinf.envs.behavior.layout import build_layout
             from rlinf.envs.behavior.viewpoint import Viewpoint
             self.layout = build_layout(world.activity, world, prefer=layout_prefer)
@@ -492,9 +498,39 @@ class SymbolicACI:
     # helpers
     # ------------------------------------------------------------------ #
     def _resolve(self, name) -> Optional[str]:
-        """Display name (or raw scope name) -> scope name, or None."""
+        """Selection -> scope name, or None.
+
+        In `detect` mode the argument is a view-local handle (`"d3"`) or a box
+        (`"118,96,171,148"`), never an object name -- names are the leak this mode
+        exists to remove. Routing it through here rather than through each tool is
+        what lets all 17 tool signatures stay unchanged, so expert plans and the SFT
+        schema are untouched.
+
+        A failed spatial resolution leaves `self._resolve_error` set with the reason,
+        because "ambiguous" and "no such object" are different failures and the policy
+        needs to be able to tell them apart.
+        """
+        self._resolve_error = None
         if not isinstance(name, str):
             return None
+        if self.obs_mode == "detect":
+            from rlinf.envs.behavior.detect import resolve as _resolve_det
+            if self._det_epoch != self._view_epoch:
+                self._resolve_error = ("your last observation is stale; "
+                                       "observe again before selecting")
+                return None
+            det, err = _resolve_det(name, self._dets)
+            if det is None:
+                self._resolve_error = err
+                return None
+            # Scene furniture is selectable and real, but has no BDDL identity, so no
+            # tool can act on it. Saying so is honest; silently treating it as
+            # "no such object" would hide that the policy pointed at a real thing.
+            if not det.key.startswith("scope:"):
+                self._resolve_error = (f"that is a {det.category}; it is scene furniture "
+                                       f"and no tool applies to it")
+                return None
+            return det.key[len("scope:"):]
         if name in self.world.from_display:
             return self.world.from_display[name]
         if name in self.world.scope:
@@ -534,8 +570,40 @@ class SymbolicACI:
         return self.world.is_success()
 
     def _result(self, ok, tool, args, reason) -> ToolResult:
-        return ToolResult(ok=ok, tool=tool, args=args, reason=reason,
-                          observation=self.observe())
+        # In `detect` mode an action ack carries NO observation. Two reasons, and the
+        # second is a correctness bug this fixes: a 26-detection payload on every ack
+        # is the context cost we are trying to make the policy *choose* to pay, and
+        # re-running `observe()` here silently re-issued the view-local handles, so
+        # `turn_left` refreshed the very handles it was supposed to invalidate.
+        obs = None if self.obs_mode == "detect" else self.observe()
+        return ToolResult(ok=ok, tool=tool, args=args,
+                          reason=reason if ok else self._refusal(reason),
+                          observation=obs)
+
+    def _refusal(self, reason: str) -> str:
+        """Apply `reason_mode` to a refusal. Every refusal funnels through here.
+
+        E1 (0815) found that stripping the procedural system prompt costs nothing,
+        because the policy simply reads the same knowledge out of our refusals
+        instead: `minimal` walked into `not near sink_1; go_to(sink_1) first` and
+        recovered from it. So the refusal text is a second skill channel, and its
+        halves supply different things:
+
+            precondition failed: not near sink_1;  go_to(sink_1) first
+            |____ state: which precondition ____|  |__ plan: which tool __|
+
+        `verbose` gives both, `terse` gives the state only, `silent` gives neither
+        (ALFWorld's "Nothing happens", which its own paper blames for the repeat
+        loops it then patched with beam search). Splitting on the repair clause
+        rather than removing feedback wholesale is what lets us price the plan half
+        separately from the diagnosis half -- and keep the half that is a
+        contribution while dropping the half that is a leak.
+        """
+        if self.reason_mode == "verbose":
+            return reason
+        if self.reason_mode == "silent":
+            return ""
+        return reason.split("; ")[0]
 
     def _future_reason(self, name: str, scope_name: str) -> str:
         """Why @name does not exist yet, AND what would create it.
@@ -564,7 +632,9 @@ class SymbolicACI:
         """
         scope_name = self._resolve(name)
         if scope_name is None:
-            return None, self._result(False, tool, args, f"no such object {name!r}")
+            return None, self._result(
+                False, tool, args,
+                self._resolve_error or f"no such object {name!r}")
         if not self.world.is_real(scope_name):
             return None, self._result(False, tool, args, self._future_reason(name,
                                                                             scope_name))
@@ -677,6 +747,8 @@ class SymbolicACI:
         Observability is gated by `_visible`; the three modes and why `object`
         exists are documented there.
         """
+        if self.obs_mode == "detect":
+            return self._observe_detect()
         here = self.world.room_of(self._at) if self._at else None
         names = [n for n in self.world.scope_names
                  if n != self.world.agent and self.world.is_real(n)
@@ -706,6 +778,47 @@ class SymbolicACI:
             out["geometry"] = "measured" if metric else "schematic"
         return out
 
+    def _observe_detect(self) -> dict:
+        """Detections in view -- scene furniture and task objects, undifferentiated.
+
+        This is the method that removes the object-scope oracle. `full`/`partial`/
+        `object`/`fov` all report the BDDL scope: median 9 objects out of the 260 in a
+        real scene, and precisely the 9 the task needs. Here the task objects arrive
+        mixed with the furniture and working out which is which is the policy's job.
+
+        No name, no instance index, no `is_near`, no `Cooked` -- `0815 - interface
+        audit` records why none of those could come from a camera.
+        """
+        from rlinf.envs.behavior.detect import detect, scene_furniture
+
+        entries = []
+        for name in self.world.scope_names:
+            if name == self.world.agent or not self.world.is_real(name):
+                continue
+            if self.world.enclosing_closed(name):
+                continue                  # a shut container hides its contents
+            pos = self.layout.pos(name)
+            if pos is None:
+                continue                  # substances have no location by construction
+            entries.append((f"scope:{name}", _word(synset_of(name)), pos,
+                            (0.15, 0.15, 0.15)))
+        for i, (cat, pos, ext) in enumerate(scene_furniture(self.layout.scene or "")):
+            entries.append((f"scene:{i}", cat, pos, ext))
+
+        self._dets = detect(self.view, entries)
+        self._det_epoch = self._view_epoch
+        return {
+            "obs_mode": "detect",
+            "view": self.view.state(),
+            "held": bool(self._held),
+            "geometry": "measured" if self.layout.is_real else "schematic",
+            "detections": [
+                {"det": d.det, "bbox": list(d.bbox), "category": d.category,
+                 "score": d.score}
+                for d in self._dets
+            ],
+        }
+
     # ------------------------------------------------------------------ #
     # navigation
     # ------------------------------------------------------------------ #
@@ -713,7 +826,8 @@ class SymbolicACI:
         args = {"name": name}
         scope_name = self._resolve(name)
         if scope_name is None:
-            return self._result(False, "go_to", args, f"no such object {name!r}")
+            return self._result(False, "go_to", args,
+                                self._resolve_error or f"no such object {name!r}")
         if not self.world.is_real(scope_name):
             return self._result(False, "go_to", args,
                                 self._future_reason(name, scope_name))
@@ -752,10 +866,11 @@ class SymbolicACI:
         expert plan stays valid and the 17 semantic tools keep their meaning. The only
         effect is on what the next `observe()` reports -- which is the point.
         """
-        if self.obs_mode != "fov":
+        if self.obs_mode not in ("fov", "detect"):
             return self._result(False, tool, {},
-                                f"{tool} is only available with obs_mode=fov")
+                                f"{tool} needs obs_mode=fov or detect")
         getattr(self.view, tool)()
+        self._view_epoch += 1          # every det handle just went stale
         st = self.view.state()
         return self._result(True, tool, {},
                             f"facing {st['facing_deg']} deg, "

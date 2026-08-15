@@ -27,6 +27,7 @@ provenance would trade months for a property the measurement does not need.
 """
 from __future__ import annotations
 
+import functools
 import glob
 import hashlib
 import json
@@ -66,6 +67,7 @@ class Layout:
     rooms: dict = field(default_factory=dict)      # room name -> (cx, cy)
     robot_xy: tuple = (0.0, 0.0)
     robot_yaw: float = 0.0
+    scene: str = ""                                 # scene_model, for furniture
 
     @property
     def is_real(self) -> bool:
@@ -88,9 +90,16 @@ def _find_instance(activity: str) -> Optional[str]:
     return max(hits, key=os.path.getmtime) if hits else None
 
 
+def _scene_of_path(path: str) -> str:
+    """`.../scenes/<scene_model>/json/...` -> scene_model."""
+    parts = path.split(os.sep)
+    return parts[parts.index("scenes") + 1] if "scenes" in parts else ""
+
+
 def _from_instance(activity: str, path: str) -> Layout:
     raw = json.load(open(path))
-    lay = Layout(activity=activity, source="sampled")
+    lay = Layout(activity=activity, source="sampled",
+                 scene=_scene_of_path(path))
     for name, entry in raw.items():
         if name == "robot_poses":
             # Present in official instances, absent from ours -- the generator sets
@@ -131,14 +140,46 @@ def _anchors(world: SymbolicWorld) -> list:
                   and (n in world.rooms or "sceneObject" in properties_of(n)))
 
 
+@functools.lru_cache(maxsize=8)
+def _scene_room_centroids(scene_model: str) -> dict:
+    """room type -> (x, y) centroid of that room's objects in the real scene."""
+    if not scene_model:
+        return {}
+    hits = glob.glob(os.path.join(
+        "/data/behavior-data/behavior-1k-assets/scenes", scene_model, "json",
+        f"{scene_model}_best.json"))
+    if not hits:
+        return {}
+    d = json.load(open(hits[0]))
+    reg = d.get("state", {}).get("registry", {}).get("object_registry", {})
+    acc: dict = defaultdict(list)
+    for name, info in d.get("objects_info", {}).get("init_info", {}).items():
+        pos = (reg.get(name) or {}).get("root_link", {}).get("pos")
+        if not pos:
+            continue
+        for r in (info.get("args", {}).get("in_rooms") or []):
+            acc[str(r).rsplit("_", 1)[0]].append((float(pos[0]), float(pos[1])))
+    return {r: (sum(x for x, _ in v) / len(v), sum(y for _, y in v) / len(v))
+            for r, v in acc.items() if v}
+
+
 def _generated(activity: str, world: SymbolicWorld) -> Layout:
-    lay = Layout(activity=activity, source="generated")
+    # Distractors come from a REAL scene even when the task objects do not:
+    # `detect` mode needs furniture, and inventing furniture would be a second
+    # fabrication on top of the generated positions.
+    lay = Layout(activity=activity, source="generated",
+                 scene="house_single_floor")
     jitter = _rng(activity)
 
-    # Rooms on a row, each its own rectangle.
+    # Rooms are placed at the REAL scene's room centroids when the scene has a room of
+    # that type, and on a fallback row otherwise. Without this the generated task
+    # objects and the scene furniture live in two unrelated coordinate frames, and
+    # `detect` mode reports a robot standing among furniture it is nowhere near.
     rooms = sorted(set(world.rooms.values())) or ["room"]
+    real = _scene_room_centroids(lay.scene)
     for i, room in enumerate(rooms):
-        lay.rooms[room] = (i * (ROOM_W + ROOM_GAP) + ROOM_W / 2, ROOM_H / 2)
+        lay.rooms[room] = real.get(room) or (
+            i * (ROOM_W + ROOM_GAP) + ROOM_W / 2, ROOM_H / 2)
 
     # Anchors spread inside their room on a coarse grid, so two pieces of furniture
     # never coincide and the agent has somewhere to walk between them.

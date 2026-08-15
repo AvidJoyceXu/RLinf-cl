@@ -38,24 +38,41 @@ TURNS_PER_SWEEP = 4          # 4 x 90 degrees = full circle
 PITCHES = (0, -1)
 
 
-def sweep(aci: SymbolicACI) -> int:
-    """Turn a full circle at three pitches. Returns steps spent."""
+def sweep(aci: SymbolicACI, on_view=None) -> int:
+    """Turn a full circle at every pitch. Returns steps spent.
+
+    @on_view is called after each `observe`, because in `detect` mode the ACI keeps
+    only the LAST observation -- harvesting after the sweep returns would see one
+    view out of eight. That bug cost a solvability audit reading 0 found when the
+    objects were plainly visible mid-sweep.
+    """
     steps = 0
     for pitch in PITCHES:
         if pitch == -1:
-            aci.look_down(); steps += 1
+            aci.look_down()
+            steps += 1
         for _ in range(TURNS_PER_SWEEP):
-            aci.observe(); steps += 1
-            aci.turn_left(); steps += 1
+            aci.observe()
+            steps += 1
+            if on_view is not None:
+                on_view()
+            aci.turn_left()
+            steps += 1
     aci.look_up()            # back to level
     return steps + 1
 
 
 def explore(activity: str, layout_prefer: str = "generated",
-            budget: int = 400) -> dict:
-    """Search until nothing new is found or the budget runs out."""
+            budget: int = 400, obs_mode: str = "fov") -> dict:
+    """Search until nothing new is found or the budget runs out.
+
+    @obs_mode "fov" tracks `view.seen` (scope names, because the mode still reports
+    them); "detect" has no names, so what counts as "found" is a task object that
+    appeared as a DETECTION -- which is the honest analogue and the only thing a
+    policy could act on.
+    """
     world = SymbolicWorld(activity)
-    aci = SymbolicACI(world, obs_mode="fov", layout_prefer=layout_prefer)
+    aci = SymbolicACI(world, obs_mode=obs_mode, layout_prefer=layout_prefer)
     targets = {n for n in world.scope_names
                if n != world.agent and world.is_real(n)}
     # Substances with no host have no coordinates and are always reported; counting
@@ -65,6 +82,8 @@ def explore(activity: str, layout_prefer: str = "generated",
 
     steps = sweep(aci)
     visited: set = set()
+    if obs_mode == "detect":
+        return _explore_detect(world, aci, locatable, steps, budget)
     while steps < budget:
         frontier = [n for n in aci.view.seen if n not in visited
                     and aci.layout.pos(n) is not None]
@@ -105,6 +124,56 @@ def explore(activity: str, layout_prefer: str = "generated",
     }
 
 
+def _explore_detect(world, aci, locatable, steps, budget) -> dict:
+    """Frontier expansion when selection is spatial rather than by name.
+
+    Everything the fov search does by name is done here by handle: go to a detection,
+    open it if it is shut, sweep again. The one asymmetry is that a handle dies the
+    moment the camera moves, so the target must be re-acquired after arriving --
+    which is the cost the design intends, not a workaround.
+    """
+    found, visited = set(), set()
+
+    def harvest():
+        for d in aci._dets:
+            if d.key.startswith("scope:"):
+                found.add(d.key[len("scope:"):])
+
+    steps += sweep(aci, on_view=harvest)
+    while steps < budget and not locatable <= found:
+        target = None
+        aci.observe()
+        steps += 1
+        harvest()
+        for d in aci._dets:
+            if d.key not in visited:
+                target, visited = d, visited | {d.key}
+                break
+        if target is None:
+            break
+        if aci.go_to(target.det).ok:
+            steps += 1
+            aci.observe()
+            steps += 1
+            harvest()
+            shut = [x for x in aci._dets
+                    if x.key.startswith("scope:")
+                    and "openable" in properties_of(x.key[len("scope:"):])]
+            for x in shut[:1]:
+                aci.open(x.det)
+                steps += 1
+            steps += sweep(aci, on_view=harvest)
+        else:
+            steps += 1
+    return {
+        "activity": world.activity, "source": aci.layout.source,
+        "locatable": len(locatable), "found": len(found & locatable),
+        "complete": locatable <= found, "steps": steps,
+        "missing": sorted(world.to_display.get(n, n)
+                          for n in (locatable - found))[:5],
+    }
+
+
 def _main() -> None:
     import argparse
     ap = argparse.ArgumentParser(description=__doc__)
@@ -113,10 +182,12 @@ def _main() -> None:
     ap.add_argument("--n", type=int, default=0, help="limit --all to the first N")
     ap.add_argument("--prefer", default="generated", choices=["sampled", "generated"])
     ap.add_argument("--budget", type=int, default=400)
+    ap.add_argument("--obs-mode", default="fov", choices=["fov", "detect"])
     args = ap.parse_args()
 
     if not args.all:
-        print(json.dumps(explore(args.activity, args.prefer, args.budget), indent=1))
+        print(json.dumps(explore(args.activity, args.prefer, args.budget,
+                                 args.obs_mode), indent=1))
         return
 
     acts = json.load(open("/data/behavior-data/tw_verified.json"))["solved"]
@@ -126,8 +197,8 @@ def _main() -> None:
     steps_ok, worst = [], []
     for a in acts:
         try:
-            r = explore(a, args.prefer, args.budget)
-        except Exception as ex:                                    # noqa: BLE001
+            r = explore(a, args.prefer, args.budget, args.obs_mode)
+        except Exception:                                          # noqa: BLE001
             fail += 1
             continue
         if r["complete"]:
