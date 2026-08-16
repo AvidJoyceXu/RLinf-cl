@@ -65,6 +65,7 @@ are where the symbolic layer is genuinely a different task.
 """
 from __future__ import annotations
 
+import dataclasses
 import functools
 import json
 import math
@@ -466,9 +467,25 @@ class SymbolicACI:
     loop are unchanged and the SFT cold start transfers.
     """
 
+    # The observation modes form a 2x2 over the two things `detect` changed at once.
+    # `detect` measured -0.677 against `fov` (0816), but it moved BOTH axes, so the
+    # two middle cells exist to price them separately:
+    #
+    #                    addressed by NAME      addressed by HANDLE/BOX
+    #   scope only       fov                    detect_scope
+    #   + furniture      fov_distract           detect
+    #
+    # Reading down a column isolates DISTRACTORS; reading across a row isolates
+    # REFERENCE RESOLUTION. Occlusion belongs to the detect family only, so it is
+    # constant within each row and within each column -- never a difference term.
+    CAMERA_MODES = ("fov", "fov_distract", "detect", "detect_scope")
+    DETECT_MODES = ("detect", "detect_scope")          # handle/box selection
+    DISTRACTOR_MODES = ("fov_distract", "detect")      # furniture is REPORTED
+    OBS_MODES = ("full", "partial", "object") + CAMERA_MODES
+
     def __init__(self, world: SymbolicWorld, obs_mode: str = "full",
                  layout_prefer: str = "sampled", reason_mode: str = "terse"):
-        assert obs_mode in ("full", "partial", "object", "fov", "detect"), obs_mode
+        assert obs_mode in self.OBS_MODES, obs_mode
         assert reason_mode in ("verbose", "terse", "silent"), reason_mode
         self.reason_mode = reason_mode
         self.world = world
@@ -485,38 +502,70 @@ class SymbolicACI:
         # is what keeps the 0801 baselines reproducible.
         self.layout = None
         self.view = None
-        self._dets: list = []          # detect mode: last observation
+        self._dets: list = []          # detect modes: last observation
         self._view_epoch = 0           # bumped by any camera mutation
         self._det_epoch = -1           # epoch the handles in `_dets` belong to
-        if obs_mode in ("fov", "detect"):
+        self._furn: dict = {}          # fov_distract: display name -> SceneObject
+        if obs_mode in self.CAMERA_MODES:
             from rlinf.envs.behavior.layout import build_layout
             from rlinf.envs.behavior.viewpoint import Viewpoint
             self.layout = build_layout(world.activity, world, prefer=layout_prefer)
-            if obs_mode == "detect" and not self.layout.is_real:
-                # NO INVENTED POSES IN `detect`. Every pose must come from BEHAVIOR's
-                # sampler, which is the only source that puts task objects in the
-                # SCENE's frame and satisfies the BDDL initial conditions
-                # geometrically. A generated layout satisfies neither: `inside(can,
-                # ashcan)` can hold symbolically while the can sits three metres away,
-                # and mixing invented task poses with real furniture makes every
-                # occlusion and every bearing an accident. `fov` tolerates a generated
-                # layout because it reports no furniture and claims no scene; `detect`
-                # cannot.
+            if obs_mode != "fov" and not self.layout.is_real:
+                # NO INVENTED POSES ONCE THE SCENE IS INVOLVED. Every pose must come
+                # from BEHAVIOR's sampler, which is the only source that puts task
+                # objects in the SCENE's frame and satisfies the BDDL initial
+                # conditions geometrically. A generated layout satisfies neither:
+                # `inside(can, ashcan)` can hold symbolically while the can sits three
+                # metres away, and mixing invented task poses with real furniture makes
+                # every occlusion and every bearing an accident. Plain `fov` tolerates
+                # a generated layout because it reports no furniture and claims no
+                # scene; the other three all read the scene json and cannot.
                 raise ValueError(
-                    f"obs_mode=detect requires a sampled instance for "
+                    f"obs_mode={obs_mode} requires a sampled instance for "
                     f"{world.activity!r}; none found. Generate one with "
                     f"rlinf/envs/behavior/instance_generator.py.")
             self.view = Viewpoint(x=self.layout.robot_xy[0], y=self.layout.robot_xy[1])
+            if obs_mode == "fov_distract":
+                self._furn = self._name_furniture()
 
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
+    def _name_furniture(self) -> dict:
+        """Scene furniture -> the display names `fov_distract` reports it under.
+
+        The scene json calls a cabinet `bottom_cabinet_pkdnbu_0` -- a name carrying an
+        asset model id, which a scope object's `ashcan_1` never does. Reporting that
+        raw would hand the policy a FORMAT that separates distractor from task object
+        without reading either, and the arm would measure nothing. So furniture is
+        renamed into exactly the scope's `<category>_<n>` shape, with the counter
+        skipping any name the scope already claims -- an `ashcan_1` in the goal and an
+        `ashcan_1` on the floor would be a genuine ambiguity we did not intend to test.
+
+        This renames; it invents nothing. Category, room, pose and open state below are
+        all read from the shipped scene json.
+        """
+        from rlinf.envs.behavior.detect import scene_furniture
+
+        out: dict = {}
+        counter: dict = {}
+        for so in scene_furniture(self.layout.scene or ""):
+            n = counter.get(so.category, 0)
+            while True:
+                n += 1
+                disp = f"{so.category}_{n}"
+                if disp not in self.world.from_display and disp not in out:
+                    break
+            counter[so.category] = n
+            out[disp] = so
+        return out
+
     def _resolve(self, name) -> Optional[str]:
         """Selection -> scope name, or None.
 
-        In `detect` mode the argument is a view-local handle (`"d3"`) or a box
-        (`"118,96,171,148"`), never an object name -- names are the leak this mode
-        exists to remove. Routing it through here rather than through each tool is
+        In the `detect` family the argument is a view-local handle (`"d3"`) or a box
+        (`"118,96,171,148"`), never an object name -- names are the leak those modes
+        exist to remove. Routing it through here rather than through each tool is
         what lets all 17 tool signatures stay unchanged, so expert plans and the SFT
         schema are untouched.
 
@@ -527,7 +576,7 @@ class SymbolicACI:
         self._resolve_error = None
         if not isinstance(name, str):
             return None
-        if self.obs_mode == "detect":
+        if self.obs_mode in self.DETECT_MODES:
             from rlinf.envs.behavior.detect import resolve as _resolve_det
             if self._det_epoch != self._view_epoch:
                 self._resolve_error = ("your last observation is stale; "
@@ -540,6 +589,8 @@ class SymbolicACI:
             # Scene furniture is selectable and real, but has no BDDL identity, so no
             # tool can act on it. Saying so is honest; silently treating it as
             # "no such object" would hide that the policy pointed at a real thing.
+            # Unreachable under `detect_scope`, which reports no furniture -- kept
+            # anyway so the two modes differ in what is REPORTED and nothing else.
             if not det.key.startswith("scope:"):
                 self._resolve_error = (f"that is a {det.category}; it is scene furniture "
                                        f"and no tool applies to it")
@@ -549,6 +600,14 @@ class SymbolicACI:
             return self.world.from_display[name]
         if name in self.world.scope:
             return name
+        # Furniture is namable under `fov_distract` and is refused in the same words
+        # `detect` uses, so a distractor costs the policy the same acknowledged dead
+        # end in both. Checked AFTER the scope, so a name the scope claims is never
+        # shadowed.
+        if name in self._furn:
+            self._resolve_error = (f"that is a {self._furn[name].category}; it is scene "
+                                   f"furniture and no tool applies to it")
+            return None
         return None
 
     def _disp(self, scope_name: Optional[str]) -> Optional[str]:
@@ -589,7 +648,7 @@ class SymbolicACI:
         # is the context cost we are trying to make the policy *choose* to pay, and
         # re-running `observe()` here silently re-issued the view-local handles, so
         # `turn_left` refreshed the very handles it was supposed to invalidate.
-        obs = None if self.obs_mode == "detect" else self.observe()
+        obs = None if self.obs_mode in self.DETECT_MODES else self.observe()
         return ToolResult(ok=ok, tool=tool, args=args,
                           reason=reason if ok else self._refusal(reason),
                           observation=obs)
@@ -730,7 +789,7 @@ class SymbolicACI:
             return True
         if self.obs_mode == "full":
             return True
-        if self.obs_mode == "fov":
+        if self.obs_mode in ("fov", "fov_distract"):
             # Shut containers hide their contents here too: a camera cannot see
             # through a closed fridge door any more than `object` mode can.
             if self.world.enclosing_closed(name):
@@ -761,7 +820,7 @@ class SymbolicACI:
         Observability is gated by `_visible`; the three modes and why `object`
         exists are documented there.
         """
-        if self.obs_mode == "detect":
+        if self.obs_mode in self.DETECT_MODES:
             return self._observe_detect()
         here = self.world.room_of(self._at) if self._at else None
         names = [n for n in self.world.scope_names
@@ -775,7 +834,7 @@ class SymbolicACI:
             "room": here,
             "objects": objs,
         }
-        if self.obs_mode == "fov":
+        if self.obs_mode in ("fov", "fov_distract"):
             # Remember what has been seen: `go_to` refuses an unseen target, so this
             # set is the record of what discovery has bought. Held and current-anchor
             # objects come through `_visible` too, so they land here as well.
@@ -790,7 +849,53 @@ class SymbolicACI:
             # be reading an invention; under `generated` no metre value is emitted at
             # all, and this field says why.
             out["geometry"] = "measured" if metric else "schematic"
+            if self.obs_mode == "fov_distract":
+                out["objects"] = self._merge_furniture(objs, names)
         return out
+
+    def _merge_furniture(self, objs: list, names: list) -> list:
+        """`fov_distract`: the scene's own furniture, reported alongside the scope.
+
+        This is `detect`'s distractor axis WITHOUT its selection axis -- furniture
+        arrives mixed in, and everything is still addressed by name. Together with
+        `detect_scope` it splits the -0.677 that `detect` measured as one number.
+
+        Sorted by distance, both halves together. Appending furniture as a trailing
+        block would let the policy find the task objects by POSITION in the list and
+        never read a category, which is the whole thing this arm is trying to make it
+        do. Plain `fov` keeps its original order untouched, because its 0.871 is a
+        reported baseline; that ordering difference is a real, if small, second
+        difference between the two arms and is recorded as one.
+        """
+        rows = list(objs)
+        for name, so in self._furn.items():
+            if not self.view.in_view(so.pos):
+                continue
+            # Key ORDER matters, not just key set: these dicts are serialised to JSON
+            # with insertion order preserved, so a furniture row whose `where` came
+            # before its `room` would be separable from a scope row by field order
+            # alone -- a tell that needs no reading of any value. Same reason
+            # `in_rooms` loses its index below: the scope side reports `living_room`
+            # from the BDDL annotation, and `living_room_0` would be a giveaway of a
+            # different kind. Both are presentation, and neither changes a fact.
+            rep = {"name": name, "category": so.category, "is_near": False,
+                   "states": ({"Open": so.is_open} if so.openable else {})}
+            if so.room:
+                rep["room"] = so.room.rsplit("_", 1)[0] if so.room[-1].isdigit() \
+                    else so.room
+            rep["where"] = self.view.describe(so.pos, self.layout.is_real)
+            rows.append(rep)
+        pos_of = {n: self.layout.pos(n) for n in names}
+
+        def _key(rep):
+            p = (self._furn[rep["name"]].pos if rep["name"] in self._furn
+                 else pos_of.get(self.world.from_display.get(rep["name"])))
+            # No coordinates (an unlocalized substance) sorts last rather than
+            # crashing or being given an invented distance.
+            return (1, 0.0) if p is None else (0, self.view.range_to(p))
+
+        rows.sort(key=_key)
+        return rows
 
     def _observe_detect(self) -> dict:
         """Detections in view -- scene furniture and task objects, undifferentiated.
@@ -802,6 +907,13 @@ class SymbolicACI:
 
         No name, no instance index, no `is_near`, no `Cooked` -- `0815 - interface
         audit` records why none of those could come from a camera.
+
+        `detect_scope` reports the scope only, and is the control that prices the
+        selection mechanism on its own. Furniture still enters the projection there
+        and still OCCLUDES; it is dropped after `detect()` has run, so the two modes
+        differ in what is reported and in nothing else. Removing furniture from the
+        entry list instead would have quietly removed every occluder too, and the
+        comparison would have been against a mode that is easier for a second reason.
         """
         from rlinf.envs.behavior.detect import (
             detect,
@@ -838,13 +950,21 @@ class SymbolicACI:
             off = offset_for_model(models[name]) if name in models else (0.0, 0.0, 0.0)
             centre = tuple(pos[k] + off[k] for k in range(3))
             entries.append((f"scope:{name}", cat, centre, ext))
-        for i, (cat, pos, ext) in enumerate(scene_furniture(self.layout.scene or "")):
-            entries.append((f"scene:{i}", cat, pos, ext))
+        for i, so in enumerate(scene_furniture(self.layout.scene or "")):
+            entries.append((f"scene:{i}", so.category, so.pos, so.extent))
 
-        self._dets = detect(self.view, entries)
+        dets = detect(self.view, entries)
+        if self.obs_mode == "detect_scope":
+            kept = [d for d in dets if d.key.startswith("scope:")]
+            # Renumber, or the handles carry gaps (d2, d5, d9) that leak how many
+            # detections were withheld -- and the count of hidden furniture is a
+            # signal `detect` does not give either.
+            dets = [dataclasses.replace(d, det=f"d{i + 1}")
+                    for i, d in enumerate(kept)]
+        self._dets = dets
         self._det_epoch = self._view_epoch
         return {
-            "obs_mode": "detect",
+            "obs_mode": self.obs_mode,
             "view": self.view.state(),
             "held": bool(self._held),
             "geometry": "measured" if self.layout.is_real else "schematic",
@@ -867,7 +987,7 @@ class SymbolicACI:
         if not self.world.is_real(scope_name):
             return self._result(False, "go_to", args,
                                 self._future_reason(name, scope_name))
-        if self.obs_mode == "fov" and scope_name not in self.view.seen:
+        if self.obs_mode in ("fov", "fov_distract") and scope_name not in self.view.seen:
             # You cannot navigate to what you have not found. This is the whole point
             # of the mode: navigation stays an oracle, DISCOVERY does not. Without it
             # the policy reads a name out of the goal and teleports to it, and the
@@ -883,13 +1003,27 @@ class SymbolicACI:
         self.world.clear_position(self.world.agent)
         if ground is not None and ground != self.world.agent:
             self.world.sim.set_ontop((self.world.agent, ground), True)
-        if self.obs_mode == "fov":
+        if self.obs_mode in self.CAMERA_MODES:
             # Arriving puts the camera at the object, facing it. Navigation is still
             # the oracle; only finding the target was work.
+            #
+            # THIS USED TO BE `fov` ONLY, and that was an omission rather than a
+            # decision. Under `detect` the robot navigated symbolically while the
+            # camera stayed where it was, so reaching a new part of the house meant
+            # walking it in 0.5 m `move_ahead` steps -- 17 of 31 episodes hit the
+            # 400-turn budget at a mean of 266 steps, and that number was pricing
+            # NAVIGATION, not identification. The two families now share one
+            # navigation model, which is what makes a cross-family comparison mean
+            # anything. It also supersedes the `detect` = 0.194 of 0816; that arm is
+            # re-run rather than quoted.
             pos = self.layout.pos(scope_name)
             if pos is not None:
                 yaw = math.atan2(pos[1] - self.view.y, pos[0] - self.view.x)
                 self.view.teleport(pos[0], pos[1], yaw)
+                if self.obs_mode in self.DETECT_MODES:
+                    # The camera moved, so every handle in the last observation
+                    # refers to a frame that no longer exists.
+                    self._view_epoch += 1
         return self._result(True, "go_to", args, f"now at {name}")
 
     # ------------------------------------------------------------------ #
@@ -902,9 +1036,10 @@ class SymbolicACI:
         expert plan stays valid and the 17 semantic tools keep their meaning. The only
         effect is on what the next `observe()` reports -- which is the point.
         """
-        if self.obs_mode not in ("fov", "detect"):
+        if self.obs_mode not in self.CAMERA_MODES:
             return self._result(False, tool, {},
-                                f"{tool} needs obs_mode=fov or detect")
+                                f"{tool} needs obs_mode="
+                                f"{'|'.join(self.CAMERA_MODES)}")
         getattr(self.view, tool)()
         self._view_epoch += 1          # every det handle just went stale
         st = self.view.state()

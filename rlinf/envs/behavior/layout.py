@@ -68,6 +68,7 @@ class Layout:
     robot_xy: tuple = (0.0, 0.0)
     robot_yaw: float = 0.0
     scene: str = ""                                 # scene_model, for furniture
+    instance_path: str = ""                         # the tro_state file, for models
 
     @property
     def is_real(self) -> bool:
@@ -91,15 +92,32 @@ def _find_instance(activity: str) -> Optional[str]:
 
 
 def _scene_of_path(path: str) -> str:
-    """`.../scenes/<scene_model>/json/...` -> scene_model."""
+    """scene_model for an instance file, from its directory or its name.
+
+    Official instances live under `.../scenes/<scene_model>/json/...`. Instances our
+    own generator wrote live under `<out_dir>/<activity>/`, where the only record of
+    the scene is the filename prefix:
+
+        house_double_floor_lower_task_assembling_gift_baskets_0_0_template-tro_state.json
+        |________ scene_model ________|
+
+    Getting this wrong is not cosmetic. `detect` mixes task-object poses with scene
+    furniture, and with no scene there is no furniture -- the mode degrades silently
+    to reporting only the task objects, which is the oracle it exists to remove.
+    """
     parts = path.split(os.sep)
-    return parts[parts.index("scenes") + 1] if "scenes" in parts else ""
+    if "scenes" in parts:
+        return parts[parts.index("scenes") + 1]
+    base = os.path.basename(path)
+    if "_task_" in base:
+        return base.split("_task_")[0]
+    return ""
 
 
 def _from_instance(activity: str, path: str) -> Layout:
     raw = json.load(open(path))
     lay = Layout(activity=activity, source="sampled",
-                 scene=_scene_of_path(path))
+                 scene=_scene_of_path(path), instance_path=path)
     for name, entry in raw.items():
         if name == "robot_poses":
             # Present in official instances, absent from ours -- the generator sets
@@ -164,6 +182,16 @@ def _scene_room_centroids(scene_model: str) -> dict:
 
 
 def _generated(activity: str, world: SymbolicWorld) -> Layout:
+    """INVENTED positions. Not BEHAVIOR's geometry and never to be reported as such.
+
+    Reachable only by asking for it explicitly (`prefer="generated"`); every default in
+    this codebase is `sampled`. Kept for one narrow purpose -- a layout for an activity
+    that has no sampled instance, where nothing reads coordinates as physical fact.
+    It fails two things a real layout satisfies: the positions are in an invented frame
+    rather than the scene's, and the BDDL initial conditions do not hold geometrically,
+    so `inside(can, ashcan)` can be true in the literal set while the can sits three
+    metres away. `obs_mode=detect` therefore refuses it outright.
+    """
     # Distractors come from a REAL scene even when the task objects do not:
     # `detect` mode needs furniture, and inventing furniture would be a second
     # fabrication on top of the generated positions.

@@ -23,6 +23,12 @@ no missed object; categories are always correct; and `score` is a geometric quan
 simulated perception interface, not a perception system. Noise -- drop rate, label
 swap, box jitter -- is a staged upgrade measured against this baseline, kept separate
 so "identification is hard" never gets confounded with "our noise model is hard".
+
+`detect` changes TWO things at once against `fov` -- the scene's furniture starts being
+reported, and objects stop being addressable by name -- so the measured -0.677 is a
+joint effect. `scene_furniture` therefore feeds two consumers now: this module's
+projection, and `symbolic_world`'s `fov_distract`, which reports the same furniture
+BY NAME. See `0816 - separating distractors from reference resolution`.
 """
 from __future__ import annotations
 
@@ -148,9 +154,29 @@ class Detection:
     depth: float                 # camera-space distance, for occlusion ordering
 
 
+@dataclass(frozen=True)
+class SceneObject:
+    """One piece of scene furniture, entirely as recorded in the scene json."""
+    name: str                    # scene registry name, e.g. "bottom_cabinet_pkdnbu_0"
+    category: str
+    pos: tuple                   # bbox centre = root_link pos + scaled offset
+    extent: tuple                # half-extent
+    room: str | None             # `args.in_rooms[0]`
+    openable: bool               # the asset has articulated joints
+    is_open: bool                # any joint away from rest, see JOINT_OPEN_EPS
+
+
+# A scene object's `joint_pos` is recorded in the scene json. `_best.json` is a
+# settled scene, so a shut cabinet reads ~0.002 rather than exactly 0. OmniGibson's
+# own `Open` compares against a FRACTION of each joint's range, which we would have to
+# read from the asset; an absolute threshold is a simplification, and it is named as
+# one. It is still a measurement of a recorded quantity, not an invented state.
+JOINT_OPEN_EPS = 0.05
+
+
 @functools.lru_cache(maxsize=8)
 def scene_furniture(scene_model: str) -> tuple:
-    """Every non-`stuff` object in a BEHAVIOR scene as (category, pos, extent).
+    """Every non-`stuff` object in a BEHAVIOR scene, as `SceneObject`s.
 
     These are the distractors, and they are REAL -- read from the shipped scene json,
     not invented. Only the task objects' positions may come from a sampled instance.
@@ -169,7 +195,8 @@ def scene_furniture(scene_model: str) -> tuple:
         cat = args.get("category")
         if not cat or cat in STUFF_CATEGORIES:
             continue
-        pos = (reg.get(name) or {}).get("root_link", {}).get("pos")
+        st = reg.get(name) or {}
+        pos = st.get("root_link", {}).get("pos")
         if not pos:
             continue
         # TRUE size: the asset's own native bbox for THIS model, times the instance's
@@ -182,7 +209,13 @@ def scene_furniture(scene_model: str) -> tuple:
                     for b, v in zip(base["bbox"], sc))
         off = base.get("offset") or (0.0, 0.0, 0.0)
         centre = tuple(float(pos[k]) + float(off[k]) * float(sc[k]) for k in range(3))
-        out.append((cat, centre, ext))
+        jp = st.get("joint_pos") or []
+        rooms = args.get("in_rooms") or []
+        out.append(SceneObject(
+            name=name, category=cat, pos=centre, extent=ext,
+            room=str(rooms[0]) if rooms else None,
+            openable=bool(jp),
+            is_open=any(abs(float(v)) > JOINT_OPEN_EPS for v in jp)))
     return tuple(out)
 
 

@@ -52,9 +52,14 @@ _NAME = {"name": {"type": "string", "description": "sim object name, as reported
 _SYS = {"system_name": {"type": "string", "description": "particle/substance system name"}}
 
 
-def tool_schemas() -> list[dict]:
-    """The BEHAVIOR semantic-tool schema. Order is stable (sidecar determinism)."""
-    return [
+def tool_schemas(minimal: bool = False) -> list[dict]:
+    """The BEHAVIOR semantic-tool schema. Order is stable (sidecar determinism).
+
+    @minimal strips the procedural clauses from the descriptions -- see
+    `_MINIMAL_DESCRIPTIONS`. The parameters are untouched, so the same calls
+    validate either way and only the guidance changes.
+    """
+    out = [
         {"name": "observe",
          "description": "Return a symbolic observation of task-relevant objects "
                         "(names, categories, positions, states, what is held). "
@@ -115,6 +120,11 @@ def tool_schemas() -> list[dict]:
          "description": "Declare the task complete. Call when the goal is achieved.",
          "parameters": _obj({}, [])},
     ]
+    if minimal:
+        for t in out:
+            if t["name"] in _MINIMAL_DESCRIPTIONS:
+                t["description"] = _MINIMAL_DESCRIPTIONS[t["name"]]
+    return out
 
 
 # The camera primitives are a SEPARATE group, offered only under `obs_mode=fov`. They
@@ -126,10 +136,10 @@ def camera_schemas() -> list[dict]:
     """Viewpoint control. Order is stable, same as `tool_schemas`."""
     return [
         {"name": "turn_left",
-         "description": "Rotate the camera 45 degrees to the left, in place.",
+         "description": "Rotate the camera 90 degrees to the left, in place.",
          "parameters": _obj({}, [])},
         {"name": "turn_right",
-         "description": "Rotate the camera 45 degrees to the right, in place.",
+         "description": "Rotate the camera 90 degrees to the right, in place.",
          "parameters": _obj({}, [])},
         {"name": "move_ahead",
          "description": "Step 0.5 m in the direction you are facing.",
@@ -144,9 +154,13 @@ def camera_schemas() -> list[dict]:
     ]
 
 
-def all_schemas(obs_mode: str = "full") -> list[dict]:
+CAMERA_OBS_MODES = ("fov", "fov_distract", "detect", "detect_scope")
+
+
+def all_schemas(obs_mode: str = "full", minimal: bool = False) -> list[dict]:
     """Every tool the policy may call under @obs_mode."""
-    return tool_schemas() + (camera_schemas() if obs_mode == "fov" else [])
+    return (tool_schemas(minimal)
+            + (camera_schemas() if obs_mode in CAMERA_OBS_MODES else []))
 
 
 def dump_tool_schemas(path: str) -> None:
@@ -169,6 +183,45 @@ BEHAVIOR_SYSTEM_PROMPT = (
     "`end_task`."
 )
 
+# E1 (brainstorm/260815): the prompt above is a skill.md and we wrote it. Skill1's
+# ALFWorld ablation prices procedural knowledge in context at 16.6 points (97.5 ->
+# 80.9 without the library), and the prompt above states the control loop, the
+# proximity precondition, the one real ordering constraint and the termination rule.
+# Every observability condition we then added shipped with a matching hint, so we
+# introduced a difficulty and published its solution together, then measured that it
+# was not difficult.
+#
+# The line drawn here is INTERFACE vs DOMAIN. Kept: you are a robot, you call one tool
+# per turn -- harness facts the policy cannot infer and which are not what we claim to
+# measure. Removed: what to call first, what must precede what, what order containers
+# want, when to stop. Those are the plan.
+BEHAVIOR_SYSTEM_PROMPT_MINIMAL = (
+    "You are an embodied household robot in a simulated home. You act over multiple "
+    "turns, calling exactly one tool per turn."
+)
+
+# Same cut applied to the tool schema. A description may say what a tool DOES; it may
+# not say when to call it or what it requires. "nearby" goes too -- it is the
+# proximity precondition restated.
+_MINIMAL_DESCRIPTIONS = {
+    "observe": "Return a symbolic observation of task-relevant objects (names, "
+               "categories, positions, states, what is held).",
+    "go_to": "Navigate the robot base next to an object, facing it.",
+    "grasp": "Pick up an object.",
+    "open": "Open an openable container (e.g. fridge, cabinet).",
+    "close": "Close an openable container.",
+    "toggle_on": "Turn a toggleable device on.",
+    "toggle_off": "Turn a toggleable device off.",
+    "cook": "Cook a cookable object.",
+    "spray": "Cover an object with a substance system.",
+    "uncover": "Remove a substance system from an object.",
+    "fill": "Fill a container with a particle/fluid system.",
+    "slice": "Slice a sliceable object into its halves.",
+    "dice": "Mince an object into its diced particle system.",
+    "end_task": "Declare the task complete.",
+}
+
+
 
 def goal_atoms_to_lines(atoms: Any) -> list[str]:
     """Render BDDL ground goal atoms as readable ``pred(arg, ...)`` lines.
@@ -190,7 +243,8 @@ def goal_atoms_to_lines(atoms: Any) -> list[str]:
 
 def build_prompt_messages(activity: str, goal_lines: list[str],
                           obs_mode: str = "full",
-                          goal_nl: str | None = None) -> list[dict]:
+                          goal_nl: str | None = None,
+                          prompt_mode: str = "guided") -> list[dict]:
     """The one prompt builder, shared by the SFT harvester and the GRPO rollout.
 
     ``goal_nl`` selects the **natural-language goal condition** (see
@@ -212,25 +266,57 @@ def build_prompt_messages(activity: str, goal_lines: list[str],
     # objects matter. `full` and `partial` keep a byte-identical prompt so the
     # measured 0801 numbers stay comparable.
     obs_line = f"Observability: {obs_mode}"
-    if obs_mode == "object":
+    if prompt_mode == "minimal":
+        # The per-mode clauses below are the per-condition skill entries: each one
+        # names the tool that defeats the gate it describes. Under `minimal` the
+        # policy is told WHICH mode it is in and must work out what that implies.
+        pass
+    elif obs_mode == "object":
         obs_line += (" -- you see only what is in this room and not shut inside a "
                      "closed container; open a container to see what is in it")
-    elif obs_mode == "fov":
-        # Same principle as `object`: state the RULE, never the contents. Telling the
-        # policy that it has a camera and must aim it is not goal leakage -- it names
-        # no object. Withholding it would test whether the policy guesses the
-        # interface, which is not the question.
-        obs_line += (" -- you see only what is in the camera's field of view. Use "
-                     "turn_left / turn_right to sweep, move_ahead to approach, "
-                     "look_down for low surfaces, then observe again. You can only "
-                     "go_to an object you have already seen.")
+    elif obs_mode in CAMERA_OBS_MODES and prompt_mode == "guided":
+        # State the INTERFACE, never the contents. A policy cannot infer that objects
+        # are addressed by detection handle rather than by name, and testing whether it
+        # guesses our calling convention is not the question. It is told nothing about
+        # WHICH objects matter, which is the part that is hard and the part no
+        # sentence can give away.
+        #
+        # The four clauses are assembled from shared pieces ON PURPOSE. These modes
+        # form a 2x2 (see `SymbolicACI.OBS_MODES`) and the whole experiment is a
+        # difference between two of them, so the prompts must differ by exactly the
+        # sentence that describes the axis being varied -- and by nothing else. Four
+        # independently written paragraphs would have made the prompt a fifth
+        # uncontrolled variable.
+        SWEEP = ("Use turn_left / turn_right to sweep, move_ahead to approach, "
+                 "look_down for low surfaces, then observe again.")
+        # The distractor axis.
+        MIXED = ("Scene furniture and task objects are both reported and are not "
+                 "distinguished.")
+        if obs_mode in ("detect", "detect_scope"):
+            obs_line += (" -- observe() returns detections in the camera's view: a "
+                         "handle (d1, d2, ...), a bounding box, a category and a "
+                         "score. ")
+            if obs_mode == "detect":
+                obs_line += MIXED + " "
+            obs_line += ("Refer to an object by its handle, e.g. grasp(name='d3'), or "
+                         "by a box 'x0,y0,x1,y1'. A handle is valid only until the "
+                         "camera moves; observe again after turning or navigating. "
+                         + SWEEP)
+        else:
+            obs_line += " -- you see only what is in the camera's field of view. "
+            if obs_mode == "fov_distract":
+                obs_line += MIXED + " "
+            obs_line += (SWEEP + " You can only go_to an object you have already "
+                         "seen.")
     user = (
         f"Activity: {activity.replace('_', ' ')}\n"
         f"{obs_line}\n"
         f"{body}"
     )
     return [
-        {"role": "system", "content": BEHAVIOR_SYSTEM_PROMPT},
+        {"role": "system",
+         "content": (BEHAVIOR_SYSTEM_PROMPT_MINIMAL if prompt_mode == "minimal"
+                     else BEHAVIOR_SYSTEM_PROMPT)},
         {"role": "user", "content": user},
     ]
 

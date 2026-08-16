@@ -62,7 +62,7 @@ def sweep(aci: SymbolicACI, on_view=None) -> int:
     return steps + 1
 
 
-def explore(activity: str, layout_prefer: str = "generated",
+def explore(activity: str, layout_prefer: str = "sampled",
             budget: int = 400, obs_mode: str = "fov") -> dict:
     """Search until nothing new is found or the budget runs out.
 
@@ -82,7 +82,7 @@ def explore(activity: str, layout_prefer: str = "generated",
 
     steps = sweep(aci)
     visited: set = set()
-    if obs_mode == "detect":
+    if obs_mode in SymbolicACI.DETECT_MODES:
         return _explore_detect(world, aci, locatable, steps, budget)
     while steps < budget:
         frontier = [n for n in aci.view.seen if n not in visited
@@ -194,9 +194,10 @@ def _main() -> None:
     ap.add_argument("activity", nargs="?")
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--n", type=int, default=0, help="limit --all to the first N")
-    ap.add_argument("--prefer", default="generated", choices=["sampled", "generated"])
+    ap.add_argument("--prefer", default="sampled", choices=["sampled", "generated"])
     ap.add_argument("--budget", type=int, default=400)
-    ap.add_argument("--obs-mode", default="fov", choices=["fov", "detect"])
+    ap.add_argument("--obs-mode", default="fov",
+                    choices=["fov", "fov_distract", "detect_scope", "detect"])
     args = ap.parse_args()
 
     if not args.all:

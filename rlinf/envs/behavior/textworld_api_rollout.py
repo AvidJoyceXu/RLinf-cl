@@ -89,7 +89,7 @@ def _assistant_msg(msg, **extra) -> dict:
     return out
 
 
-def openai_tools() -> list[dict]:
+def openai_tools(obs_mode: str = "full", minimal: bool = False) -> list[dict]:
     """The same 17 schemas, in OpenAI function-calling shape.
 
     Sourced from `sft_build.tool_schemas()` so the API baseline and the RL policy
@@ -98,7 +98,7 @@ def openai_tools() -> list[dict]:
     return [{"type": "function",
              "function": {"name": t["name"], "description": t["description"],
                           "parameters": t["parameters"]}}
-            for t in sb.tool_schemas()]
+            for t in sb.all_schemas(obs_mode, minimal=minimal)]
 
 
 def _parse_text_tool_call(content: str):
@@ -133,22 +133,37 @@ class Usage:
 
 
 def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
-                temperature, usage: Usage, aci=None) -> dict:
+                temperature, usage: Usage, aci=None,
+                layout_prefer: str = "sampled",
+                prompt_mode: str = "guided",
+                reason_mode: str = "terse") -> dict:
     """One episode. Returns a record; never raises -- an API failure is a datum.
 
     @aci lets a caller supply its own ACI -- ``demo_render.RecordingACI`` wraps one
     to snapshot the episode. Passing it in rather than re-running elsewhere is what
     keeps the demo showing the same episode this harness would have scored.
     """
+    # Every mode that reads the scene json refuses a generated layout by design --
+    # poses must come from the sampler, in the scene's frame and satisfying the BDDL
+    # initial conditions. The default below is `generated` for the fov study, so these
+    # must override it or every episode dies in the constructor.
+    if obs_mode in ("detect", "detect_scope", "fov_distract"):
+        layout_prefer = "sampled"
     env = BehaviorTextWorld(activity, obs_mode=obs_mode)
     if aci is None:
-        aci = SymbolicACI(SymbolicWorld(activity), obs_mode=obs_mode)
+        # `generated` by default for a REASON, not convenience: only 6 of the 112
+        # activities in the fov subset have sampled poses, so leaving the default
+        # would give those six metre distances and the rest ordinal bands --
+        # two observation conditions inside one arm. Uniform beats real here.
+        aci = SymbolicACI(SymbolicWorld(activity), obs_mode=obs_mode,
+                          layout_prefer=layout_prefer,
+                          reason_mode=reason_mode)
     world = aci.world
 
     goal_nl = env.goal_nl if goal_format == "nl" else None
     messages = sb.build_prompt_messages(activity, env.goal_lines, obs_mode,
-                                        goal_nl=goal_nl)
-    tools = openai_tools()
+                                        goal_nl=goal_nl, prompt_mode=prompt_mode)
+    tools = openai_tools(obs_mode, minimal=prompt_mode == "minimal")
 
     steps: list[dict] = []
     ended = False
@@ -304,8 +319,22 @@ def main() -> None:
                                                          DEFAULT_BASE_URL))
     ap.add_argument("--activities", default="@/data/behavior-data/tw/val_s2.jsonl")
     ap.add_argument("--n", type=int, default=40)
+    ap.add_argument("--prompt-mode", default="guided",
+                    choices=["guided", "minimal"],
+                    help="minimal strips the procedural guidance from the "
+                         "system prompt, the tool descriptions and the "
+                         "per-obs-mode hint (E1, brainstorm/260815)")
+    ap.add_argument("--reason-mode", default="terse",
+                    choices=["verbose", "terse", "silent"],
+                    help="refusal detail. verbose='not near X; go_to(X) first' "
+                         "(state+plan), terse='not near X' (state only), "
+                         "silent='' (ALFWorld's Nothing-happens). E1b")
     ap.add_argument("--obs-mode", default="both",
-                    choices=["full", "partial", "object", "both"])
+                    choices=["full", "partial", "object",
+                             # the 2x2 that splits `detect` into its two axes:
+                             # rows = distractors, columns = selection mechanism
+                             "fov", "fov_distract", "detect_scope", "detect",
+                             "both"])
     ap.add_argument("--goal-format", default="both", choices=["atoms", "nl", "both"])
     ap.add_argument("--max-turns", type=int, default=20)
     ap.add_argument("--temperature", type=float, default=0.0)
@@ -334,6 +363,7 @@ def main() -> None:
     print(f"model       : {args.model}  @ {args.base_url}")
     print(f"activities  : {len(acts)} (held-out S2)")
     print(f"conditions  : obs={obs_modes} x goal={goal_formats}")
+    print(f"prompt      : {args.prompt_mode}  refusals: {args.reason_mode}")
     print(f"budget      : <= {len(acts) * len(obs_modes) * len(goal_formats) * args.max_turns} "
           f"API calls at temperature {args.temperature}")
 
@@ -346,7 +376,8 @@ def main() -> None:
             with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
                 futures = [pool.submit(run_episode, client, args.model, a, obs_mode,
                                        goal_format, args.max_turns, args.temperature,
-                                       usage)
+                                       usage, None, "sampled",
+                                       args.prompt_mode, args.reason_mode)
                            for a in acts]
                 records = []
                 for i, fut in enumerate(futures, 1):
