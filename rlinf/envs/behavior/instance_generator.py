@@ -15,6 +15,7 @@
 import argparse
 import json
 import sys
+import types
 from pathlib import Path
 
 from omegaconf import DictConfig, OmegaConf
@@ -344,6 +345,34 @@ def generate_activity_instances(
 
     import omnigibson as og
     from omnigibson.objects import DatasetObject
+
+    # `omnigibson.sampling.utils` imports gspread at module level, but only one
+    # function in it uses gspread -- a helper that logs sampling progress to a Google
+    # Sheet with service-account credentials we do not have and do not want.
+    # `validate_task`, the only thing we import, never touches it. Without this the
+    # import raises ModuleNotFoundError *after* a successful 19-minute sampling run,
+    # discarding the instance at the last step; measured on a positive control that
+    # otherwise sampled cleanly.
+    #
+    # A stub rather than `pip install gspread`: pulling a Google API stack into this
+    # container to satisfy an unused import is the wrong trade, and this way the
+    # decision is in our repo instead of in the image's writable layer. The stub raises
+    # if anything ever does reach for it, so a silent wrong result is not possible.
+    if "gspread" not in sys.modules:
+        class _NoGspread(types.ModuleType):
+            def __getattr__(self, name):
+                # Dunders must miss quietly: `inspect` and the import machinery probe
+                # `__file__`, `__path__`, `__all__` with hasattr, and raising there
+                # breaks the import this stub exists to allow.
+                if name.startswith("__") and name.endswith("__"):
+                    raise AttributeError(name)
+                raise RuntimeError(
+                    "omnigibson.sampling.utils tried to use gspread "
+                    f"({name!r}); it is stubbed because only its Google-Sheets "
+                    "progress logger needs it. Install gspread if that path is "
+                    "genuinely wanted.")
+        sys.modules["gspread"] = _NoGspread("gspread")
+
     from omnigibson.sampling.utils import validate_task
     from omnigibson.utils.asset_utils import get_dataset_path
 

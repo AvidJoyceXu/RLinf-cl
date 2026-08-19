@@ -43,6 +43,7 @@ from rlinf.envs.behavior.symbolic_world import SymbolicWorld, properties_of
 # sampler wrote are searched, official first.
 INSTANCE_ROOTS = (
     "/data/behavior-data/2025-challenge-task-instances/scenes",
+    "/data/behavior-data/_samp0816",
     "/data/behavior-data/_hitrate13",
     "/data/behavior-data/_hitrate11",
     "/data/behavior-data/_hitrate10",
