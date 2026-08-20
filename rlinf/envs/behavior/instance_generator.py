@@ -67,6 +67,26 @@ def parse_args() -> argparse.Namespace:
         help="Last activity_instance_id to generate.",
     )
     parser.add_argument(
+        "--activity",
+        type=str,
+        default=None,
+        help=(
+            "Activity to sample. Overrides task.activity_name from the yaml. "
+            "Without this the generator can only ever sample whatever activity the "
+            "shared config happens to name, which makes batch sampling impossible."
+        ),
+    )
+    parser.add_argument(
+        "--scene",
+        type=str,
+        default=None,
+        help=(
+            "Scene model to sample into. Overrides scene.scene_model. An activity is "
+            "only samplable into a scene whose rooms satisfy its (inroom ...) "
+            "conditions, so this pairs with --activity."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -145,6 +165,19 @@ def build_sampling_omni_cfg(
     OmegaConf.update(omni_cfg, "task.activity_instance_dir", None, merge=False)
     OmegaConf.update(omni_cfg, "task.instance_resample_mode", "disabled")
     OmegaConf.update(omni_cfg, "task.online_object_sampling", True)
+    # The three settings below are not defaults and not preferences -- they are the
+    # configuration that made sampling work at all, established over 13 runs and
+    # recorded in `code-reading/BEHAVIOR task instance sampling & validation.md` §8.1.
+    # They are set HERE rather than in the yaml because that yaml is shared with
+    # training and eval, where these values would be wrong:
+    #   flatcache OFF     -- ClothPrim does not survive flatcache, and 30.9% of the
+    #                        740 solvable activities involve cloth
+    #   gpu dynamics ON   -- required for the cloth system to initialise
+    #   include_obs OFF   -- during sampling the object_scope still holds Nones, and
+    #                        building an observation over it raises
+    OmegaConf.update(omni_cfg, "scene.enable_flatcache", False)
+    OmegaConf.update(omni_cfg, "scene.use_gpu_dynamics", True)
+    OmegaConf.update(omni_cfg, "task.include_obs", False)
     OmegaConf.update(omni_cfg, "task.use_presampled_robot_pose", False)
     OmegaConf.update(omni_cfg, "scene.scene_instance", None, merge=False)
     OmegaConf.update(omni_cfg, "scene.scene_file", None, merge=False)
@@ -480,6 +513,12 @@ def main() -> None:
         seed=args.seed,
         robot_staging_position=tuple(args.robot_staging_position),
     )
+    if args.activity:
+        OmegaConf.update(omni_cfg, "task.activity_name", args.activity)
+    if args.scene:
+        OmegaConf.update(omni_cfg, "scene.scene_model", args.scene)
+    print(f"  activity : {OmegaConf.select(omni_cfg, 'task.activity_name')}", flush=True)
+    print(f"  scene    : {OmegaConf.select(omni_cfg, 'scene.scene_model')}", flush=True)
     output_dir = resolve_output_dir(
         omni_cfg,
         args.output_dir if args.output_dir is not None else configured_output_dir,
