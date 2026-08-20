@@ -43,6 +43,11 @@ from rlinf.envs.behavior.symbolic_world import SymbolicWorld, properties_of
 # sampler wrote are searched, official first.
 INSTANCE_ROOTS = (
     "/data/behavior-data/2025-challenge-task-instances/scenes",
+    # Instances we generate ourselves with upstream's multiply_b1k_tasks.py land in the
+    # ASSET tree, not the challenge tree -- that script derives its save_dir from
+    # get_dataset_path("behavior-1k-assets"). Without this root they exist on disk and
+    # `detect` still reports the activity as having no sampled instance.
+    "/data/behavior-data/behavior-1k-assets/scenes",
     "/data/behavior-data/_samp0816",
     "/data/behavior-data/_hitrate13",
     "/data/behavior-data/_hitrate11",

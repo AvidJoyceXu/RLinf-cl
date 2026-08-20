@@ -47,6 +47,8 @@ import shutil
 TARGET = "/opt/venv/openvla-oft/BEHAVIOR-1K/OmniGibson/omnigibson/sampling/utils.py"
 TARGET_TASK = ("/opt/venv/openvla-oft/BEHAVIOR-1K/OmniGibson/omnigibson/tasks/"
                "behavior_task.py")
+TARGET_BDDL = ("/opt/venv/openvla-oft/BEHAVIOR-1K/OmniGibson/omnigibson/utils/"
+               "bddl_utils.py")
 
 EDITS = [
     # (name, old, new)
@@ -94,7 +96,41 @@ EDITS = [
 # forces `task.include_obs: False` in the recorded config. The loop does not guard for
 # it, so reset dies with `'NoneType' object has no attribute 'exists'` AFTER the scene
 # has loaded. Measured: 3 of the first 5 completed attempts in a 12-activity batch.
+EDITS_BDDL = [
+    (
+        "5. drop (and log) conditions whose scope entry is None (BOTH sort sites)",
+        """                        rigid_conditions = [c for c in conditions_to_sample if c[2].prim_type != PrimType.CLOTH]""",
+        """                        # RLinf: entities can be None here -- the scope is not fully
+                        # instantiated during online sampling -- and `.prim_type` on None
+                        # aborts the whole activity. Drop them, but SAY SO: a silently
+                        # dropped condition would mean an instance that does not satisfy
+                        # its own BDDL. validate_task step 3 re-checks the initial
+                        # conditions, so a bad drop fails the instance instead of
+                        # shipping it.
+                        _missing = [c[3] for c in conditions_to_sample if c[2] is None]
+                        if _missing:
+                            print(f"[rlinf] unfilled object_scope entries, conditions "
+                                  f"skipped: {_missing}", flush=True)
+                            conditions_to_sample = [c for c in conditions_to_sample
+                                                    if c[2] is not None]
+                        rigid_conditions = [c for c in conditions_to_sample if c[2].prim_type != PrimType.CLOTH]""",
+    ),
+]
+
 EDITS_TASK = [
+    (
+        "6. potential is undefined while the scope is being sampled",
+        """        # Evaluate the first ground goal state option as the potential
+        _, satisfied_predicates = evaluate_goal_conditions(self.ground_goal_state_options[0])""",
+        """        # RLinf: during online sampling the scope is not yet fully instantiated, so
+        # the goal cannot be evaluated -- `evaluate_goal_conditions` raises
+        # `child_values has NoneTypes`. The potential is a training signal and is never
+        # read on the sampling path, so returning 0 here is not a silent substitution.
+        if any(v is None for v in self.object_scope.values()):
+            return 0.0
+        # Evaluate the first ground goal state option as the potential
+        _, satisfied_predicates = evaluate_goal_conditions(self.ground_goal_state_options[0])""",
+    ),
     (
         "4. guard the force-wake loop against None entries in object_scope",
         """        for obj in self.object_scope.values():
@@ -110,12 +146,14 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--file", default=TARGET)
     ap.add_argument("--task-file", default=TARGET_TASK)
+    ap.add_argument("--bddl-file", default=TARGET_BDDL)
     ap.add_argument("--check", action="store_true", help="report only")
     args = ap.parse_args()
 
     applied = skipped = missing = 0
 
-    for path, edits in ((args.file, EDITS), (args.task_file, EDITS_TASK)):
+    for path, edits in ((args.file, EDITS), (args.task_file, EDITS_TASK),
+                        (args.bddl_file, EDITS_BDDL)):
         src = open(path).read()
         if not args.check and not os.path.exists(path + ".orig"):
             shutil.copy(path, path + ".orig")
@@ -125,7 +163,9 @@ def main() -> None:
                 print(f"  [already] {name}")
                 skipped += 1
             elif old in src:
-                src = src.replace(old, new, 1)
+                # `count` matters: the None-guard has two byte-identical sites in
+                # bddl_utils and patching only the first leaves the second to fail.
+                src = src.replace(old, new)
                 print(f"  [apply  ] {name}")
                 applied += 1
                 changed = True

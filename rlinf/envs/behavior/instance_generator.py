@@ -14,6 +14,7 @@
 
 import argparse
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -122,6 +123,18 @@ def parse_args() -> argparse.Namespace:
         help="Overwrite existing cached instance files.",
     )
     return parser.parse_args()
+
+
+
+def _task_custom_lists() -> dict:
+    """BEHAVIOR's curated per-(activity, scene) model whitelists, or {} if absent."""
+    import omnigibson
+    path = os.path.join(os.path.dirname(omnigibson.__file__), "sampling",
+                        "task_custom_lists.json")
+    if not os.path.exists(path):
+        return {}
+    with open(path) as f:
+        return json.load(f)
 
 
 def load_env_cfg(config_path: str) -> DictConfig:
@@ -465,6 +478,23 @@ def generate_activity_instances(
             for _ in range(DEFAULT_SETTLE_STEPS):
                 og.sim.step()
 
+            # Zero velocities IMMEDIATELY before the dump, and include the ROBOT.
+            #
+            # Two bugs in the old order, both real:
+            #   * only `object_scope` entries were stilled, and the robot is not one of
+            #     them -- so validation step 2 rejected the instance with
+            #     `robot_r1 joint velocity is not close to 0`;
+            #   * even for the objects, `keep_still()` ran BEFORE another settle loop,
+            #     which steps physics and reintroduces exactly the velocities it just
+            #     cleared.
+            # Stilling last is what step 2 actually checks, since it reads the dumped
+            # state rather than the state a few steps earlier.
+            for robot in env.robots:
+                robot.keep_still()
+            for entity in env.task.object_scope.values():
+                if isinstance(entity, DatasetObject):
+                    entity.keep_still()
+
             task_final_state = env.scene.dump_state()
             validated, error_msg = validate_task(
                 env.task,
@@ -517,6 +547,38 @@ def main() -> None:
         OmegaConf.update(omni_cfg, "task.activity_name", args.activity)
     if args.scene:
         OmegaConf.update(omni_cfg, "scene.scene_model", args.scene)
+    # BEHAVIOR ships a per-(activity, scene) MODEL WHITELIST and the sampler needs it.
+    #
+    # `code-reading/BEHAVIOR task instance sampling & validation.md` §5 concluded from
+    # the code that `sampling_whitelist` is "an optional narrowing of candidate models,
+    # not a precondition". That is true of the mechanism and false in practice for the
+    # curated activities: without it the sampler leaves those synsets UNFILLED in
+    # `object_scope`, and the run then dies on `NoneType.prim_type` (or, with the guard
+    # in `patch_sampler.py`, drops the condition and fails validation).
+    #
+    # The evidence is exact, not statistical -- the synsets that come back None are the
+    # ones the whitelist names, activity by activity:
+    #   carrying_in_groceries -> dropped {beefsteak_tomato.n.01_1, carton__of__milk.n.01_1};
+    #                            whitelist names beefsteak_tomato.n.01, carton__of__milk.n.01
+    #   clean_a_patio         -> dropped {broom.n.01_1}; whitelist names broom.n.01
+    #
+    # `sample_b1k_tasks.py` asserts the whitelist is not None before sampling any of its
+    # 77 curated (activity, scene) pairs, which is the same conclusion from upstream's
+    # side. Activities absent from the file sample without one, as before.
+    custom = _task_custom_lists()
+    entry = (custom.get(OmegaConf.select(omni_cfg, "task.activity_name") or "") or {})
+    scene_entry = entry.get(OmegaConf.select(omni_cfg, "scene.scene_model") or "")
+    if scene_entry:
+        if scene_entry.get("whitelist"):
+            OmegaConf.update(omni_cfg, "task.sampling_whitelist",
+                             scene_entry["whitelist"], merge=False)
+        if scene_entry.get("blacklist"):
+            OmegaConf.update(omni_cfg, "task.sampling_blacklist",
+                             scene_entry["blacklist"], merge=False)
+        print(f"  whitelist: {len(scene_entry.get('whitelist') or {})} synsets "
+              f"(curated activity)", flush=True)
+    else:
+        print("  whitelist: none (activity not in task_custom_lists.json)", flush=True)
     print(f"  activity : {OmegaConf.select(omni_cfg, 'task.activity_name')}", flush=True)
     print(f"  scene    : {OmegaConf.select(omni_cfg, 'scene.scene_model')}", flush=True)
     output_dir = resolve_output_dir(
