@@ -88,13 +88,27 @@ class Layout:
 # sampled poses
 # --------------------------------------------------------------------------- #
 def _find_instance(activity: str) -> Optional[str]:
-    """Newest `*-tro_state.json` for @activity, or None."""
-    hits: list[str] = []
+    """Newest `*-tro_state.json` for @activity, or None.
+
+    INSTANCE_ROOTS is ordered by PREFERENCE, and the first root wins outright; mtime
+    only breaks ties within a root. That ordering is load-bearing rather than
+    cosmetic: the official challenge instances carry `robot_poses` (a sampled robot
+    start pose) and instances we generate with `multiply_b1k_tasks.py` do not, because
+    the stage that writes them -- `sample_robot_pose.py` -- does not exist in this
+    OmniGibson version. Without a sampled pose `_from_instance` falls back to the
+    centroid of the task objects, which stands the robot on top of them.
+
+    Ranking every root together by mtime therefore let 5 freshly generated pose-less
+    instances shadow 351 official ones that had real poses, and `detect` went from
+    reporting objects to reporting nothing.
+    """
     for root in INSTANCE_ROOTS:
-        hits += glob.glob(os.path.join(root, "*", "json", f"*_task_{activity}_instances",
-                                       "*tro_state.json"))
+        hits = glob.glob(os.path.join(root, "*", "json", f"*_task_{activity}_instances",
+                                      "*tro_state.json"))
         hits += glob.glob(os.path.join(root, activity, "*tro_state.json"))
-    return max(hits, key=os.path.getmtime) if hits else None
+        if hits:
+            return max(hits, key=os.path.getmtime)
+    return None
 
 
 def _scene_of_path(path: str) -> str:
@@ -137,11 +151,24 @@ def _from_instance(activity: str, path: str) -> Layout:
         if not rl:
             # Substances have no pose by construction; they are located by host.
             continue
+        if name.startswith("agent.n.01"):
+            # The agent is written into the instance at its STAGING pose -- the
+            # off-scene parking spot the sampler uses while it places objects
+            # ((-50,-50,-50) for instances from multiply_b1k_tasks). It is not task
+            # state and it is not where the robot starts. Keeping it here corrupted
+            # the centroid below: averaging six objects around the origin with one
+            # entry at -50 put the robot ~10 m from the nearest object, outside
+            # detect's range, so `observe()` reported NOTHING. See
+            # `code-reading ... sampling & validation` §8.3, which found the same
+            # staging pose written by our own generator and fixed it there.
+            continue
         x, y, z = (float(v) for v in rl["pos"])
         lay.xyz[name] = (x, y, z)
     if lay.xyz and lay.robot_xy == (0.0, 0.0):
         # No robot_poses in the file: start the robot at the centroid of the task
         # objects rather than at the origin, which would usually be outside the house.
+        # This is a fallback, not a sampled pose -- upstream's stage 4
+        # (`sample_robot_pose.py`) is what writes a real one.
         xs = [p[0] for p in lay.xyz.values()]
         ys = [p[1] for p in lay.xyz.values()]
         lay.robot_xy = (sum(xs) / len(xs), sum(ys) / len(ys))
