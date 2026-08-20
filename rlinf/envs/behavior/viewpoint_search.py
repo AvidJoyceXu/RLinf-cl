@@ -35,7 +35,14 @@ TURNS_PER_SWEEP = 4          # 4 x 90 degrees = full circle
 # coverage and ~10 steps to the median sweep -- most BEHAVIOR objects sit at or
 # below camera height. `look_up` stays in the tool set so the policy can undo a
 # `look_down`; the reference search just never needs it.
-PITCHES = (0, -1)
+#
+# TWO downward steps, not one. The camera is at 1.2 m and `PITCH_LIMIT_RAD` is 60
+# degrees, so a single -30 step still leaves anything close and low below the frame --
+# an object 1 m away at floor level sits about 50 degrees down. Measured per object
+# over a full sweep on 4 instance-backed activities: level only 8/28 found,
+# (0, -30) 18/28, (0, -30, -60) 20/28. The sweep costs one extra `look_down` and one
+# extra circle, against a search that spends a median 36 steps of a 400 budget.
+PITCHES = (0, -1, -2)
 
 
 def sweep(aci: SymbolicACI, on_view=None) -> int:
@@ -47,10 +54,12 @@ def sweep(aci: SymbolicACI, on_view=None) -> int:
     objects were plainly visible mid-sweep.
     """
     steps = 0
+    prev_pitch = 0
     for pitch in PITCHES:
-        if pitch == -1:
+        while prev_pitch > pitch:            # one look_down per step of pitch
             aci.look_down()
             steps += 1
+            prev_pitch -= 1
         for _ in range(TURNS_PER_SWEEP):
             aci.observe()
             steps += 1
@@ -58,8 +67,11 @@ def sweep(aci: SymbolicACI, on_view=None) -> int:
                 on_view()
             aci.turn_left()
             steps += 1
-    aci.look_up()            # back to level
-    return steps + 1
+    while prev_pitch < 0:                    # back to level
+        aci.look_up()
+        steps += 1
+        prev_pitch += 1
+    return steps
 
 
 def explore(activity: str, layout_prefer: str = "sampled",
@@ -139,6 +151,7 @@ def _explore_detect(world, aci, locatable, steps, budget) -> dict:
             if d.key.startswith("scope:"):
                 found.add(d.key[len("scope:"):])
 
+    explored = 0
     steps += sweep(aci, on_view=harvest)
     while steps < budget and not locatable <= found:
         target = None
@@ -150,7 +163,28 @@ def _explore_detect(world, aci, locatable, steps, budget) -> dict:
                 target, visited = d, visited | {d.key}
                 break
         if target is None:
-            break
+            # NOTHING NEW IS VISIBLE FROM HERE. The old search gave up at this point,
+            # which is why it terminated at a median 56 steps of a 400 budget: it can
+            # only ever `go_to` something it has ALREADY detected, so an object that is
+            # not visible from any viewpoint it happened to reach was unreachable in
+            # principle, not in practice.
+            #
+            # Translate blind instead. Occlusion and the vertical frustum are both
+            # properties of WHERE YOU STAND -- 77 of 273 objects in a 32-activity audit
+            # were `outside_frustum` from the start pose alone -- so moving and
+            # re-sweeping is the only operator that can recover them. We turn to an
+            # unexplored heading, walk, and sweep, until the budget is gone.
+            if steps + 12 > budget:
+                break
+            for _ in range(explored % 4 + 1):
+                aci.turn_left()
+                steps += 1
+            for _ in range(2):
+                aci.move_ahead()
+                steps += 1
+            explored += 1
+            steps += sweep(aci, on_view=harvest)
+            continue
         if aci.go_to(target.det).ok:
             steps += 1
             aci.observe()
@@ -227,6 +261,17 @@ def _main() -> None:
     print(f"  ALL objects found   : {complete} = {complete / n:.1%}")
     print(f"  incomplete          : {partial}")
     print(f"  errored             : {fail}")
+    if worst:
+        # Mean coverage over the activities the mode can actually attempt. The
+        # all-or-nothing `ALL objects found` gate is the certificate we need before
+        # running a baseline, but it hides progress: a search that goes from finding a
+        # tenth of the objects to finding most of them moves this line and not that
+        # one. Report both, and note the denominator is the ATTEMPTED activities, not
+        # the 740 -- `detect` needs a sampled instance and most activities have none.
+        fracs = sorted(f for f, _, _ in worst)
+        mean = sum(fracs) / len(fracs)
+        print(f"  mean coverage       : {mean:.1%} over {len(fracs)} attempted "
+              f"(median {fracs[len(fracs) // 2]:.0%})")
     if steps_ok:
         steps_ok.sort()
         print(f"  search steps        : median {steps_ok[len(steps_ok) // 2]}  "
