@@ -88,6 +88,69 @@ def least_loaded_gpu(exclude: set[int]) -> int:
 SAMPLING_DIR = ("/opt/venv/openvla-oft/BEHAVIOR-1K/OmniGibson/omnigibson/sampling")
 
 
+# --------------------------------------------------------------------------- #
+# Scene routing. An activity's BDDL `inroom` atoms name the room TYPES it needs,
+# and a scene can only host it if it has all of them. Forcing every activity into
+# one scene is why online sampling looked impossible: `adding_chemicals_to_hot_tub`
+# needs a garden, and `house_double_floor_lower` has none, so it failed in 0 s
+# before a single pose was tried.
+#
+# 51 scenes ship with the assets and every one of the 740 verified-solvable
+# activities is room-compatible with at least one of them. Room match is NECESSARY,
+# NOT SUFFICIENT -- the scene must also contain the sampleable objects (a garden
+# with no hot tub still fails) -- so this raises the ceiling, it does not guarantee
+# a hit.
+# --------------------------------------------------------------------------- #
+ACTIVITY_HOSTS_JSON = "/data/behavior-data/_tmp/activity_hosts.json"
+# Prefer the scenes the challenge used: they are the ones whose sampling path is
+# exercised, and staying on them where possible keeps instances comparable.
+PREFERRED = ("house_double_floor_lower", "house_single_floor", "house_double_floor_upper")
+
+
+def route_scene(activity: str) -> str | None:
+    """A scene that can host @activity, preferring the challenge scenes.
+
+    Compatibility is decided on the `inroom` requirements: the scene must already
+    CONTAIN an object of the right category in the right room type. Room type alone
+    is not enough -- a garden with no hot tub cannot host
+    `adding_chemicals_to_hot_tub`, and that is exactly how it fails, in 0 s, before
+    a pose is tried. Synset -> category goes through bddl's ObjectTaxonomy, because
+    `floor.n.01` is the category `floors` and guessing the string gets it wrong.
+
+    Measured over the 740 verified-solvable activities: 691 are hostable by at
+    least one of the 51 shipped scenes, median 12 scenes each.
+    """
+    try:
+        hosts = json.load(open(ACTIVITY_HOSTS_JSON)).get(activity) or []
+    except Exception:
+        return None
+    if not hosts:
+        return None
+    for p in PREFERRED:
+        if p in hosts:
+            return p
+    return sorted(hosts)[0]
+
+
+def template_scene(activity: str) -> str | None:
+    """The scene whose json dir actually holds a template for @activity.
+
+    `multiply` reads an EXISTING template, so the scene is not a free choice: point
+    it at the wrong one and it dies with FileNotFoundError and then segfaults on
+    teardown, which reads as a simulator crash. Measured: this was 17 of 19
+    "crashes" on the template-only activities -- a launcher bug of mine, not Kit.
+    """
+    import glob as _glob
+    import re as _re
+    for root in ("/data/behavior-data/2025-challenge-task-instances/scenes",
+                 "/data/behavior-data/behavior-1k-assets/scenes"):
+        for f in _glob.glob(root + "/*/json/*_template.json"):
+            m = _re.search(r"^(.+?)_task_(.+?)_\d+_\d+_template\.json$", os.path.basename(f))
+            if m and m.group(2) == activity:
+                return m.group(1)
+    return None
+
+
 def headless_copy(script: str) -> str:
     """Copy an upstream sampling script with `gm.HEADLESS` forced True.
 
@@ -120,8 +183,11 @@ def run_one(activity: str, args, gpu: int) -> dict:
                "--seed", str(args.seed),
                "--start_idx", str(args.start_idx), "--end_idx", str(args.end_idx),
                "--partial_save", "--activity", activity]
-        if args.scene:
-            cmd += ["--scene_model", args.scene]
+        scene = args.scene
+        if scene == "auto":
+            scene = template_scene(activity) or route_scene(activity)
+        if scene:
+            cmd += ["--scene_model", scene]
     else:
         cmd = [
             "python", "-u", "-m", "rlinf.envs.behavior.instance_generator",
@@ -132,8 +198,9 @@ def run_one(activity: str, args, gpu: int) -> dict:
             "--output-dir", args.out,
             "--num-trials", str(args.num_trials),
         ]
-        if args.scene:
-            cmd += ["--scene", args.scene]
+        scene = route_scene(activity) if args.scene == "auto" else args.scene
+        if scene:
+            cmd += ["--scene", scene]
 
     env = dict(os.environ,
                CUDA_VISIBLE_DEVICES=str(gpu),
@@ -203,7 +270,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--activities", required=True,
                     help="comma-separated, or @file with one per line")
-    ap.add_argument("--scene", default=None)
+    ap.add_argument("--scene", default=None,
+                    help="scene model, or 'auto' to route each activity to a "
+                         "room-compatible scene (see route_scene)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--log-dir", default="/data/behavior-data/_tmp/samp_logs")
     ap.add_argument("--config",

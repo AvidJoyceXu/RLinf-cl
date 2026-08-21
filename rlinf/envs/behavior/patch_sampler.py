@@ -119,6 +119,11 @@ EDITS_BDDL = [
 
 EDITS_TASK = [
     (
+        "7. no presampled robot pose -> fall back, do not crash",
+        '        # Use presampled robot pose if specified (only available for officially supported mobile manipulators)\n        if self.use_presampled_robot_pose:\n            robot = self.get_agent(env)\n            presampled_poses = env.scene.get_task_metadata(key="robot_poses")\n            assert (\n                robot.model_name in presampled_poses\n            ), f"{robot.model_name} presampled pose is not found in task metadata; please set use_presampled_robot_pose to False in task config"',
+        '        # Use presampled robot pose if specified (only available for officially supported mobile manipulators)\n        presampled_poses = env.scene.get_task_metadata(key="robot_poses") if self.use_presampled_robot_pose else None\n        # RLinf: a template that never went through stage 4 (`sample_robot_pose.py`, which\n        # does not exist in this OmniGibson version) carries NO `robot_poses`, and\n        # `robot.model_name in None` raises a TypeError before the assert below can print\n        # its own advice -- "please set use_presampled_robot_pose to False in task config".\n        # Kit then segfaults on teardown, so it reads as a simulator crash rather than a\n        # missing key. Measured: 23 of the 24 activities that have a template but no\n        # instance, i.e. exactly the ones where activity coverage could grow.\n        if self.use_presampled_robot_pose and not presampled_poses:\n            print("[rlinf] no presampled robot_poses in this scene task metadata; "\n                  "falling back to the default robot pose", flush=True)\n            self.use_presampled_robot_pose = False\n        if self.use_presampled_robot_pose:\n            robot = self.get_agent(env)\n            assert (\n                robot.model_name in presampled_poses\n            ), f"{robot.model_name} presampled pose is not found in task metadata; please set use_presampled_robot_pose to False in task config"',
+    ),
+    (
         "6. potential is undefined while the scope is being sampled",
         """        # Evaluate the first ground goal state option as the potential
         _, satisfied_predicates = evaluate_goal_conditions(self.ground_goal_state_options[0])""",
