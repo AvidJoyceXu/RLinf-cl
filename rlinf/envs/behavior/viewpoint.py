@@ -83,8 +83,28 @@ class Viewpoint:
         self.yaw = _wrap(self.yaw - TURN_STEP_RAD)
 
     def move_ahead(self) -> None:
-        self.x += MOVE_STEP_M * math.cos(self.yaw)
-        self.y += MOVE_STEP_M * math.sin(self.yaw)
+        self._translate(self.yaw)
+
+    # WASD. `move_ahead` + `turn_*` can reach any pose in principle, but not without
+    # changing where the camera POINTS, and that is the whole difficulty `detect`
+    # measures: an object hidden behind furniture is recovered by stepping sideways
+    # while still looking at it. Turning to walk and turning back costs 4 extra calls
+    # and loses the framing in between, which is why a policy that can only turn-walk
+    # -turn tends not to bother. Measured motivation: 77 of 273 scope objects were
+    # `outside_frustum` and 28 occluded from the start pose, both of which are
+    # properties of WHERE YOU STAND rather than of where you look.
+    def move_back(self) -> None:
+        self._translate(self.yaw + math.pi)
+
+    def strafe_left(self) -> None:
+        self._translate(self.yaw + math.pi / 2)
+
+    def strafe_right(self) -> None:
+        self._translate(self.yaw - math.pi / 2)
+
+    def _translate(self, heading: float) -> None:
+        self.x += MOVE_STEP_M * math.cos(heading)
+        self.y += MOVE_STEP_M * math.sin(heading)
 
     def look_up(self) -> None:
         self.pitch = min(self.pitch + PITCH_STEP_RAD, PITCH_LIMIT_RAD)

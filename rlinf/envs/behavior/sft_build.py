@@ -144,6 +144,18 @@ def camera_schemas() -> list[dict]:
         {"name": "move_ahead",
          "description": "Step 0.5 m in the direction you are facing.",
          "parameters": _obj({}, [])},
+        {"name": "move_back",
+         "description": "Step 0.5 m backwards, still facing the same way.",
+         "parameters": _obj({}, [])},
+        {"name": "strafe_left",
+         "description": "Step 0.5 m to your left WITHOUT turning, so whatever you "
+                        "are looking at stays in view from a new angle. Use this to "
+                        "see past something that is blocking your view.",
+         "parameters": _obj({}, [])},
+        {"name": "strafe_right",
+         "description": "Step 0.5 m to your right WITHOUT turning, so whatever you "
+                        "are looking at stays in view from a new angle.",
+         "parameters": _obj({}, [])},
         {"name": "look_down",
          "description": "Tilt the camera 30 degrees down, to see low surfaces "
                         "and the floor.",

@@ -1056,6 +1056,18 @@ class SymbolicACI:
     def move_ahead(self) -> ToolResult:
         return self._camera("move_ahead")
 
+    # WASD: translate without turning. `turn, walk, turn back` reaches the same place
+    # in 4 calls and loses the framing in between, which is exactly the manoeuvre a
+    # policy needs when an object is occluded from where it stands.
+    def move_back(self) -> ToolResult:
+        return self._camera("move_back")
+
+    def strafe_left(self) -> ToolResult:
+        return self._camera("strafe_left")
+
+    def strafe_right(self) -> ToolResult:
+        return self._camera("strafe_right")
+
     def look_up(self) -> ToolResult:
         return self._camera("look_up")
 
