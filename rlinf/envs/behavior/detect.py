@@ -378,9 +378,34 @@ def resolve(query: str, detections: list):
         return None, f"{q} is not in the current view; observe again"
 
     parts = [p for p in q.replace("[", "").replace("]", "").split(",") if p.strip()]
+    # A POINT, which is what an open-vocabulary pointer (Molmo-style) emits and what a
+    # human clicking the render produces. Resolved to the SMALLEST detection containing
+    # it: with nested boxes -- a mug on a table, both under the cursor -- the smaller is
+    # almost always the intended referent, and picking the larger would silently make
+    # every click select the furniture.
+    if len(parts) == 2:
+        try:
+            qx, qy = float(parts[0]), float(parts[1])
+        except ValueError:
+            return None, "point coordinates must be numbers"
+        hits = [d for d in detections
+                if d.bbox[0] <= qx <= d.bbox[2] and d.bbox[1] <= qy <= d.bbox[3]]
+        if not hits:
+            return None, "nothing in view is at that point"
+        hits.sort(key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]))
+        if len(hits) > 1:
+            a0 = (hits[0].bbox[2]-hits[0].bbox[0]) * (hits[0].bbox[3]-hits[0].bbox[1])
+            a1 = (hits[1].bbox[2]-hits[1].bbox[0]) * (hits[1].bbox[3]-hits[1].bbox[1])
+            # Two candidates of near-identical size under one point are genuinely
+            # ambiguous; refusing is the honest answer, per 0815 selection design R4.
+            if a1 <= a0 * (1.0 + AMBIGUOUS_MARGIN):
+                cats = {hits[0].category, hits[1].category}
+                return None, (f"ambiguous: {len(hits)} objects lie under that point "
+                              f"({', '.join(sorted(cats))}); move or look closer")
+        return hits[0], None
     if len(parts) != 4:
         return None, ("selection must be a detection handle from the current observation "
-                      "(e.g. d3) or a box x0,y0,x1,y1")
+                      "(e.g. d3), a point x,y, or a box x0,y0,x1,y1")
     try:
         box = tuple(float(p) for p in parts)
     except ValueError:
