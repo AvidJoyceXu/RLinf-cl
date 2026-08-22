@@ -219,6 +219,7 @@ def explore(activity: str, layout_prefer: str = "sampled",
     return {
         "activity": activity,
         "source": aci.layout.source,
+        "instance_path": aci.layout.instance_path or None,
         "locatable": len(locatable),
         "found": len(found),
         "complete": locatable <= aci.view.seen,
@@ -320,6 +321,7 @@ def _explore_detect(world, aci, targets, locatable, steps, budget, use_tour=Fals
     }
     return {
         "activity": world.activity, "source": aci.layout.source,
+        "instance_path": aci.layout.instance_path or None,
         "locatable": len(locatable), "found": len(found & locatable),
         "complete": locatable <= found, "steps": steps,
         "search_kind": "tour" if use_tour else "primitive",
@@ -406,6 +408,7 @@ def _main() -> None:
                     use_tour=True,
                 )
                 record = build_activity_certificate(activity, primitive, privileged)
+                record["instance_sha256"] = _sha256(record.get("instance_path") or "")
                 records.append(record)
                 outcomes.update(record["outcome_counts"])
             except Exception as exc:  # noqa: BLE001

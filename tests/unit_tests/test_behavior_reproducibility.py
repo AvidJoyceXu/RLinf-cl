@@ -142,6 +142,7 @@ class SolvabilityCertificateTest(unittest.TestCase):
             "target_objects": ["a", "b"],
             "object_events": {"a": ["visible"], "b": ["target"]},
             "source": "instance.json",
+            "instance_path": "/data/instance.json",
             "steps": 40,
             "complete": False,
         }
@@ -153,11 +154,13 @@ class SolvabilityCertificateTest(unittest.TestCase):
                 "c": ["missing_pose"],
             },
             "source": "instance.json",
+            "instance_path": "/data/instance.json",
             "steps": 400,
             "complete": False,
         }
         cert = build_activity_certificate("task", primitive, tour)
         self.assertEqual(cert["targets"], 3)
+        self.assertEqual(cert["instance_path"], "/data/instance.json")
         self.assertEqual(sum(cert["outcome_counts"].values()), 3)
         self.assertEqual(cert["outcome_counts"]["found_by_primitive"], 1)
         self.assertEqual(cert["outcome_counts"]["primitive_search_miss"], 1)
