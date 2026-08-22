@@ -213,6 +213,39 @@ class InstanceCompatibilityTest(unittest.TestCase):
                 },
             )
 
+    def test_scene_wildcards_match_numbered_template_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tro = self._write_pair(
+                Path(directory), ["cabinet.n.01_2", "cabinet.n.01_3"], []
+            )
+            self.assertIsNone(scope_mismatch(["cabinet.n.01_*"], str(tro)))
+
+    def test_future_objects_are_ignored_but_other_missing_objects_are_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tro = self._write_pair(Path(directory), ["onion.n.01_1"], [])
+            expected = ["onion.n.01_1", "diced__onion.n.01_1", "knife.n.01_1"]
+            self.assertEqual(
+                scope_mismatch(
+                    expected,
+                    str(tro),
+                    ignored_scope=["diced__onion.n.01_1"],
+                ),
+                {"missing": ["knife.n.01_1"], "extra": []},
+            )
+
+    def test_scene_objects_can_be_absent_from_task_instance_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tro = self._write_pair(
+                Path(directory), ["grocery.n.01_1", "refrigerator.n.01_1"], []
+            )
+            self.assertIsNone(
+                scope_mismatch(
+                    ["grocery.n.01_1", "refrigerator.n.01_1"],
+                    str(tro),
+                    ignored_scope=["refrigerator.n.01_1"],
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,16 +51,35 @@ def instance_scope(tro_state_path: str) -> set[str]:
 
 
 def scope_mismatch(
-    expected_scope: Iterable[str], tro_state_path: str
+    expected_scope: Iterable[str],
+    tro_state_path: str,
+    ignored_scope: Iterable[str] = (),
 ) -> Optional[dict[str, list[str]]]:
-    """Return missing/extra names, or ``None`` for an exact scope match."""
+    """Return incompatible concrete names, or ``None`` for a semantic match.
+
+    Scene-object declarations ending in ``_*`` are selectors, not concrete objects.
+    Templates may omit them or expand them to any number of numbered instances. Names
+    in ``ignored_scope`` are also excluded; callers use this for BDDL future objects,
+    which correctly do not exist in an initial geometric snapshot.
+    """
     # Agent pose is sampled separately in ``robot_poses`` and is deliberately absent
     # from ``inst_to_name``. It is not evidence for or against task-object provenance.
-    expected = {name for name in expected_scope if not name.startswith("agent.n.01_")}
+    ignored = set(ignored_scope)
+    ignored_wildcard_prefixes = {name[:-1] for name in ignored if name.endswith("_*")}
+    declared = {
+        name
+        for name in expected_scope
+        if not name.startswith("agent.n.01_") and name not in ignored
+    }
+    wildcard_prefixes = {name[:-1] for name in declared if name.endswith("_*")}
+    expected = {name for name in declared if not name.endswith("_*")}
     actual = {
         name
         for name in instance_scope(tro_state_path)
         if not name.startswith("agent.n.01_")
+        and name not in ignored
+        and not any(name.startswith(prefix) for prefix in ignored_wildcard_prefixes)
+        and not any(name.startswith(prefix) for prefix in wildcard_prefixes)
     }
     missing = sorted(expected - actual)
     extra = sorted(actual - expected)

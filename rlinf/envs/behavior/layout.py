@@ -97,7 +97,9 @@ class Layout:
 # --------------------------------------------------------------------------- #
 # sampled poses
 # --------------------------------------------------------------------------- #
-def _find_instance(activity: str, expected_scope=None) -> Optional[str]:
+def _find_instance(
+    activity: str, expected_scope=None, ignored_scope=()
+) -> Optional[str]:
     """Preferred compatible `*-tro_state.json` for @activity, or None.
 
     INSTANCE_ROOTS is ordered by PREFERENCE, and the first root wins outright; mtime
@@ -123,7 +125,11 @@ def _find_instance(activity: str, expected_scope=None) -> Optional[str]:
         )
         hits += glob.glob(os.path.join(root, activity, "*tro_state.json"))
         for path in sorted(hits, key=os.path.getmtime, reverse=True):
-            if expected_scope is None or scope_mismatch(expected_scope, path) is None:
+            if (
+                expected_scope is None
+                or scope_mismatch(expected_scope, path, ignored_scope=ignored_scope)
+                is None
+            ):
                 return path
     return None
 
@@ -342,7 +348,12 @@ def build_layout(
     """
     world = world or SymbolicWorld(activity)
     if prefer == "sampled":
-        path = _find_instance(activity, world.scope_names)
+        ignored_scope = [
+            name
+            for name in world.scope_names
+            if not world.is_real(name) or "sceneObject" in properties_of(name)
+        ]
+        path = _find_instance(activity, world.scope_names, ignored_scope=ignored_scope)
         if path:
             lay = _from_instance(activity, path)
             if lay.xyz:
