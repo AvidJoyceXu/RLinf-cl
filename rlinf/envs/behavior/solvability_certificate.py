@@ -19,6 +19,12 @@ def classify_object(
         return "missing_pose"
     if "missing_extent" in tour:
         return "missing_extent"
+    if (
+        "closed_container" in tour
+        and "within_range" not in tour
+        and "projectable" not in tour
+    ):
+        return "sealed_by_closed_container"
     if "visible" in tour:
         return (
             "found_by_primitive" if "visible" in primitive else "primitive_search_miss"

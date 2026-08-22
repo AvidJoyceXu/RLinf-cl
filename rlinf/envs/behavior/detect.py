@@ -98,13 +98,8 @@ def _scene_root() -> str:
 
 
 @functools.lru_cache(maxsize=4)
-def scope_models(instance_path: str) -> dict:
-    """BDDL scope name -> asset model id, for one task instance.
-
-    Chain: the instance's sibling `*_template.json` carries `metadata.task.inst_to_name`
-    (scope -> scene object name) and `objects_info.init_info[name].args.model`. Both are
-    written by the sampler, so this is recorded data rather than a guess.
-    """
+def _template_data(instance_path: str) -> dict:
+    """Load the activity template paired with one task-instance snapshot."""
     # The template is PER ACTIVITY and lives one directory up; the tro_state files are
     # per instance inside `<scene>_task_<activity>_instances/`. Measured on the shipped
     # tree: 37 templates against 301 instances in one scene. Looking for a sibling
@@ -124,7 +119,17 @@ def scope_models(instance_path: str) -> dict:
             return {}
         tmpl = cands[0]
     with open(tmpl) as f:
-        d = json.load(f)
+        return json.load(f)
+
+
+@functools.lru_cache(maxsize=4)
+def scope_models(instance_path: str) -> dict:
+    """BDDL scope name -> asset model id, for one task instance.
+
+    Chain: the instance's activity template carries ``inst_to_name`` and the scene
+    registry's ``init_info[name].args.model``. Both are sampler output.
+    """
+    d = _template_data(instance_path)
     i2n = d.get("metadata", {}).get("task", {}).get("inst_to_name") or {}
     init = d.get("objects_info", {}).get("init_info", {})
     out = {}
@@ -133,6 +138,14 @@ def scope_models(instance_path: str) -> dict:
         if model:
             out[inst] = model
     return out
+
+
+@functools.lru_cache(maxsize=4)
+def scope_scene_names(instance_path: str) -> frozenset[str]:
+    """Concrete scene registry objects already represented by task-scope entries."""
+    d = _template_data(instance_path)
+    mapping = d.get("metadata", {}).get("task", {}).get("inst_to_name") or {}
+    return frozenset(str(name) for name in mapping.values() if name != "robot")
 
 
 def extent_for_model(model: str):

@@ -25,6 +25,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import json
+import math
 import os
 import sys
 from collections import Counter
@@ -174,13 +175,33 @@ def tour(aci, budget, on_view=None) -> int:
             if not x.key.startswith("scope:") or x.key in opened:
                 continue                 # open each container ONCE, not once per view
             if "openable" in properties_of(x.key[len("scope:"):]):
-                # Mark only on SUCCESS. `open` has a proximity precondition, so a
-                # container seen across the room is refused; marking it as done then
-                # would mean the waypoint that actually stands next to it never tries.
-                # Measured: marking before the call left the certificate byte-identical
-                # to no opening at all -- every open was refused as `not near`.
-                if aci.open(x.det).ok:
-                    opened.add(x.key)
+                # Navigate with the still-live handle, then reacquire it from the
+                # new frame before opening. The old tour moved only `view`, leaving
+                # `_at` unchanged, so every open failed `not near` and all contents
+                # were misclassified as outside range.
+                key = x.key
+                if not aci.go_to(x.det).ok:
+                    continue
+                # A tall nearby appliance can leave the level and -30-degree
+                # frames while filling the -60-degree frame (measured on the
+                # cook_bacon refrigerator). Reacquire at every supported pitch.
+                # Direct pitch assignment is acceptable here because this is the
+                # privileged findability tour; its step count is never a policy
+                # budget. The policy has the equivalent look_down tools.
+                saved_pitch = aci.view.pitch
+                for pitch_index in PITCHES:
+                    aci.view.pitch = pitch_index * math.radians(30.0)
+                    aci._view_epoch += 1
+                    aci.observe()
+                    reacquired = next((d for d in aci._dets if d.key == key), None)
+                    if reacquired is not None and aci.open(reacquired.det).ok:
+                        opened.add(key)
+                        break
+                aci.view.pitch = saved_pitch
+                aci._view_epoch += 1
+                # go_to invalidated every other handle in the old list. Return to
+                # the sweep; later views will discover additional containers.
+                return
 
     steps = 0
     for (wx, wy) in _waypoints(aci):

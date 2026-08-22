@@ -39,6 +39,7 @@ _capabilities = _load_pure_module(
 _trajectory_video = _load_pure_module(
     "_behavior_trajectory_video_test", "trajectory_video.py"
 )
+_detect = _load_pure_module("_behavior_detect_test", "detect.py")
 CAMERA_OBS_MODES = _sft_build.CAMERA_OBS_MODES
 all_schemas = _sft_build.all_schemas
 tool_schemas = _sft_build.tool_schemas
@@ -54,6 +55,7 @@ selected_layout_sources = _sources.selected_layout_sources
 source_catalog = _sources.source_catalog
 validate_harness = _capabilities.validate_harness
 TrajectoryVideoRecorder = _trajectory_video.TrajectoryVideoRecorder
+scope_scene_names = _detect.scope_scene_names
 
 
 class ToolSchemaTest(unittest.TestCase):
@@ -154,6 +156,31 @@ class InstanceSourcePolicyTest(unittest.TestCase):
         self.assertIn("cabinet.n.01_2 cabinet.n.01_3 - cabinet.n.01", expanded)
         self.assertIn("(inroom cabinet.n.01_2 kitchen)", expanded)
         self.assertIn("(inroom cabinet.n.01_3 kitchen)", expanded)
+
+    def test_scope_bound_scene_names_can_be_removed_from_distractors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tro = Path(directory) / "task_template-tro_state.json"
+            tro.write_text("{}")
+            template = Path(directory) / "task_template.json"
+            template.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "task": {
+                                "inst_to_name": {
+                                    "agent.n.01_1": "robot",
+                                    "cabinet.n.01_1": "bottom_cabinet_0",
+                                    "cup.n.01_1": "cup_7",
+                                }
+                            }
+                        }
+                    }
+                )
+            )
+            self.assertEqual(
+                scope_scene_names(str(tro)),
+                frozenset({"bottom_cabinet_0", "cup_7"}),
+            )
 
 
 class HarnessCapabilityTest(unittest.TestCase):
@@ -289,6 +316,7 @@ class SolvabilityCertificateTest(unittest.TestCase):
             "missing_extent": ([], ["missing_extent"]),
             "found_by_primitive": (["visible"], ["visible"]),
             "primitive_search_miss": ([], ["visible"]),
+            "sealed_by_closed_container": ([], ["target", "closed_container"]),
             "outside_tour_range": ([], ["target"]),
             "never_projectable": ([], ["within_range"]),
             "near_total_occlusion": ([], ["within_range", "projectable", "occluded"]),

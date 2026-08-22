@@ -1000,9 +1000,11 @@ class SymbolicACI:
             offset_for_model,
             scene_furniture,
             scope_models,
+            scope_scene_names,
         )
 
         models = scope_models(self.layout.instance_path or "")
+        bound_scene_names = scope_scene_names(self.layout.instance_path or "")
 
         entries = []
         for name in self.world.scope_names:
@@ -1039,6 +1041,11 @@ class SymbolicACI:
             centre = tuple(pos[k] + off[k] for k in range(3))
             entries.append((f"scope:{name}", cat, centre, ext))
         for i, so in enumerate(scene_furniture(self.layout.scene or "")):
+            if so.name in bound_scene_names:
+                # The same physical object is already represented by its scope
+                # entry. Keeping both boxes makes an exact self-occluder and can
+                # prevent a navigated-to cabinet from ever being reacquired.
+                continue
             entries.append((f"scene:{i}", so.category, so.pos, so.extent))
 
         dets = detect(self.view, entries, audit=self._det_audit)
@@ -1106,8 +1113,21 @@ class SymbolicACI:
             # re-run rather than quoted.
             pos = self.layout.pos(scope_name)
             if pos is not None:
-                yaw = math.atan2(pos[1] - self.view.y, pos[0] - self.view.x)
-                self.view.teleport(pos[0], pos[1], yaw)
+                # Stop in front of the object, not at its bbox centre. The old
+                # exact-centre teleport put the camera inside cabinets/fridges and
+                # made the handle impossible to reacquire after navigation -- which
+                # in turn made every privileged-tour open() fail.
+                dx, dy = self.view.x - pos[0], self.view.y - pos[1]
+                norm = math.hypot(dx, dy)
+                if norm < 1e-6:
+                    dx = -math.cos(self.view.yaw)
+                    dy = -math.sin(self.view.yaw)
+                    norm = 1.0
+                stop = 0.9
+                camera_x = pos[0] + stop * dx / norm
+                camera_y = pos[1] + stop * dy / norm
+                yaw = math.atan2(pos[1] - camera_y, pos[0] - camera_x)
+                self.view.teleport(camera_x, camera_y, yaw)
                 if self.obs_mode in self.DETECT_MODES:
                     # The camera moved, so every handle in the last observation
                     # refers to a frame that no longer exists.
