@@ -26,6 +26,7 @@ baseline from the SFT checkpoint -- is answerable on any consistent layout. Mode
 claim real geometry (`detect`, `detect_scope`, `fov_distract`) override this default and
 refuse generated layouts.
 """
+
 from __future__ import annotations
 
 import functools
@@ -38,6 +39,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
+from rlinf.envs.behavior.instance_compatibility import scope_mismatch
 from rlinf.envs.behavior.symbolic_world import SymbolicWorld, properties_of
 
 # Where sampled instances land. Both the official challenge tree and anything our own
@@ -67,7 +69,7 @@ INSTANCE_ROOTS = (
 ROOM_W, ROOM_H = 6.0, 5.0
 ROOM_GAP = 2.0
 ORBIT_R = 0.6
-SURFACE_H = 0.75          # nominal height of a support surface
+SURFACE_H = 0.75  # nominal height of a support surface
 FLOOR_H = 0.05
 
 
@@ -76,13 +78,13 @@ class Layout:
     """Positions in metres, plus an honest label for where they came from."""
 
     activity: str
-    source: str                                    # "sampled" | "generated"
-    xyz: dict = field(default_factory=dict)        # scope name -> (x, y, z)
-    rooms: dict = field(default_factory=dict)      # room name -> (cx, cy)
+    source: str  # "sampled" | "generated"
+    xyz: dict = field(default_factory=dict)  # scope name -> (x, y, z)
+    rooms: dict = field(default_factory=dict)  # room name -> (cx, cy)
     robot_xy: tuple = (0.0, 0.0)
     robot_yaw: float = 0.0
-    scene: str = ""                                 # scene_model, for furniture
-    instance_path: str = ""                         # the tro_state file, for models
+    scene: str = ""  # scene_model, for furniture
+    instance_path: str = ""  # the tro_state file, for models
 
     @property
     def is_real(self) -> bool:
@@ -95,8 +97,8 @@ class Layout:
 # --------------------------------------------------------------------------- #
 # sampled poses
 # --------------------------------------------------------------------------- #
-def _find_instance(activity: str) -> Optional[str]:
-    """Newest `*-tro_state.json` for @activity, or None.
+def _find_instance(activity: str, expected_scope=None) -> Optional[str]:
+    """Preferred compatible `*-tro_state.json` for @activity, or None.
 
     INSTANCE_ROOTS is ordered by PREFERENCE, and the first root wins outright; mtime
     only breaks ties within a root. Official challenge instances are preferred because
@@ -108,13 +110,21 @@ def _find_instance(activity: str) -> Optional[str]:
     difference between the sampled pose and `_from_instance`'s centroid fallback. Keep
     the provenance preference, but do not describe generated instances as second-class
     for detect on that basis.
+
+    When ``expected_scope`` is supplied, partial overlap is never accepted. This is a
+    provenance gate, not a pose-coverage test: BDDL and the template must declare the
+    same objects before geometry from that template can be attributed to the task.
     """
     for root in INSTANCE_ROOTS:
-        hits = glob.glob(os.path.join(root, "*", "json", f"*_task_{activity}_instances",
-                                      "*tro_state.json"))
+        hits = glob.glob(
+            os.path.join(
+                root, "*", "json", f"*_task_{activity}_instances", "*tro_state.json"
+            )
+        )
         hits += glob.glob(os.path.join(root, activity, "*tro_state.json"))
-        if hits:
-            return max(hits, key=os.path.getmtime)
+        for path in sorted(hits, key=os.path.getmtime, reverse=True):
+            if expected_scope is None or scope_mismatch(expected_scope, path) is None:
+                return path
     return None
 
 
@@ -143,8 +153,12 @@ def _scene_of_path(path: str) -> str:
 
 def _from_instance(activity: str, path: str) -> Layout:
     raw = json.load(open(path))
-    lay = Layout(activity=activity, source="sampled",
-                 scene=_scene_of_path(path), instance_path=path)
+    lay = Layout(
+        activity=activity,
+        source="sampled",
+        scene=_scene_of_path(path),
+        instance_path=path,
+    )
     for name, entry in raw.items():
         if name == "robot_poses":
             # Present in official instances, absent from ours -- the generator sets
@@ -193,9 +207,11 @@ def _rng(activity: str) -> float:
 
 def _anchors(world: SymbolicWorld) -> list:
     """Objects that get a fixed spot: room-assigned things and scene furniture."""
-    return sorted(n for n in world.scope_names
-                  if n != world.agent
-                  and (n in world.rooms or "sceneObject" in properties_of(n)))
+    return sorted(
+        n
+        for n in world.scope_names
+        if n != world.agent and (n in world.rooms or "sceneObject" in properties_of(n))
+    )
 
 
 @functools.lru_cache(maxsize=8)
@@ -203,9 +219,14 @@ def _scene_room_centroids(scene_model: str) -> dict:
     """room type -> (x, y) centroid of that room's objects in the real scene."""
     if not scene_model:
         return {}
-    hits = glob.glob(os.path.join(
-        "/data/behavior-data/behavior-1k-assets/scenes", scene_model, "json",
-        f"{scene_model}_best.json"))
+    hits = glob.glob(
+        os.path.join(
+            "/data/behavior-data/behavior-1k-assets/scenes",
+            scene_model,
+            "json",
+            f"{scene_model}_best.json",
+        )
+    )
     if not hits:
         return {}
     d = json.load(open(hits[0]))
@@ -215,10 +236,13 @@ def _scene_room_centroids(scene_model: str) -> dict:
         pos = (reg.get(name) or {}).get("root_link", {}).get("pos")
         if not pos:
             continue
-        for r in (info.get("args", {}).get("in_rooms") or []):
+        for r in info.get("args", {}).get("in_rooms") or []:
             acc[str(r).rsplit("_", 1)[0]].append((float(pos[0]), float(pos[1])))
-    return {r: (sum(x for x, _ in v) / len(v), sum(y for _, y in v) / len(v))
-            for r, v in acc.items() if v}
+    return {
+        r: (sum(x for x, _ in v) / len(v), sum(y for _, y in v) / len(v))
+        for r, v in acc.items()
+        if v
+    }
 
 
 def _generated(activity: str, world: SymbolicWorld) -> Layout:
@@ -235,8 +259,7 @@ def _generated(activity: str, world: SymbolicWorld) -> Layout:
     # Distractors come from a REAL scene even when the task objects do not:
     # `detect` mode needs furniture, and inventing furniture would be a second
     # fabrication on top of the generated positions.
-    lay = Layout(activity=activity, source="generated",
-                 scene="house_single_floor")
+    lay = Layout(activity=activity, source="generated", scene="house_single_floor")
     jitter = _rng(activity)
 
     # Rooms are placed at the REAL scene's room centroids when the scene has a room of
@@ -247,7 +270,9 @@ def _generated(activity: str, world: SymbolicWorld) -> Layout:
     real = _scene_room_centroids(lay.scene)
     for i, room in enumerate(rooms):
         lay.rooms[room] = real.get(room) or (
-            i * (ROOM_W + ROOM_GAP) + ROOM_W / 2, ROOM_H / 2)
+            i * (ROOM_W + ROOM_GAP) + ROOM_W / 2,
+            ROOM_H / 2,
+        )
 
     # Anchors spread inside their room on a coarse grid, so two pieces of furniture
     # never coincide and the agent has somewhere to walk between them.
@@ -261,9 +286,11 @@ def _generated(activity: str, world: SymbolicWorld) -> Layout:
             col, row = k % cols, k // cols
             step_x = ROOM_W / (cols + 1)
             step_y = ROOM_H / (cols + 1)
-            lay.xyz[name] = (cx - ROOM_W / 2 + step_x * (col + 1) + 0.1 * jitter,
-                             cy - ROOM_H / 2 + step_y * (row + 1) + 0.1 * jitter,
-                             FLOOR_H)
+            lay.xyz[name] = (
+                cx - ROOM_W / 2 + step_x * (col + 1) + 0.1 * jitter,
+                cy - ROOM_H / 2 + step_y * (row + 1) + 0.1 * jitter,
+                FLOOR_H,
+            )
 
     # Everything else orbits whatever supports it, resolved outward one level at a
     # time so a can inside a box that is on a table ends up near the table.
@@ -288,8 +315,11 @@ def _generated(activity: str, world: SymbolicWorld) -> Layout:
             for j, name in enumerate(kids):
                 ang = (j / max(len(kids), 1)) * 2 * math.pi + jitter * math.pi
                 r = ORBIT_R * (1 + 0.3 * depth)
-                lay.xyz[name] = (px + r * math.cos(ang), py + r * math.sin(ang),
-                                 pz if on_floor else pz + SURFACE_H)
+                lay.xyz[name] = (
+                    px + r * math.cos(ang),
+                    py + r * math.sin(ang),
+                    pz if on_floor else pz + SURFACE_H,
+                )
                 nxt.append(name)
         frontier, depth = nxt, depth + 1
 
@@ -301,8 +331,9 @@ def _generated(activity: str, world: SymbolicWorld) -> Layout:
 
 
 # --------------------------------------------------------------------------- #
-def build_layout(activity: str, world: Optional[SymbolicWorld] = None,
-                 prefer: str = "sampled") -> Layout:
+def build_layout(
+    activity: str, world: Optional[SymbolicWorld] = None, prefer: str = "sampled"
+) -> Layout:
     """Layout for @activity. Uses real sampled poses when available unless told not to.
 
     @prefer "sampled" -> real poses if an instance exists, else generated.
@@ -311,7 +342,7 @@ def build_layout(activity: str, world: Optional[SymbolicWorld] = None,
     """
     world = world or SymbolicWorld(activity)
     if prefer == "sampled":
-        path = _find_instance(activity)
+        path = _find_instance(activity, world.scope_names)
         if path:
             lay = _from_instance(activity, path)
             if lay.xyz:
@@ -321,10 +352,14 @@ def build_layout(activity: str, world: Optional[SymbolicWorld] = None,
 
 def _main() -> None:
     import argparse
+
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("activity", nargs="?")
-    ap.add_argument("--audit", action="store_true",
-                    help="build a layout for every verified-solvable activity")
+    ap.add_argument(
+        "--audit",
+        action="store_true",
+        help="build a layout for every verified-solvable activity",
+    )
     ap.add_argument("--prefer", default="sampled", choices=["sampled", "generated"])
     args = ap.parse_args()
 
@@ -338,9 +373,12 @@ def _main() -> None:
                 lay = build_layout(a, w, prefer=args.prefer)
                 n_sampled += lay.is_real
                 n_gen += not lay.is_real
-                unplaced += sum(1 for n in w.scope_names
-                                if n != w.agent and w.is_real(n) and n not in lay.xyz)
-            except Exception:                                      # noqa: BLE001
+                unplaced += sum(
+                    1
+                    for n in w.scope_names
+                    if n != w.agent and w.is_real(n) and n not in lay.xyz
+                )
+            except Exception:  # noqa: BLE001
                 fail += 1
         print(f"activities        : {len(acts)}")
         print(f"  sampled poses   : {n_sampled}")

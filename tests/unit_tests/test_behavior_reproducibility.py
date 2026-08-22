@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -26,12 +28,17 @@ _turn_budget = _load_pure_module("_behavior_turn_budget_test", "turn_budget.py")
 _certificate = _load_pure_module(
     "_behavior_solvability_certificate_test", "solvability_certificate.py"
 )
+_compatibility = _load_pure_module(
+    "_behavior_instance_compatibility_test", "instance_compatibility.py"
+)
 CAMERA_OBS_MODES = _sft_build.CAMERA_OBS_MODES
 all_schemas = _sft_build.all_schemas
 tool_schemas = _sft_build.tool_schemas
 turn_budget_for = _turn_budget.turn_budget_for
 build_activity_certificate = _certificate.build_activity_certificate
 classify_object = _certificate.classify_object
+instance_scope = _compatibility.instance_scope
+scope_mismatch = _compatibility.scope_mismatch
 
 
 class ToolSchemaTest(unittest.TestCase):
@@ -165,6 +172,46 @@ class SolvabilityCertificateTest(unittest.TestCase):
         self.assertEqual(cert["outcome_counts"]["found_by_primitive"], 1)
         self.assertEqual(cert["outcome_counts"]["primitive_search_miss"], 1)
         self.assertEqual(cert["outcome_counts"]["missing_pose"], 1)
+
+
+class InstanceCompatibilityTest(unittest.TestCase):
+    def _write_pair(self, root: Path, template_scope, tro_scope) -> Path:
+        tro = root / "example_template-tro_state.json"
+        template = root / "example_template.json"
+        tro.write_text(json.dumps({name: {} for name in tro_scope}))
+        template.write_text(
+            json.dumps(
+                {
+                    "metadata": {
+                        "task": {
+                            "inst_to_name": {
+                                name: f"scene_{name}" for name in template_scope
+                            }
+                        }
+                    }
+                }
+            )
+        )
+        return tro
+
+    def test_exact_template_scope_is_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tro = self._write_pair(Path(directory), ["agent", "plate"], ["plate"])
+            self.assertEqual(instance_scope(str(tro)), {"agent", "plate"})
+            self.assertIsNone(scope_mismatch(["agent", "plate"], str(tro)))
+
+    def test_partial_overlap_reports_both_sides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tro = self._write_pair(
+                Path(directory), ["agent", "taco", "countertop"], ["taco"]
+            )
+            self.assertEqual(
+                scope_mismatch(["agent", "kabob", "breakfast_table"], str(tro)),
+                {
+                    "missing": ["breakfast_table", "kabob"],
+                    "extra": ["countertop", "taco"],
+                },
+            )
 
 
 if __name__ == "__main__":
