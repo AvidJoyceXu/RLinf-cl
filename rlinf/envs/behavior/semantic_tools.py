@@ -29,9 +29,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-import torch as th
-
 import omnigibson as og
+import torch as th
 from omnigibson.object_states import (
     AABB,
     Cooked,
@@ -50,6 +49,12 @@ NEAR_THRESHOLD_M = 1.5
 FOV_HALF_ANGLE_RAD = math.radians(60.0)
 # Max range for the partial-obs gate (m).
 FOV_RANGE_M = 8.0
+FOV_VERTICAL_HALF_ANGLE_RAD = math.radians(45.0)
+CAMERA_TURN_RAD = math.radians(90.0)
+CAMERA_STEP_M = 0.5
+CAMERA_PITCH_STEP_RAD = math.radians(30.0)
+CAMERA_PITCH_LIMIT_RAD = math.radians(60.0)
+CAMERA_HEIGHT_M = 1.2
 # Object-state classes we report/act on in M1 (all cheap "flag" states).
 REPORTED_STATES = {"ToggledOn": ToggledOn, "Open": Open}
 
@@ -75,7 +80,7 @@ class SemanticACI:
     def __init__(self, env, near_threshold: float = NEAR_THRESHOLD_M,
                  obs_mode: str = "full"):
         # env: an omnigibson.envs.Environment (e.g. vec_env.envs[0]).
-        assert obs_mode in ("full", "partial"), obs_mode
+        assert obs_mode in ("full", "partial", "fov"), obs_mode
         self.env = env
         self.scene = env.scene
         self.task = env.task
@@ -84,6 +89,7 @@ class SemanticACI:
         self.robot = robots[0]
         self.near_threshold = near_threshold
         self.obs_mode = obs_mode
+        self.camera_pitch = 0.0
         self._pred = self.task._termination_conditions["predicate"]
         self._held = None          # name of the object currently grasped, or None
         # slice/dice create half-objects and fill/spray instantiate particle systems,
@@ -141,7 +147,22 @@ class SemanticACI:
             return True
         bearing = math.atan2(float(oxy[1] - rxy[1]), float(oxy[0] - rxy[0]))
         diff = abs((bearing - self._robot_yaw() + math.pi) % (2 * math.pi) - math.pi)
-        return diff <= FOV_HALF_ANGLE_RAD
+        if diff > FOV_HALF_ANGLE_RAD:
+            return False
+        if self.obs_mode != "fov":
+            # Preserve the historical partial-mode contract. ``fov`` is the camera
+            # action branch and adds a vertical gate controlled by look_up/down.
+            return True
+        try:
+            low, high = obj.states[AABB].get_value()
+            centre_z = float((low[2] + high[2]) / 2.0)
+        except Exception:
+            centre_z = float(obj.get_position_orientation()[0][2])
+        elevation = math.atan2(
+            centre_z - (float(self._robot_pose()[0][2]) + CAMERA_HEIGHT_M),
+            max(d, 1e-3),
+        )
+        return abs(elevation - self.camera_pitch) <= FOV_VERTICAL_HALF_ANGLE_RAD
 
     # ------------------------------------------------------------------ #
     # goal (reward signal) -- refreshed WITHOUT a physics step
@@ -190,16 +211,19 @@ class SemanticACI:
             obj = getattr(entity, "wrapped_obj", None)
             if obj is None or getattr(entity, "is_system", False):
                 continue
-            if self.obs_mode == "partial" and not self._in_fov(obj):
+            if self.obs_mode in ("partial", "fov") and not self._in_fov(obj):
                 continue
             objs.append(self._obj_report(obj))
-        return {
+        out = {
             "obs_mode": self.obs_mode,
             "robot_xy": [round(float(robot_xy[0]), 2), round(float(robot_xy[1]), 2)],
             "robot_yaw_deg": round(math.degrees(self._robot_yaw()), 1),
             "held": self._held,
             "objects": objs,
         }
+        if self.obs_mode == "fov":
+            out["camera_pitch_deg"] = round(math.degrees(self.camera_pitch), 1)
+        return out
 
     # ------------------------------------------------------------------ #
     # tools
@@ -229,6 +253,94 @@ class SemanticACI:
         self.robot.set_position_orientation(position=target_pos, orientation=quat)
         return self._result(True, "go_to", {"name": name},
                             f"now {self._distance(obj):.2f}m from {name}")
+
+    # ------------------------------------------------------------------ #
+    # camera / base viewpoint controls (fov mode)
+    # ------------------------------------------------------------------ #
+    def _camera_mode_result(self, tool: str, mutate) -> ToolResult:
+        if self.obs_mode != "fov":
+            return self._result(
+                False,
+                tool,
+                {},
+                f"{tool} requires obs_mode='fov', got {self.obs_mode!r}",
+            )
+        mutate()
+        return self._result(True, tool, {}, "viewpoint updated")
+
+    def _set_base_yaw(self, yaw: float) -> None:
+        pos, _ = self._robot_pose()
+        quat = th.tensor(
+            [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)],
+            dtype=pos.dtype,
+            device=pos.device,
+        )
+        self.robot.set_position_orientation(position=pos, orientation=quat)
+
+    def _translate_base(self, forward: float, lateral: float) -> None:
+        """Teleport the base in its local frame, matching ``go_to`` oracle motion.
+
+        This is a viewpoint primitive, not a low-level navigation benchmark; like
+        ``go_to`` it does not yet validate a navmesh path. The debug RGB recorder
+        follows the resulting real simulator pose, so collisions/out-of-room motion
+        are visible and can be audited before this mode is certified.
+        """
+        pos, quat = self._robot_pose()
+        yaw = self._robot_yaw()
+        dx = forward * math.cos(yaw) - lateral * math.sin(yaw)
+        dy = forward * math.sin(yaw) + lateral * math.cos(yaw)
+        target = pos.clone()
+        target[0] += dx
+        target[1] += dy
+        self.robot.set_position_orientation(position=target, orientation=quat)
+
+    def turn_left(self) -> ToolResult:
+        return self._camera_mode_result(
+            "turn_left", lambda: self._set_base_yaw(self._robot_yaw() + CAMERA_TURN_RAD)
+        )
+
+    def turn_right(self) -> ToolResult:
+        return self._camera_mode_result(
+            "turn_right", lambda: self._set_base_yaw(self._robot_yaw() - CAMERA_TURN_RAD)
+        )
+
+    def move_ahead(self) -> ToolResult:
+        return self._camera_mode_result(
+            "move_ahead", lambda: self._translate_base(CAMERA_STEP_M, 0.0)
+        )
+
+    def move_back(self) -> ToolResult:
+        return self._camera_mode_result(
+            "move_back", lambda: self._translate_base(-CAMERA_STEP_M, 0.0)
+        )
+
+    def strafe_left(self) -> ToolResult:
+        return self._camera_mode_result(
+            "strafe_left", lambda: self._translate_base(0.0, CAMERA_STEP_M)
+        )
+
+    def strafe_right(self) -> ToolResult:
+        return self._camera_mode_result(
+            "strafe_right", lambda: self._translate_base(0.0, -CAMERA_STEP_M)
+        )
+
+    def look_down(self) -> ToolResult:
+        def mutate():
+            self.camera_pitch = max(
+                -CAMERA_PITCH_LIMIT_RAD,
+                self.camera_pitch - CAMERA_PITCH_STEP_RAD,
+            )
+
+        return self._camera_mode_result("look_down", mutate)
+
+    def look_up(self) -> ToolResult:
+        def mutate():
+            self.camera_pitch = min(
+                CAMERA_PITCH_LIMIT_RAD,
+                self.camera_pitch + CAMERA_PITCH_STEP_RAD,
+            )
+
+        return self._camera_mode_result("look_up", mutate)
 
     def _set_flag(self, tool, name, state_cls, value, need_closed=False):
         obj = self._resolve(name)
@@ -382,7 +494,7 @@ class SemanticACI:
         self._held = name
         return self._result(True, "grasp", {"name": name}, f"holding {name}")
 
-    def release(self, name: str = None) -> ToolResult:
+    def release(self, name: str | None = None) -> ToolResult:
         if self._held is None:
             return self._result(False, "release", {}, "precondition failed: not holding anything")
         held = self._held

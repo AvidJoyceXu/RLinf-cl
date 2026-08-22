@@ -47,21 +47,27 @@ def _rlinf_root() -> str:
     return str(pathlib.Path(__file__).resolve().parents[3])
 
 
-def _instance_root() -> str:
-    data = os.environ.get("OMNIGIBSON_DATA_PATH", "/data/behavior-data")
-    return os.path.join(data, "2025-challenge-task-instances", "scenes")
+def resolve_scene_and_dir(
+    activity: str,
+    scene: str | None = None,
+    source: str | None = None,
+) -> tuple[str, str]:
+    """Return ``(scene, instance_dir)`` from one explicit versioned source.
 
+    ``BEHAVIOR_INSTANCE_SOURCE`` selects the source when ``source`` is omitted. The
+    default remains ``2025-official`` for the installed v3.7 simulator, but the
+    resolver no longer searches 2025, 2026 and local samples as one anonymous pool.
+    """
+    from rlinf.envs.behavior.instance_sources import resolve_activity_location
 
-def resolve_scene_and_dir(activity: str, scene: str | None = None) -> tuple[str, str]:
-    """Return (scene, instance_dir) for @activity. Each activity has exactly one
-    home scene; if @scene is given we honor it, else we discover it."""
-    root = _instance_root()
-    for sc in ([scene] if scene else INSTANCE_SCENES):
-        d = os.path.join(root, sc, "json", f"{sc}_task_{activity}_instances")
-        if os.path.isdir(d):
-            return sc, d
-    raise ValueError(f"no instance dir for activity={activity!r} under {root} "
-                     f"(scenes tried: {[scene] if scene else list(INSTANCE_SCENES)})")
+    data_root = os.environ.get("OMNIGIBSON_DATA_PATH", "/data/behavior-data")
+    location = resolve_activity_location(
+        activity,
+        source_name=source,
+        scene=scene,
+        data_root=data_root,
+    )
+    return location.scene, location.directory
 
 
 def harvest_one(activity: str, out_dir: str, obs_mode: str, scene: str | None = None,
@@ -87,7 +93,9 @@ def harvest_one(activity: str, out_dir: str, obs_mode: str, scene: str | None = 
     from rlinf.envs.behavior import expert_planner as ep
     from rlinf.envs.behavior import sft_build as sb
     from rlinf.envs.behavior.instance_loader import (
-        discover_activity_instance_files, load_activity_instance_tro_state)
+        discover_activity_instance_files,
+        load_activity_instance_tro_state,
+    )
     from rlinf.envs.behavior.semantic_tools import SemanticACI
     from rlinf.envs.behavior.utils import setup_omni_cfg
 

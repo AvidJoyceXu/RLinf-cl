@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import sys
@@ -31,6 +32,13 @@ _certificate = _load_pure_module(
 _compatibility = _load_pure_module(
     "_behavior_instance_compatibility_test", "instance_compatibility.py"
 )
+_sources = _load_pure_module("_behavior_instance_sources_test", "instance_sources.py")
+_capabilities = _load_pure_module(
+    "_behavior_harness_capabilities_test", "harness_capabilities.py"
+)
+_trajectory_video = _load_pure_module(
+    "_behavior_trajectory_video_test", "trajectory_video.py"
+)
 CAMERA_OBS_MODES = _sft_build.CAMERA_OBS_MODES
 all_schemas = _sft_build.all_schemas
 tool_schemas = _sft_build.tool_schemas
@@ -39,6 +47,12 @@ build_activity_certificate = _certificate.build_activity_certificate
 classify_object = _certificate.classify_object
 instance_scope = _compatibility.instance_scope
 scope_mismatch = _compatibility.scope_mismatch
+assert_detect_eligible = _sources.assert_detect_eligible
+resolve_activity_location = _sources.resolve_activity_location
+selected_layout_sources = _sources.selected_layout_sources
+source_catalog = _sources.source_catalog
+validate_harness = _capabilities.validate_harness
+TrajectoryVideoRecorder = _trajectory_video.TrajectoryVideoRecorder
 
 
 class ToolSchemaTest(unittest.TestCase):
@@ -70,6 +84,114 @@ class ToolSchemaTest(unittest.TestCase):
             self.assertEqual(len(names), 25, msg=mode)
             self.assertEqual(len(names), len(set(names)), msg=mode)
             self.assertEqual(set(names) - set(core_names), expected_camera, msg=mode)
+
+
+class InstanceSourcePolicyTest(unittest.TestCase):
+    def test_default_layout_sources_exclude_local_samples(self):
+        names = [source.name for source in selected_layout_sources(data_root="/tmp/x")]
+        self.assertEqual(names, ["2026-v3.9.1", "2025-official"])
+        self.assertNotIn("local-v3.7", names)
+
+    def test_unknown_and_duplicate_sources_fail_closed(self):
+        with self.assertRaises(ValueError):
+            selected_layout_sources("invented", data_root="/tmp/x")
+        with self.assertRaises(ValueError):
+            selected_layout_sources(
+                "2025-official,2025-official", data_root="/tmp/x"
+            )
+
+    def test_local_samples_are_not_detect_eligible(self):
+        catalog = source_catalog("/tmp/x")
+        with self.assertRaisesRegex(ValueError, "paired .*template"):
+            assert_detect_eligible(catalog["local-v3.7"])
+        assert_detect_eligible(catalog["2025-official"])
+        assert_detect_eligible(catalog["2026-v3.9.1"])
+
+    def test_simulator_resolution_never_crosses_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scene = "house_single_floor"
+            rel = Path("2025-challenge-task-instances/scenes") / scene / "json"
+            activity_dir = rel / f"{scene}_task_task_a_instances"
+            (root / activity_dir).mkdir(parents=True)
+            location = resolve_activity_location(
+                "task_a", source_name="2025-official", data_root=str(root)
+            )
+            self.assertEqual(location.source.name, "2025-official")
+            self.assertEqual(Path(location.directory), root / activity_dir)
+            with self.assertRaisesRegex(ValueError, "source='2026-v3.9.1'"):
+                resolve_activity_location(
+                    "task_a", source_name="2026-v3.9.1", data_root=str(root)
+                )
+
+
+class HarnessCapabilityTest(unittest.TestCase):
+    def test_omnigibson_fov_schema_has_dispatch_methods(self):
+        root = Path(__file__).resolve().parents[2]
+        tree = ast.parse(
+            (root / "rlinf/envs/behavior/semantic_tools.py").read_text()
+        )
+        semantic_aci = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "SemanticACI"
+        )
+        methods = {
+            node.name
+            for node in semantic_aci.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        schema_names = {tool["name"] for tool in all_schemas("fov")}
+        self.assertFalse(schema_names - methods, msg=sorted(schema_names - methods))
+
+    def test_schema_only_omnigibson_modes_fail_before_launch(self):
+        validate_harness("omnigibson", "fov")
+        for mode in ("detect", "detect_scope", "fov_distract", "object"):
+            with self.assertRaisesRegex(ValueError, "Schema registration alone"):
+                validate_harness("omnigibson", mode)
+
+    def test_policy_rgb_transport_is_not_claimed(self):
+        with self.assertRaisesRegex(ValueError, "tokenizes JSON tool text only"):
+            validate_harness("omnigibson", "fov", policy_rgb=True)
+
+    def test_textworld_keeps_all_symbolic_observation_modes(self):
+        for mode in (
+            "full",
+            "partial",
+            "object",
+            "fov",
+            "fov_distract",
+            "detect",
+            "detect_scope",
+        ):
+            validate_harness("textworld", mode)
+
+
+class TrajectoryVideoTest(unittest.TestCase):
+    def test_one_video_and_aligned_sidecar_per_complete_session(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = TrajectoryVideoRecorder(directory, fps=2)
+            video = recorder.begin(
+                {"activity": "task_a", "instance_id": 7, "session_id": "abc"}
+            )
+            frame = np.zeros((32, 48, 3), dtype=np.uint8)
+            recorder.append(frame, tool="session_start", ok=True)
+            recorder.append(frame, tool="turn_left", ok=True)
+            record = recorder.finish(complete=True, reason="session_end")
+            self.assertTrue(Path(video).is_file())
+            self.assertGreater(Path(video).stat().st_size, 0)
+            sidecars = list(Path(directory).glob("*.json"))
+            videos = list(Path(directory).glob("*.mp4"))
+            self.assertEqual(len(sidecars), 1)
+            self.assertEqual(len(videos), 1)
+            self.assertTrue(record["complete"])
+            self.assertEqual(record["frames"], 2)
+            self.assertEqual(
+                [event["tool"] for event in record["events"]],
+                ["session_start", "turn_left"],
+            )
 
 
 class TurnBudgetTest(unittest.TestCase):

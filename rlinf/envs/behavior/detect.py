@@ -72,10 +72,29 @@ SCENE_ROOT = "/data/behavior-data/behavior-1k-assets/scenes"
 NATIVE_BBOX_PATH = "/data/behavior-data/native_bbox.json"
 
 
-@functools.lru_cache(maxsize=1)
-def _native_bbox() -> dict:
-    with open(NATIVE_BBOX_PATH) as f:
+@functools.lru_cache(maxsize=4)
+def _load_native_bbox(path: str) -> dict:
+    with open(path) as f:
         return json.load(f)
+
+
+def _native_bbox() -> dict:
+    """Load the bbox artifact selected for this asset release.
+
+    Both paths are environment-selectable because old and synchronized v3.9 assets
+    coexist on the same host. Caching by resolved path prevents one process from
+    accidentally reusing the old artifact after an explicit source switch.
+    """
+    return _load_native_bbox(native_bbox_path())
+
+
+def native_bbox_path() -> str:
+    """The version-pinned bbox artifact selected for this process."""
+    return os.environ.get("BEHAVIOR_NATIVE_BBOX_PATH", NATIVE_BBOX_PATH)
+
+
+def _scene_root() -> str:
+    return os.environ.get("BEHAVIOR_ASSET_SCENE_ROOT", SCENE_ROOT)
 
 
 @functools.lru_cache(maxsize=4)
@@ -181,7 +200,7 @@ def scene_furniture(scene_model: str) -> tuple:
     These are the distractors, and they are REAL -- read from the shipped scene json,
     not invented. Only the task objects' positions may come from a sampled instance.
     """
-    hits = glob.glob(os.path.join(SCENE_ROOT, scene_model, "json",
+    hits = glob.glob(os.path.join(_scene_root(), scene_model, "json",
                                   f"{scene_model}_best.json"))
     if not hits:
         return ()

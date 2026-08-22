@@ -70,6 +70,7 @@ import functools
 import json
 import math
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -108,8 +109,13 @@ _POSITIONAL = ("ontop", "inside", "under", "touching", "overlaid", "draped")
 # --------------------------------------------------------------------------- #
 @functools.lru_cache(maxsize=1)
 def _property_table() -> dict:
-    path = os.path.join(os.path.dirname(bddl.__file__), "generated_data",
-                        "propagated_annots_canonical.json")
+    definition_root = os.environ.get("BEHAVIOR_BDDL_DEFINITION_ROOT")
+    package_root = os.path.dirname(definition_root) if definition_root else os.path.dirname(
+        bddl.__file__
+    )
+    path = os.path.join(
+        package_root, "generated_data", "propagated_annots_canonical.json"
+    )
     with open(path) as f:
         return json.load(f)
 
@@ -276,7 +282,39 @@ class SymbolicWorld:
     def __init__(self, activity: str, definition: int = 0):
         self.activity = activity
         self.definition = definition
-        self.conds = Conditions(activity, definition, "omnigibson")
+        self.definition_source = "installed"
+        predefined_problem = None
+        definition_root = os.environ.get("BEHAVIOR_BDDL_DEFINITION_ROOT")
+        if definition_root:
+            problem_path = os.path.join(
+                definition_root, activity, f"problem{definition}.bddl"
+            )
+            if not os.path.isfile(problem_path):
+                raise FileNotFoundError(
+                    f"pinned BDDL definition missing: {problem_path}"
+                )
+            predefined_problem = open(problem_path).read()
+            # The installed v3.7 evaluator calls its equivalent domain
+            # ``omnigibson``; v3.9.1 renamed it to ``behavior-1k`` while retaining
+            # the predicates this symbolic backend uses. Feed the pinned problem to
+            # the old, tested evaluator after changing only the declared domain.
+            predefined_problem, replacements = re.subn(
+                r"\(:domain\s+behavior-1k\)",
+                "(:domain omnigibson)",
+                predefined_problem,
+                count=1,
+            )
+            if replacements != 1:
+                raise ValueError(
+                    f"{problem_path}: expected exactly one behavior-1k domain line"
+                )
+            self.definition_source = os.path.abspath(problem_path)
+        self.conds = Conditions(
+            activity,
+            definition,
+            "omnigibson",
+            predefined_problem=predefined_problem,
+        )
         self.scope_names = list(get_object_scope(self.conds))
         self.to_display, self.from_display = display_names(self.scope_names)
         # BEHAVIOR always names the robot agent.n.01_1; assert rather than guess,
@@ -510,7 +548,15 @@ class SymbolicACI:
         if obs_mode in self.CAMERA_MODES:
             from rlinf.envs.behavior.layout import build_layout
             from rlinf.envs.behavior.viewpoint import Viewpoint
-            self.layout = build_layout(world.activity, world, prefer=layout_prefer)
+            self.layout = build_layout(
+                world.activity,
+                world,
+                prefer=layout_prefer,
+                # Detect needs the paired template to recover the concrete asset
+                # model for each scope name. Local tro_state-only samples cannot
+                # satisfy that contract and must not fall back to category medians.
+                require_detect_models=obs_mode in self.DETECT_MODES,
+            )
             if obs_mode != "fov" and not self.layout.is_real:
                 # NO INVENTED POSES ONCE THE SCENE IS INVOLVED. Every pose must come
                 # from BEHAVIOR's sampler, which is the only source that puts task

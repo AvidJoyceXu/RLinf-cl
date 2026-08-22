@@ -58,7 +58,11 @@ class BehaviorEnv:
 
     def __init__(self, activity: str, obs_mode: str = "full",
                  instances_per_activity: int = 0, rgb: bool = False,
-                 partial_scene: bool = True, fast_reset: bool = False):
+                 partial_scene: bool = True, fast_reset: bool = False,
+                 instance_source: str | None = None,
+                 debug_video_dir: str | None = None,
+                 debug_video_fps: int = 4,
+                 debug_render_iters: int = 3):
         from omegaconf import OmegaConf
         from omnigibson.envs import VectorEnvironment
 
@@ -72,7 +76,14 @@ class BehaviorEnv:
         self.activity = activity
         self.obs_mode = obs_mode
         self.fast_reset = fast_reset
-        self.scene, inst_dir = resolve_scene_and_dir(activity)
+        self.debug_video_dir = debug_video_dir
+        self.debug_render_iters = debug_render_iters
+        self.instance_source = instance_source or os.environ.get(
+            "BEHAVIOR_INSTANCE_SOURCE", "2025-official"
+        )
+        self.scene, inst_dir = resolve_scene_and_dir(
+            activity, source=self.instance_source
+        )
 
         cfg = OmegaConf.load(
             "/workspace/RLinf/examples/embodiment/config/env/behavior_r1pro.yaml")
@@ -111,11 +122,24 @@ class BehaviorEnv:
             # vision-augmentation ablation, where the cost is the point.
             OmegaConf.update(cfg, "omni_config.robots.0.obs_modalities",
                              ["proprio"], force_add=True)
+        if debug_video_dir:
+            # The recorder uses one viewer camera rather than loading all R1 camera
+            # sensors. This is a boot-time macro and cannot be enabled later.
+            OmegaConf.update(
+                cfg, "omni_config.macro.render_viewer_camera", True, force_add=True
+            )
         self.vec_env = VectorEnvironment(
             1, OmegaConf.to_container(setup_omni_cfg(cfg), resolve=True))
         self.vec_env.reset()
         self.env = self.vec_env.envs[0]
         self.aci = SemanticACI(self.env, obs_mode=obs_mode)
+        self.video_recorder = None
+        if debug_video_dir:
+            from rlinf.envs.behavior.trajectory_video import TrajectoryVideoRecorder
+
+            self.video_recorder = TrajectoryVideoRecorder(
+                debug_video_dir, fps=debug_video_fps
+            )
 
         task = self.env.task
         self.goal_lines = sb.goal_atoms_to_lines(task.ground_goal_state_options[0])
@@ -193,6 +217,7 @@ class BehaviorEnv:
         _t0 = _t.time()
         reset_to_instance(self.aci, self.env, inst,
                           reset_scene=not self.fast_reset, hard_reset=hard)
+        self.aci.camera_pitch = 0.0
         d_reset = _t.time() - _t0
         self.aci.object_set_dirty = False
 
@@ -212,12 +237,13 @@ class BehaviorEnv:
         )
 
         self.session_id = uuid4().hex
-        return {
+        result = {
             "session_id": self.session_id,
             "activity": self.activity,
             "scene": self.scene,
             "instance_id": inst.instance_id,
             "obs_mode": self.obs_mode,
+            "instance_source": self.instance_source,
             # Both goal renderings travel together; which one reaches the policy is
             # the agent loop's `goal_format` choice, so the NL and atoms conditions
             # are the same server and the same episode -- only the prompt differs.
@@ -228,6 +254,19 @@ class BehaviorEnv:
             # success; the caller must drop such episodes rather than score them.
             "contaminated": bool(self.aci.is_success()),
         }
+        if self.video_recorder is not None:
+            result["debug_video"] = self.video_recorder.begin(
+                {
+                    "session_id": self.session_id,
+                    "activity": self.activity,
+                    "scene": self.scene,
+                    "instance_id": inst.instance_id,
+                    "instance_source": self.instance_source,
+                    "obs_mode": self.obs_mode,
+                }
+            )
+            self._record_debug_frame("session_start", ok=True)
+        return result
 
     def call(self, name: str, arguments: dict) -> dict:
         """Dispatch one tool and return {payload, meta}.
@@ -239,16 +278,53 @@ class BehaviorEnv:
 
         fn = getattr(self.aci, name, None)
         if fn is None or name.startswith("_"):
-            return {"payload": {"ok": False, "reason": f"unknown_tool:{name}"},
-                    "meta": self._meta(), "terminal": False}
+            payload = {"ok": False, "reason": f"unknown_tool:{name}"}
+            self._record_debug_frame(name or "unknown_tool", ok=False)
+            return {"payload": payload, "meta": self._meta(), "terminal": False}
         try:
             res = fn(**(arguments or {}))
         except TypeError as ex:                       # bad/missing arguments
-            return {"payload": {"ok": False, "reason": f"bad_arguments: {ex}"},
-                    "meta": self._meta(), "terminal": False}
-        return {"payload": result_payload(name, res),
-                "meta": self._meta(),
+            payload = {"ok": False, "reason": f"bad_arguments: {ex}"}
+            self._record_debug_frame(name, ok=False)
+            return {"payload": payload, "meta": self._meta(), "terminal": False}
+        payload = result_payload(name, res)
+        self._record_debug_frame(name, ok=bool(payload.get("ok", True)))
+        return {"payload": payload, "meta": self._meta(),
                 "terminal": name == "end_task"}
+
+    def _record_debug_frame(self, tool: str, ok: bool) -> None:
+        """Capture the camera after every tool, independent of policy RGB delivery."""
+        if self.video_recorder is None:
+            return
+        import numpy as np
+        import omnigibson as og
+        import torch as th
+
+        from rlinf.envs.behavior.render_rgb import look_quat
+        from rlinf.envs.behavior.semantic_tools import CAMERA_HEIGHT_M
+
+        cam = og.sim.viewer_camera
+        if cam is None:
+            raise RuntimeError("debug video requested but viewer camera was not created")
+        base_pos, _ = self.aci._robot_pose()
+        yaw = self.aci._robot_yaw()
+        pitch = float(getattr(self.aci, "camera_pitch", 0.0))
+        camera_pos = th.tensor(
+            [float(base_pos[0]), float(base_pos[1]), float(base_pos[2]) + CAMERA_HEIGHT_M],
+            dtype=base_pos.dtype,
+            device=base_pos.device,
+        )
+        cam.set_position_orientation(
+            position=camera_pos, orientation=look_quat(yaw, pitch)
+        )
+        for _ in range(max(1, self.debug_render_iters)):
+            og.sim.render()
+        raw = cam.get_obs()[0]["rgb"]
+        frame = raw[..., :3]
+        frame = frame.cpu().numpy() if hasattr(frame, "cpu") else np.asarray(frame)
+        if frame.size == 0:
+            raise RuntimeError("viewer camera returned an empty RGB frame")
+        self.video_recorder.append(frame, tool=tool, ok=ok)
 
     def _meta(self) -> dict:
         """Real BDDL goal evaluation — pure logic over true simulator state."""
@@ -259,10 +335,15 @@ class BehaviorEnv:
                 "is_success": (len(gs["unsatisfied"]) == 0 and n_sat > 0)}
 
     def end(self) -> dict:
+        video = None
+        if self.video_recorder is not None:
+            video = self.video_recorder.finish(complete=True, reason="session_end")
         self.session_id = None
-        return {"ok": True}
+        return {"ok": True, "debug_video": video}
 
     def close(self):
+        if self.video_recorder is not None:
+            self.video_recorder.finish(complete=False, reason="environment_closed")
         try:
             self.vec_env.close()
         except Exception:
@@ -367,6 +448,10 @@ def main():
     ap.add_argument("--obs-mode", default="full", choices=["full", "partial"])
     ap.add_argument("--instances-per-activity", type=int, default=0,
                     help="0 = all pre-sampled instances")
+    ap.add_argument("--instance-source", default=None,
+                    choices=["2025-official", "2026-v3.9.1", "local-v3.7"],
+                    help="one versioned instance population; defaults to "
+                         "BEHAVIOR_INSTANCE_SOURCE or 2025-official")
     ap.add_argument("--rgb", action="store_true",
                     help="load the robot's cameras (adds ~10 min to boot; only the "
                          "vision-augmentation ablation needs them)")
@@ -378,11 +463,20 @@ def main():
                          "the fix for the >90 min reset (DEBUG-LOG §5); verify the "
                          "start state (contaminated flag + observe) before trusting "
                          "a training run with it on.")
+    ap.add_argument("--debug-video-dir", default=None,
+                    help="record one viewer-camera MP4 plus JSON sidecar per complete "
+                         "tool trajectory; frames are captured after every tool")
+    ap.add_argument("--debug-video-fps", type=int, default=4)
+    ap.add_argument("--debug-render-iters", type=int, default=3)
     args = ap.parse_args()
 
     env = BehaviorEnv(args.activity, args.obs_mode, args.instances_per_activity,
                       rgb=args.rgb, partial_scene=not args.full_scene,
-                      fast_reset=args.fast_reset)
+                      fast_reset=args.fast_reset,
+                      instance_source=args.instance_source,
+                      debug_video_dir=args.debug_video_dir,
+                      debug_video_fps=args.debug_video_fps,
+                      debug_render_iters=args.debug_render_iters)
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(env))
     # Boot is ~5 min (shader compile); the trainer polls /health, so announce
     # readiness on a line it can grep rather than making it guess.

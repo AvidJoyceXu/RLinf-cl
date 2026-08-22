@@ -59,6 +59,11 @@ def build_activity_certificate(
     return {
         "activity": activity,
         "source": tour.get("source", primitive.get("source")),
+        "instance_source": tour.get(
+            "instance_source", primitive.get("instance_source")
+        ),
+        "bddl_release": tour.get("bddl_release", primitive.get("bddl_release")),
+        "asset_release": tour.get("asset_release", primitive.get("asset_release")),
         "instance_path": tour.get("instance_path", primitive.get("instance_path")),
         "targets": len(targets),
         "primitive_steps": primitive["steps"],

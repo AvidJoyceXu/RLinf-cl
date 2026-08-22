@@ -79,11 +79,24 @@ class BehaviorToolWorker(ToolWorker):
         assert self.backend in ("omnigibson", "textworld"), self.backend
         self.obs_mode: str = str(tcfg.get("obs_mode", "full"))
         self.instances_per_activity: int = int(tcfg.get("instances_per_activity", 1))
+        self.instance_source: str | None = tcfg.get("instance_source", None)
         # Cameras off / partial scene load are the defaults for the same reason as in
         # env_server.py: the semantic ACI reads no pixels, and camera load cost ~13 of
         # ~16 boot minutes on a non-ray-tracing GPU.
         self.rgb: bool = bool(tcfg.get("rgb", False))
+        self.policy_rgb: bool = bool(tcfg.get("policy_rgb", False))
         self.partial_scene: bool = bool(tcfg.get("partial_scene", True))
+        self.debug_video_dir: str | None = tcfg.get("debug_video_dir", None)
+        self.debug_video_fps: int = int(tcfg.get("debug_video_fps", 4))
+        self.debug_render_iters: int = int(tcfg.get("debug_render_iters", 3))
+
+        # Validate what the backend truly implements before Ray, Kit, or model
+        # weights are started. A 25-tool schema is not evidence that OmniGibson can
+        # dispatch every method, and loading camera sensors is not evidence that the
+        # agent loop transports their pixels.
+        from rlinf.envs.behavior.harness_capabilities import validate_harness
+
+        validate_harness(self.backend, self.obs_mode, policy_rgb=self.policy_rgb)
 
         # Booting Kit on a worker thread does not work. Two main-thread assumptions
         # were patchable (signal.signal, a missing event loop); the third was not --
@@ -433,6 +446,10 @@ class BehaviorToolWorker(ToolWorker):
                 instances_per_activity=self.instances_per_activity,
                 rgb=self.rgb,
                 partial_scene=self.partial_scene,
+                instance_source=self.instance_source,
+                debug_video_dir=self.debug_video_dir,
+                debug_video_fps=self.debug_video_fps,
+                debug_render_iters=self.debug_render_iters,
             )
         finally:
             _signal.signal = real_signal

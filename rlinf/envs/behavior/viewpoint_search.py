@@ -22,6 +22,7 @@ bound a policy could in principle reach, not one only an oracle could.
 """
 from __future__ import annotations
 
+import glob
 import hashlib
 import json
 import os
@@ -59,6 +60,32 @@ def _sha256(path: str) -> str | None:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _activities_from_source(path: str) -> tuple[list[str], str]:
+    """Load a pinned list or derive one from an official ``scenes`` directory."""
+    if os.path.isdir(path):
+        directories = glob.glob(os.path.join(path, "*", "json", "*_task_*_instances"))
+        activities = sorted(
+            {
+                os.path.basename(directory)
+                .split("_task_", 1)[1]
+                .rsplit("_instances", 1)[0]
+                for directory in directories
+            }
+        )
+    else:
+        with open(path) as stream:
+            payload = json.load(stream)
+        activities = payload if isinstance(payload, list) else payload.get(
+            "solved", payload.get("activities")
+        )
+    if not isinstance(activities, list) or not activities or not all(
+        isinstance(activity, str) for activity in activities
+    ):
+        raise ValueError("activity source must resolve to a non-empty string list")
+    canonical = json.dumps(sorted(activities), separators=(",", ":")).encode()
+    return activities, hashlib.sha256(canonical).hexdigest()
 
 
 def sweep(aci: SymbolicACI, on_view=None) -> int:
@@ -219,6 +246,9 @@ def explore(activity: str, layout_prefer: str = "sampled",
     return {
         "activity": activity,
         "source": aci.layout.source,
+        "instance_source": aci.layout.instance_source or None,
+        "bddl_release": aci.layout.bddl_release or None,
+        "asset_release": aci.layout.asset_release or None,
         "instance_path": aci.layout.instance_path or None,
         "locatable": len(locatable),
         "found": len(found),
@@ -321,6 +351,9 @@ def _explore_detect(world, aci, targets, locatable, steps, budget, use_tour=Fals
     }
     return {
         "activity": world.activity, "source": aci.layout.source,
+        "instance_source": aci.layout.instance_source or None,
+        "bddl_release": aci.layout.bddl_release or None,
+        "asset_release": aci.layout.asset_release or None,
         "instance_path": aci.layout.instance_path or None,
         "locatable": len(locatable), "found": len(found & locatable),
         "complete": locatable <= found, "steps": steps,
@@ -351,6 +384,9 @@ def _main() -> None:
                                             "requires --all, --source-id and --container-id")
     ap.add_argument("--source-id", help="exact RLinf Git commit recorded in a certificate")
     ap.add_argument("--container-id", help="container image name/digest recorded in a certificate")
+    ap.add_argument("--activity-source", default=ACTIVITY_SOURCE,
+                    help="JSON list, or an object containing a 'solved' or "
+                         "'activities' list; the exact file is hashed")
     ap.add_argument("--out", help="write {activity: oracle_steps} as JSON. This table is "
                                   "what an ORACLE-RELATIVE turn budget is computed from: "
                                   "max_turns = K * oracle_steps(activity). A flat budget "
@@ -382,12 +418,14 @@ def _main() -> None:
                                  args.obs_mode), indent=1))
         return
 
-    with open(ACTIVITY_SOURCE) as stream:
-        acts = json.load(stream)["solved"]
+    try:
+        acts, activity_list_sha256 = _activities_from_source(args.activity_source)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        ap.error(f"invalid --activity-source: {exc}")
     if args.n:
         acts = acts[:args.n]
     if args.certificate:
-        from rlinf.envs.behavior.detect import NATIVE_BBOX_PATH
+        from rlinf.envs.behavior.detect import native_bbox_path
         from rlinf.envs.behavior.solvability_certificate import (
             build_activity_certificate,
         )
@@ -425,12 +463,13 @@ def _main() -> None:
             "primitive_budget": args.budget,
             "tour_budget": args.tour_budget,
             "activity_source": {
-                "path": ACTIVITY_SOURCE,
-                "sha256": _sha256(ACTIVITY_SOURCE),
+                "path": args.activity_source,
+                "sha256": _sha256(args.activity_source),
+                "activity_list_sha256": activity_list_sha256,
             },
             "native_bbox": {
-                "path": NATIVE_BBOX_PATH,
-                "sha256": _sha256(NATIVE_BBOX_PATH),
+                "path": native_bbox_path(),
+                "sha256": _sha256(native_bbox_path()),
             },
             "summary": {
                 "requested_activities": len(acts),

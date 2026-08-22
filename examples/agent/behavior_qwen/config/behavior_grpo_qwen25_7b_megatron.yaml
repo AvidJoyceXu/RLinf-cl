@@ -185,6 +185,7 @@ tools:
     # activity per process anyway, so this states what was already true.
     activity: picking_up_trash
     obs_mode: full
+    instance_source: 2025-official
     # 0 = keep ALL discovered instances. This must not truncate: build_rl_dataset
     # samples arbitrary instance ids (59, 97, 124, ... for picking_up_trash) while
     # `instances_per_activity: N` keeps only the first N (ids 0..N-1), so every
@@ -192,6 +193,10 @@ tools:
     # one instance at a time -- so keeping all 351 costs nothing.
     instances_per_activity: 0
     rgb: False                   # the semantic ACI reads no pixels
+    policy_rgb: False            # no vision-token transport in the agent loop yet
+    debug_video_dir: null        # one complete MP4 + JSON per session when set
+    debug_video_fps: 4
+    debug_render_iters: 3
     partial_scene: True          # load_task_relevant_only -> 122 objects, 0.1s reset
 
 

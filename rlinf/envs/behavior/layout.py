@@ -40,29 +40,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from rlinf.envs.behavior.instance_compatibility import scope_mismatch
-from rlinf.envs.behavior.symbolic_world import SymbolicWorld, properties_of
-
-# Where sampled instances land. Both the official challenge tree and anything our own
-# sampler wrote are searched, official first.
-INSTANCE_ROOTS = (
-    # The 2026 challenge set has 100 activities and ~324 instances per activity,
-    # which makes within-activity splits possible. It is NOT a superset of the 2025
-    # set: 16 activities exist only in 2025, so both roots are required. 2026 goes
-    # first only because its many instances are preferable when an activity overlaps.
-    # Fetched with `download_and_unpack_zipped_dataset("2026-challenge-task-instances")`;
-    # 0.11 GB. The union covers 116 activities before our own generated instances.
-    "/data/behavior-data/2026-challenge-task-instances/scenes",
-    "/data/behavior-data/2025-challenge-task-instances/scenes",
-    # Instances we generate ourselves with upstream's multiply_b1k_tasks.py land in the
-    # ASSET tree, not the challenge tree -- that script derives its save_dir from
-    # get_dataset_path("behavior-1k-assets"). Without this root they exist on disk and
-    # `detect` still reports the activity as having no sampled instance.
-    "/data/behavior-data/behavior-1k-assets/scenes",
-    "/data/behavior-data/_samp0816",
-    "/data/behavior-data/_hitrate13",
-    "/data/behavior-data/_hitrate11",
-    "/data/behavior-data/_hitrate10",
+from rlinf.envs.behavior.instance_sources import (
+    InstanceSource,
+    assert_detect_eligible,
+    selected_layout_sources,
 )
+from rlinf.envs.behavior.symbolic_world import SymbolicWorld, properties_of
 
 # Generated-layout geometry, in metres. Chosen to look like a house rather than to
 # match one: rooms are 6x5, objects orbit their support at 0.6 m.
@@ -85,6 +68,9 @@ class Layout:
     robot_yaw: float = 0.0
     scene: str = ""  # scene_model, for furniture
     instance_path: str = ""  # the tro_state file, for models
+    instance_source: str = ""  # versioned source name from instance_sources.py
+    bddl_release: str = ""
+    asset_release: str = ""
 
     @property
     def is_real(self) -> bool:
@@ -98,11 +84,17 @@ class Layout:
 # sampled poses
 # --------------------------------------------------------------------------- #
 def _find_instance(
-    activity: str, expected_scope=None, ignored_scope=()
-) -> Optional[str]:
+    activity: str,
+    expected_scope=None,
+    ignored_scope=(),
+    *,
+    source_selection: str | None = None,
+    require_detect_models: bool = False,
+) -> Optional[tuple[str, InstanceSource]]:
     """Preferred compatible `*-tro_state.json` for @activity, or None.
 
-    INSTANCE_ROOTS is ordered by PREFERENCE, and the first root wins outright; mtime
+    The selected source registry is ordered by PREFERENCE, and the first source wins
+    outright; mtime
     only breaks ties within a root. Official challenge instances are preferred because
     they passed the published pipeline and, in the 2026 set, provide hundreds of
     within-activity variants. Locally generated instances remain the fallback.
@@ -117,7 +109,13 @@ def _find_instance(
     provenance gate, not a pose-coverage test: BDDL and the template must declare the
     same objects before geometry from that template can be attributed to the task.
     """
-    for root in INSTANCE_ROOTS:
+    for source in selected_layout_sources(source_selection):
+        if require_detect_models:
+            try:
+                assert_detect_eligible(source)
+            except ValueError:
+                continue
+        root = source.root
         hits = glob.glob(
             os.path.join(
                 root, "*", "json", f"*_task_{activity}_instances", "*tro_state.json"
@@ -130,7 +128,7 @@ def _find_instance(
                 or scope_mismatch(expected_scope, path, ignored_scope=ignored_scope)
                 is None
             ):
-                return path
+                return path, source
     return None
 
 
@@ -157,13 +155,16 @@ def _scene_of_path(path: str) -> str:
     return ""
 
 
-def _from_instance(activity: str, path: str) -> Layout:
+def _from_instance(activity: str, path: str, source: InstanceSource) -> Layout:
     raw = json.load(open(path))
     lay = Layout(
         activity=activity,
         source="sampled",
         scene=_scene_of_path(path),
         instance_path=path,
+        instance_source=source.name,
+        bddl_release=source.bddl_release,
+        asset_release=source.asset_release,
     )
     for name, entry in raw.items():
         if name == "robot_poses":
@@ -338,7 +339,12 @@ def _generated(activity: str, world: SymbolicWorld) -> Layout:
 
 # --------------------------------------------------------------------------- #
 def build_layout(
-    activity: str, world: Optional[SymbolicWorld] = None, prefer: str = "sampled"
+    activity: str,
+    world: Optional[SymbolicWorld] = None,
+    prefer: str = "sampled",
+    *,
+    source_selection: str | None = None,
+    require_detect_models: bool = False,
 ) -> Layout:
     """Layout for @activity. Uses real sampled poses when available unless told not to.
 
@@ -353,9 +359,16 @@ def build_layout(
             for name in world.scope_names
             if not world.is_real(name) or "sceneObject" in properties_of(name)
         ]
-        path = _find_instance(activity, world.scope_names, ignored_scope=ignored_scope)
-        if path:
-            lay = _from_instance(activity, path)
+        found = _find_instance(
+            activity,
+            world.scope_names,
+            ignored_scope=ignored_scope,
+            source_selection=source_selection,
+            require_detect_models=require_detect_models,
+        )
+        if found:
+            path, source = found
+            lay = _from_instance(activity, path, source)
             if lay.xyz:
                 return lay
     return _generated(activity, world)

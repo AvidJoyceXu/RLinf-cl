@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import statistics
@@ -44,33 +45,46 @@ import tempfile
 
 from cryptography.fernet import Fernet
 
-ASSET_ROOT = "/data/behavior-data/behavior-1k-assets/objects"
+ASSET_ROOT = os.environ.get(
+    "BEHAVIOR_ASSET_OBJECT_ROOT", "/data/behavior-data/behavior-1k-assets/objects"
+)
 KEY_PATH = "/data/behavior-data/omnigibson.key"
-OUT_PATH = "/data/behavior-data/native_bbox.json"
+OUT_PATH = os.environ.get(
+    "BEHAVIOR_NATIVE_BBOX_PATH", "/data/behavior-data/native_bbox.json"
+)
 
 
 def _decrypt(path: str, key: bytes) -> str:
     """Decrypt one asset to a temp file and return its path. Caller unlinks."""
     data = Fernet(key).decrypt(open(path, "rb").read())
-    fd, out = tempfile.mkstemp(suffix=".usdz")
+    # v3.7 assets are encrypted USDZ packages; v3.9 assets are encrypted raw USD
+    # layers. Preserve the decrypted container type so the reader can take the
+    # correct path rather than assuming every release is a zip archive.
+    suffix = ".usdz" if path.endswith(".usdz.encrypted") else ".usd"
+    fd, out = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
     return out
 
 
-def _read_attrs(usdz_path: str) -> tuple[list, list]:
+def _read_attrs(usd_path: str) -> tuple[list, list]:
     """Return (nativeBB, offsetBaseLink) from the first prim that carries them.
 
-    The usdz must be UNZIPPED first: `Usd.Stage.Open` on the package itself fails with
-    `Failed to open layer`, and only the inner `.usdc` opens. OmniGibson's own
-    `extracted()` helper does the same thing for the same reason.
+    v3.7 USDZ must be unzipped first: ``Usd.Stage.Open`` on the package fails and
+    only the inner layer opens. v3.9's decrypted ``.usd`` opens directly.
     """
     import zipfile
 
     from pxr import Usd
 
+    if not zipfile.is_zipfile(usd_path):
+        stage = Usd.Stage.Open(usd_path)
+        if stage is None:
+            raise ValueError("USD stage would not open")
+        return _scan(stage)
+
     with tempfile.TemporaryDirectory() as d:
-        with zipfile.ZipFile(usdz_path) as z:
+        with zipfile.ZipFile(usd_path) as z:
             inner = [n for n in z.namelist() if n.endswith((".usdc", ".usda", ".usd"))]
             if not inner:
                 raise ValueError("no usd layer inside the usdz package")
@@ -104,8 +118,14 @@ def main() -> None:
     args = ap.parse_args()
 
     key = open(args.key, "rb").read()
-    assets = sorted(glob.glob(os.path.join(args.asset_root, "*", "*", "usd",
-                                           "*.usdz.encrypted")))
+    assets = sorted(
+        glob.glob(
+            os.path.join(args.asset_root, "*", "*", "usd", "*.usdz.encrypted")
+        )
+        + glob.glob(
+            os.path.join(args.asset_root, "*", "*", "usd", "*.encrypted.usd")
+        )
+    )
     if args.limit:
         assets = assets[: args.limit]
     print(f"assets: {len(assets)}", flush=True)
@@ -147,8 +167,31 @@ def main() -> None:
         for cat, boxes in per_category.items()
     }
 
+    version_path = os.path.join(os.path.dirname(args.asset_root), "VERSION")
+    asset_version = open(version_path).read().strip() if os.path.isfile(version_path) else None
+    source_manifest = {
+        "asset_root": os.path.abspath(args.asset_root),
+        "asset_version": asset_version,
+        "encrypted_layouts": sorted(
+            {"usdz" if p.endswith(".usdz.encrypted") else "usd" for p in assets}
+        ),
+        "models_attempted": len(assets),
+        "models_extracted": len(by_model),
+        "failures": len(failures),
+    }
+    source_manifest["source_list_sha256"] = hashlib.sha256(
+        "\n".join(os.path.relpath(p, args.asset_root) for p in assets).encode()
+    ).hexdigest()
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump({"by_model": by_model, "by_category": by_category}, f)
+        json.dump(
+            {
+                "metadata": source_manifest,
+                "by_model": by_model,
+                "by_category": by_category,
+            },
+            f,
+        )
 
     n_off = sum("offset" in v for v in by_model.values())
     n_nonzero = sum(any(abs(c) > 1e-9 for c in v.get("offset", ()))
