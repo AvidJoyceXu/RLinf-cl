@@ -47,7 +47,14 @@ class TrajectoryVideoRecorder:
         self.writer = imageio.get_writer(self.video_path, fps=self.fps)
         return self.video_path
 
-    def append(self, frame, *, tool: str, ok: bool | None = None) -> None:
+    def append(
+        self,
+        frame,
+        *,
+        tool: str,
+        ok: bool | None = None,
+        event_metadata: dict | None = None,
+    ) -> None:
         """Append one rendered frame aligned to a start/tool event."""
         if self.writer is None:
             raise RuntimeError("trajectory recorder has not begun")
@@ -66,7 +73,10 @@ class TrajectoryVideoRecorder:
         draw.rectangle((0, 0, box[2] + 8, box[3] + 6), fill=(0, 0, 0))
         draw.text((4, 3), label, fill=(255, 255, 255))
         self.writer.append_data(np.asarray(image))
-        self.events.append({"frame": index, "tool": tool, "ok": ok})
+        event = {"frame": index, "tool": tool, "ok": ok}
+        if event_metadata:
+            event.update(event_metadata)
+        self.events.append(event)
 
     def finish(self, *, complete: bool, reason: str = "") -> dict:
         """Close the MP4 and write its event/provenance sidecar."""

@@ -38,11 +38,42 @@ def look_quat(yaw: float, pitch: float = 0.0):
     silent 90-degree error, which is exactly the kind of thing that looks like a
     perception bug later.
     """
+    import omnigibson.utils.transform_utils as T
     import torch as th
 
-    import omnigibson.utils.transform_utils as T
-
     return T.euler2quat(th.tensor([math.pi / 2 + pitch, 0.0, yaw - math.pi / 2]))
+
+
+def configure_debug_renderer(
+    *,
+    render_mode: str = "PathTracing",
+    texture_budget: float = 1.0,
+    dlss_quality: int = 2,
+    spp: int = 8,
+    total_spp: int = 128,
+) -> None:
+    """Apply the renderer settings shared by demos and trajectory recording.
+
+    Isaac Sim 4.5 real-time RTX produces grey noise on the Blackwell host used for
+    this project. Path tracing is the verified workaround. The OptiX denoiser must
+    remain disabled here: on this runtime it fails to initialise and returns an empty
+    frame instead of a noisy one.
+    """
+    import omnigibson.lazy as lazy
+
+    settings = lazy.carb.settings.get_settings()
+    settings.set_float(
+        "/rtx-transient/resourcemanager/texturestreaming/memoryBudget",
+        texture_budget,
+    )
+    settings.set_int("/rtx/post/dlss/execMode", dlss_quality)
+    settings.set_string("/rtx/rendermode", render_mode)
+    if render_mode == "PathTracing":
+        settings.set_int("/rtx/pathtracing/spp", spp)
+        settings.set_int("/rtx/pathtracing/totalSpp", total_spp)
+        settings.set_int("/rtx/pathtracing/clampSpp", total_spp)
+        settings.set_int("/rtx/pathtracing/maxBounces", 4)
+        settings.set_bool("/rtx/pathtracing/optixDenoiser/enabled", False)
 
 
 def main() -> None:
@@ -91,11 +122,9 @@ def main() -> None:
 
     import imageio.v2 as imageio
     import numpy as np
+    import omnigibson as og
     import torch as th
     from omegaconf import OmegaConf
-    from PIL import Image
-
-    import omnigibson as og
     from omnigibson.envs import VectorEnvironment
 
     from rlinf.envs.behavior.harvest_sft import resolve_scene_and_dir
@@ -130,27 +159,13 @@ def main() -> None:
     vec_env.reset()
     env = vec_env.envs[0]
 
-    # Undo RLinf's training-oriented texture budget for this process only.
-    import omnigibson.lazy as lazy
-    lazy.carb.settings.get_settings().set_float(
-        "/rtx-transient/resourcemanager/texturestreaming/memoryBudget",
-        args.texture_budget)
-    lazy.carb.settings.get_settings().set_int("/rtx/post/dlss/execMode",
-                                              args.dlss_quality)
-    _s = lazy.carb.settings.get_settings()
-    _s.set_string("/rtx/rendermode", args.render_mode)
-    if args.render_mode == "PathTracing":
-        _s.set_int("/rtx/pathtracing/spp", args.spp)
-        _s.set_int("/rtx/pathtracing/totalSpp", args.total_spp)
-        _s.set_int("/rtx/pathtracing/clampSpp", args.total_spp)
-        _s.set_int("/rtx/pathtracing/maxBounces", 4)
-        # The OptiX denoiser fails to initialise on this host --
-        #   [rtx.optixdenoising.plugin] optixDenoiserCreate(...) Internal error
-        # -- and the frame then comes back EMPTY, which surfaces downstream as
-        # `zero-size array to reduction operation minimum`. Same family as the
-        # Blackwell/Kit incompatibility in isaac-sim/IsaacLab#2869. We accumulate many
-        # samples per frame anyway, so the denoiser is not needed for a static scene.
-        _s.set_bool("/rtx/pathtracing/optixDenoiser/enabled", False)
+    configure_debug_renderer(
+        render_mode=args.render_mode,
+        texture_budget=args.texture_budget,
+        dlss_quality=args.dlss_quality,
+        spp=args.spp,
+        total_spp=args.total_spp,
+    )
     print(f"renderer : {args.render_mode} "
           f"(spp={args.spp}, totalSpp={args.total_spp})", flush=True)
 

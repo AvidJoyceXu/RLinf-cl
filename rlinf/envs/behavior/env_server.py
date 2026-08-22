@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import threading
 import traceback
@@ -78,6 +79,14 @@ class BehaviorEnv:
         self.fast_reset = fast_reset
         self.debug_video_dir = debug_video_dir
         self.debug_render_iters = debug_render_iters
+        self.debug_camera_forward_m = 0.4
+        self.debug_renderer = {
+            "render_mode": "PathTracing",
+            "spp": 8,
+            "total_spp": max(64, self.debug_render_iters * 8),
+            "render_iters": self.debug_render_iters,
+            "camera_forward_m": self.debug_camera_forward_m,
+        }
         self.instance_source = instance_source or os.environ.get(
             "BEHAVIOR_INSTANCE_SOURCE", "2025-official"
         )
@@ -135,8 +144,14 @@ class BehaviorEnv:
         self.aci = SemanticACI(self.env, obs_mode=obs_mode)
         self.video_recorder = None
         if debug_video_dir:
+            from rlinf.envs.behavior.render_rgb import configure_debug_renderer
             from rlinf.envs.behavior.trajectory_video import TrajectoryVideoRecorder
 
+            configure_debug_renderer(
+                render_mode=self.debug_renderer["render_mode"],
+                spp=self.debug_renderer["spp"],
+                total_spp=self.debug_renderer["total_spp"],
+            )
             self.video_recorder = TrajectoryVideoRecorder(
                 debug_video_dir, fps=debug_video_fps
             )
@@ -263,6 +278,7 @@ class BehaviorEnv:
                     "instance_id": inst.instance_id,
                     "instance_source": self.instance_source,
                     "obs_mode": self.obs_mode,
+                    "debug_renderer": self.debug_renderer,
                 }
             )
             self._record_debug_frame("session_start", ok=True)
@@ -309,8 +325,16 @@ class BehaviorEnv:
         base_pos, _ = self.aci._robot_pose()
         yaw = self.aci._robot_yaw()
         pitch = float(getattr(self.aci, "camera_pitch", 0.0))
+        # The robot base origin is inside R1's body. Raising that exact x/y to head
+        # height still leaves a viewer camera inside the head mesh; on the Blackwell
+        # smoke test it produced alternating black/grey interior surfaces. Put the
+        # virtual lens just in front of the head, in the robot's current yaw frame.
         camera_pos = th.tensor(
-            [float(base_pos[0]), float(base_pos[1]), float(base_pos[2]) + CAMERA_HEIGHT_M],
+            [
+                float(base_pos[0]) + self.debug_camera_forward_m * math.cos(yaw),
+                float(base_pos[1]) + self.debug_camera_forward_m * math.sin(yaw),
+                float(base_pos[2]) + CAMERA_HEIGHT_M,
+            ],
             dtype=base_pos.dtype,
             device=base_pos.device,
         )
@@ -324,7 +348,16 @@ class BehaviorEnv:
         frame = frame.cpu().numpy() if hasattr(frame, "cpu") else np.asarray(frame)
         if frame.size == 0:
             raise RuntimeError("viewer camera returned an empty RGB frame")
-        self.video_recorder.append(frame, tool=tool, ok=ok)
+        self.video_recorder.append(
+            frame,
+            tool=tool,
+            ok=ok,
+            event_metadata={
+                "camera_xyz": [round(float(value), 4) for value in camera_pos],
+                "yaw_deg": round(math.degrees(yaw), 2),
+                "pitch_deg": round(math.degrees(pitch), 2),
+            },
+        )
 
     def _meta(self) -> dict:
         """Real BDDL goal evaluation — pure logic over true simulator state."""
@@ -445,7 +478,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--activity", required=True)
     ap.add_argument("--port", type=int, required=True)
-    ap.add_argument("--obs-mode", default="full", choices=["full", "partial"])
+    ap.add_argument("--obs-mode", default="full", choices=["full", "partial", "fov"])
     ap.add_argument("--instances-per-activity", type=int, default=0,
                     help="0 = all pre-sampled instances")
     ap.add_argument("--instance-source", default=None,

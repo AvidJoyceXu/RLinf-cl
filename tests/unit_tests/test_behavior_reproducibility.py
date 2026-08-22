@@ -45,6 +45,9 @@ _detect = _load_pure_module("_behavior_detect_test", "detect.py")
 _layout_source = (
     Path(__file__).resolve().parents[2] / "rlinf/envs/behavior/layout.py"
 ).read_text()
+_env_server_source = (
+    Path(__file__).resolve().parents[2] / "rlinf/envs/behavior/env_server.py"
+).read_text()
 CAMERA_OBS_MODES = _sft_build.CAMERA_OBS_MODES
 all_schemas = _sft_build.all_schemas
 tool_schemas = _sft_build.tool_schemas
@@ -331,6 +334,33 @@ class HarnessCapabilityTest(unittest.TestCase):
 
 
 class TrajectoryVideoTest(unittest.TestCase):
+    def test_debug_server_configures_renderer_and_exposes_fov_cli(self):
+        tree = ast.parse(_env_server_source)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        self.assertTrue(
+            any(
+                isinstance(call.func, ast.Name)
+                and call.func.id == "configure_debug_renderer"
+                for call in calls
+            )
+        )
+        obs_mode_calls = [
+            call
+            for call in calls
+            if isinstance(call.func, ast.Attribute)
+            and call.func.attr == "add_argument"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == "--obs-mode"
+        ]
+        self.assertEqual(len(obs_mode_calls), 1)
+        choices = next(
+            keyword.value
+            for keyword in obs_mode_calls[0].keywords
+            if keyword.arg == "choices"
+        )
+        self.assertIn("fov", [elt.value for elt in choices.elts])
+
     def test_one_video_and_aligned_sidecar_per_complete_session(self):
         import numpy as np
 
@@ -340,7 +370,12 @@ class TrajectoryVideoTest(unittest.TestCase):
                 {"activity": "task_a", "instance_id": 7, "session_id": "abc"}
             )
             frame = np.zeros((32, 48, 3), dtype=np.uint8)
-            recorder.append(frame, tool="session_start", ok=True)
+            recorder.append(
+                frame,
+                tool="session_start",
+                ok=True,
+                event_metadata={"yaw_deg": 90.0, "pitch_deg": 0.0},
+            )
             recorder.append(frame, tool="turn_left", ok=True)
             record = recorder.finish(complete=True, reason="session_end")
             self.assertTrue(Path(video).is_file())
@@ -355,6 +390,7 @@ class TrajectoryVideoTest(unittest.TestCase):
                 [event["tool"] for event in record["events"]],
                 ["session_start", "turn_left"],
             )
+            self.assertEqual(record["events"][0]["yaw_deg"], 90.0)
 
 
 class TurnBudgetTest(unittest.TestCase):
