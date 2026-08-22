@@ -124,6 +124,7 @@ class TurnBudgetTest(unittest.TestCase):
 class SolvabilityCertificateTest(unittest.TestCase):
     def test_miss_taxonomy_is_mutually_exclusive(self):
         cases = {
+            "nonvisual_substance": ([], ["nonvisual_substance"]),
             "missing_pose": ([], ["missing_pose"]),
             "missing_extent": ([], ["missing_extent"]),
             "found_by_primitive": (["visible"], ["visible"]),

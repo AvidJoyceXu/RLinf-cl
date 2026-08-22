@@ -938,7 +938,12 @@ class SymbolicACI:
                 continue                  # a shut container hides its contents
             pos = self.layout.pos(name)
             if pos is None:
-                self._det_audit[audit_key].add("missing_pose")
+                event = (
+                    "nonvisual_substance"
+                    if "substance" in properties_of(name)
+                    else "missing_pose"
+                )
+                self._det_audit[audit_key].add(event)
                 continue                  # substances have no location by construction
             cat = _word(synset_of(name))
             # Size comes from the asset, per MODEL where the instance recorded one and

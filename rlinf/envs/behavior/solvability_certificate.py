@@ -13,6 +13,8 @@ def classify_object(
     """Assign one mutually exclusive outcome to a required task object."""
     primitive = set(primitive_events)
     tour = set(tour_events)
+    if "nonvisual_substance" in tour:
+        return "nonvisual_substance"
     if "missing_pose" in tour:
         return "missing_pose"
     if "missing_extent" in tour:
