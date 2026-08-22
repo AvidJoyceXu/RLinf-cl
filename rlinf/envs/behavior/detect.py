@@ -290,7 +290,13 @@ def _iou(a, b) -> float:
     return inter / ua if ua > 0 else 0.0
 
 
-def detect(view, entries) -> list:
+def _audit_mark(audit, key: str, event: str) -> None:
+    """Accumulate detector-stage evidence without changing detector output."""
+    if audit is not None:
+        audit.setdefault(key, set()).add(event)
+
+
+def detect(view, entries, audit=None) -> list:
     """Project @entries -> visible detections, nearest first, occluded ones dropped.
 
     @entries is an iterable of (key, category, pos, extent). The key is how the caller
@@ -311,9 +317,11 @@ def detect(view, entries) -> list:
         radius = math.hypot(ext[0], ext[1])
         if math.hypot(pos[0] - view.x, pos[1] - view.y) - radius > FOV_RANGE_M:
             continue
+        _audit_mark(audit, key, "within_range")
         pr = _project(view, pos, ext)
         if pr is None:
             continue
+        _audit_mark(audit, key, "projectable")
         box, depth = pr
         # A near-horizontal surface at or below foot level -- a floor, a lawn, a
         # driveway -- cannot hide what rests ON it, however near and large its
@@ -347,6 +355,7 @@ def detect(view, entries) -> list:
         covered = max((_frac_covered(box, nb) for nb, ncat in occluders
                        if ncat != cat), default=0.0)
         if covered > 0.95:
+            _audit_mark(audit, key, "occluded")
             continue                    # essentially entirely hidden
         area = (box[2] - box[0]) * (box[3] - box[1]) * (1.0 - covered)
         out.append(Detection(
@@ -354,6 +363,7 @@ def detect(view, entries) -> list:
             score=round(min(1.0, (0.35 + 0.65 * math.sqrt(
                 max(area, 1) / (IMAGE_W * IMAGE_H))) * (1.0 - covered)), 2),
             key=key, depth=round(depth, 2)))
+        _audit_mark(audit, key, "visible")
         if not flat:
             occluders.append((box, cat))
     return out

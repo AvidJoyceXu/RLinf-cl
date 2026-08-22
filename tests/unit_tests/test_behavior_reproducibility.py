@@ -23,10 +23,15 @@ def _load_pure_module(name: str, filename: str):
 
 _sft_build = _load_pure_module("_behavior_sft_build_test", "sft_build.py")
 _turn_budget = _load_pure_module("_behavior_turn_budget_test", "turn_budget.py")
+_certificate = _load_pure_module(
+    "_behavior_solvability_certificate_test", "solvability_certificate.py"
+)
 CAMERA_OBS_MODES = _sft_build.CAMERA_OBS_MODES
 all_schemas = _sft_build.all_schemas
 tool_schemas = _sft_build.tool_schemas
 turn_budget_for = _turn_budget.turn_budget_for
+build_activity_certificate = _certificate.build_activity_certificate
+classify_object = _certificate.classify_object
 
 
 class ToolSchemaTest(unittest.TestCase):
@@ -114,6 +119,48 @@ class TurnBudgetTest(unittest.TestCase):
             turn_budget_for("task_a", flat_max_turns=40, budget_k=0)
         with self.assertRaises(ValueError):
             turn_budget_for("task_a", flat_max_turns=40, budget_cap=-1)
+
+
+class SolvabilityCertificateTest(unittest.TestCase):
+    def test_miss_taxonomy_is_mutually_exclusive(self):
+        cases = {
+            "missing_pose": ([], ["missing_pose"]),
+            "missing_extent": ([], ["missing_extent"]),
+            "found_by_primitive": (["visible"], ["visible"]),
+            "primitive_search_miss": ([], ["visible"]),
+            "outside_tour_range": ([], ["target"]),
+            "never_projectable": ([], ["within_range"]),
+            "near_total_occlusion": ([], ["within_range", "projectable", "occluded"]),
+            "tour_miss_unclassified": ([], ["within_range", "projectable"]),
+        }
+        for expected, (primitive, tour) in cases.items():
+            self.assertEqual(classify_object(primitive, tour), expected)
+
+    def test_activity_certificate_conserves_target_denominator(self):
+        primitive = {
+            "target_objects": ["a", "b"],
+            "object_events": {"a": ["visible"], "b": ["target"]},
+            "source": "instance.json",
+            "steps": 40,
+            "complete": False,
+        }
+        tour = {
+            "target_objects": ["a", "b", "c"],
+            "object_events": {
+                "a": ["visible"],
+                "b": ["visible"],
+                "c": ["missing_pose"],
+            },
+            "source": "instance.json",
+            "steps": 400,
+            "complete": False,
+        }
+        cert = build_activity_certificate("task", primitive, tour)
+        self.assertEqual(cert["targets"], 3)
+        self.assertEqual(sum(cert["outcome_counts"].values()), 3)
+        self.assertEqual(cert["outcome_counts"]["found_by_primitive"], 1)
+        self.assertEqual(cert["outcome_counts"]["primitive_search_miss"], 1)
+        self.assertEqual(cert["outcome_counts"]["missing_pose"], 1)
 
 
 if __name__ == "__main__":

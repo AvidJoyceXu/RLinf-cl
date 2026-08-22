@@ -503,6 +503,7 @@ class SymbolicACI:
         self.layout = None
         self.view = None
         self._dets: list = []          # detect modes: last observation
+        self._det_audit: dict[str, set[str]] = {}  # cumulative detector-stage evidence
         self._view_epoch = 0           # bumped by any camera mutation
         self._det_epoch = -1           # epoch the handles in `_dets` belong to
         self._furn: dict = {}          # fov_distract: display name -> SceneObject
@@ -930,10 +931,14 @@ class SymbolicACI:
         for name in self.world.scope_names:
             if name == self.world.agent or not self.world.is_real(name):
                 continue
+            audit_key = f"scope:{name}"
+            self._det_audit.setdefault(audit_key, set()).add("target")
             if self.world.enclosing_closed(name):
+                self._det_audit[audit_key].add("closed_container")
                 continue                  # a shut container hides its contents
             pos = self.layout.pos(name)
             if pos is None:
+                self._det_audit[audit_key].add("missing_pose")
                 continue                  # substances have no location by construction
             cat = _word(synset_of(name))
             # Size comes from the asset, per MODEL where the instance recorded one and
@@ -944,6 +949,7 @@ class SymbolicACI:
             ext = (extent_for_model(models[name]) if name in models else None) \
                 or extent_for_category(cat)
             if ext is None:
+                self._det_audit[audit_key].add("missing_extent")
                 continue
             # The instance file records the BASE LINK pose; the bbox is centred at
             # pose + ig:offsetBaseLink.
@@ -953,7 +959,7 @@ class SymbolicACI:
         for i, so in enumerate(scene_furniture(self.layout.scene or "")):
             entries.append((f"scene:{i}", so.category, so.pos, so.extent))
 
-        dets = detect(self.view, entries)
+        dets = detect(self.view, entries, audit=self._det_audit)
         if self.obs_mode == "detect_scope":
             kept = [d for d in dets if d.key.startswith("scope:")]
             # Renumber, or the handles carry gaps (d2, d5, d9) that leak how many

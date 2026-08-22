@@ -22,7 +22,11 @@ bound a policy could in principle reach, not one only an oracle could.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import sys
+from collections import Counter
 
 from rlinf.envs.behavior.symbolic_world import (
     SymbolicACI,
@@ -43,6 +47,18 @@ TURNS_PER_SWEEP = 4          # 4 x 90 degrees = full circle
 # (0, -30) 18/28, (0, -30, -60) 20/28. The sweep costs one extra `look_down` and one
 # extra circle, against a search that spends a median 36 steps of a 400 budget.
 PITCHES = (0, -1, -2)
+ACTIVITY_SOURCE = "/data/behavior-data/tw_verified.json"
+
+
+def _sha256(path: str) -> str | None:
+    """Hash a small benchmark input, or return None when it is unavailable."""
+    if not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def sweep(aci: SymbolicACI, on_view=None) -> int:
@@ -170,7 +186,7 @@ def explore(activity: str, layout_prefer: str = "sampled",
     steps = sweep(aci)
     visited: set = set()
     if obs_mode in SymbolicACI.DETECT_MODES:
-        return _explore_detect(world, aci, locatable, steps, budget, use_tour)
+        return _explore_detect(world, aci, targets, locatable, steps, budget, use_tour)
     while steps < budget:
         frontier = [n for n in aci.view.seen if n not in visited
                     and aci.layout.pos(n) is not None]
@@ -211,7 +227,7 @@ def explore(activity: str, layout_prefer: str = "sampled",
     }
 
 
-def _explore_detect(world, aci, locatable, steps, budget, use_tour=False) -> dict:
+def _explore_detect(world, aci, targets, locatable, steps, budget, use_tour=False) -> dict:
     """Frontier expansion when selection is spatial rather than by name.
 
     Everything the fov search does by name is done here by handle: go to a detection,
@@ -299,10 +315,18 @@ def _explore_detect(world, aci, locatable, steps, budget, use_tour=False) -> dic
                 steps += sweep(aci, on_view=harvest)
         else:
             steps += 1
+    object_events = {
+        name: sorted(aci._det_audit.get(f"scope:{name}", ())) for name in sorted(targets)
+    }
     return {
         "activity": world.activity, "source": aci.layout.source,
         "locatable": len(locatable), "found": len(found & locatable),
         "complete": locatable <= found, "steps": steps,
+        "search_kind": "tour" if use_tour else "primitive",
+        "target_objects": sorted(targets),
+        "locatable_objects": sorted(locatable),
+        "found_objects": sorted(found & locatable),
+        "object_events": object_events,
         "missing": sorted(world.to_display.get(n, n)
                           for n in (locatable - found))[:5],
     }
@@ -319,6 +343,12 @@ def _main() -> None:
     ap.add_argument("--tour", action="store_true",
                     help="privileged coverage tour instead of primitive-only search: "
                          "certifies findability, does NOT produce a policy budget")
+    ap.add_argument("--tour-budget", type=int, default=8000,
+                    help="privileged-tour budget used only by --certificate")
+    ap.add_argument("--certificate", help="write paired primitive/tour per-object JSON; "
+                                            "requires --all, --source-id and --container-id")
+    ap.add_argument("--source-id", help="exact RLinf Git commit recorded in a certificate")
+    ap.add_argument("--container-id", help="container image name/digest recorded in a certificate")
     ap.add_argument("--out", help="write {activity: oracle_steps} as JSON. This table is "
                                   "what an ORACLE-RELATIVE turn budget is computed from: "
                                   "max_turns = K * oracle_steps(activity). A flat budget "
@@ -335,15 +365,86 @@ def _main() -> None:
             "--tour cannot be combined with --out: tour teleports using privileged "
             "scene layout, so its steps must never become a policy turn budget"
         )
+    if args.certificate:
+        if not args.all:
+            ap.error("--certificate requires --all")
+        if args.tour or args.out:
+            ap.error("--certificate runs both searches itself; omit --tour and --out")
+        if args.obs_mode not in SymbolicACI.DETECT_MODES:
+            ap.error("--certificate requires detect_scope or detect")
+        if not args.source_id or not args.container_id:
+            ap.error("--certificate requires --source-id and --container-id")
 
     if not args.all:
         print(json.dumps(explore(args.activity, args.prefer, args.budget,
                                  args.obs_mode), indent=1))
         return
 
-    acts = json.load(open("/data/behavior-data/tw_verified.json"))["solved"]
+    with open(ACTIVITY_SOURCE) as stream:
+        acts = json.load(stream)["solved"]
     if args.n:
         acts = acts[:args.n]
+    if args.certificate:
+        from rlinf.envs.behavior.detect import NATIVE_BBOX_PATH
+        from rlinf.envs.behavior.solvability_certificate import (
+            build_activity_certificate,
+        )
+
+        records, errors = [], []
+        outcomes = Counter()
+        for index, activity in enumerate(acts, 1):
+            print(f"[{index}/{len(acts)}] {activity}", flush=True)
+            try:
+                primitive = explore(
+                    activity, args.prefer, args.budget, args.obs_mode, use_tour=False
+                )
+                privileged = explore(
+                    activity,
+                    args.prefer,
+                    args.tour_budget,
+                    args.obs_mode,
+                    use_tour=True,
+                )
+                record = build_activity_certificate(activity, primitive, privileged)
+                records.append(record)
+                outcomes.update(record["outcome_counts"])
+            except Exception as exc:  # noqa: BLE001
+                errors.append(
+                    {"activity": activity, "type": type(exc).__name__, "message": str(exc)}
+                )
+        payload = {
+            "schema_version": 1,
+            "source_id": args.source_id,
+            "container_id": args.container_id,
+            "argv": sys.argv,
+            "obs_mode": args.obs_mode,
+            "layout_prefer": args.prefer,
+            "primitive_budget": args.budget,
+            "tour_budget": args.tour_budget,
+            "activity_source": {
+                "path": ACTIVITY_SOURCE,
+                "sha256": _sha256(ACTIVITY_SOURCE),
+            },
+            "native_bbox": {
+                "path": NATIVE_BBOX_PATH,
+                "sha256": _sha256(NATIVE_BBOX_PATH),
+            },
+            "summary": {
+                "requested_activities": len(acts),
+                "certified_activities": len(records),
+                "errored_activities": len(errors),
+                "objects": sum(outcomes.values()),
+                "outcome_counts": dict(sorted(outcomes.items())),
+            },
+            "activities": records,
+            "errors": errors,
+        }
+        with open(args.certificate, "w") as stream:
+            json.dump(payload, stream, indent=1, sort_keys=True)
+            stream.write("\n")
+        print(json.dumps(payload["summary"], indent=1), flush=True)
+        print(f"wrote certificate -> {args.certificate}", flush=True)
+        return
     complete = partial = fail = 0
     steps_ok, worst = [], []
     oracle_steps = {}
