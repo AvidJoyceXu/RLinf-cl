@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_pure_module(name: str, filename: str):
@@ -56,6 +57,8 @@ source_catalog = _sources.source_catalog
 validate_harness = _capabilities.validate_harness
 TrajectoryVideoRecorder = _trajectory_video.TrajectoryVideoRecorder
 scope_scene_names = _detect.scope_scene_names
+scope_assets = _detect.scope_assets
+project_detections = _detect.detect
 
 
 class ToolSchemaTest(unittest.TestCase):
@@ -181,6 +184,50 @@ class InstanceSourcePolicyTest(unittest.TestCase):
                 scope_scene_names(str(tro)),
                 frozenset({"bottom_cabinet_0", "cup_7"}),
             )
+
+    def test_scope_asset_scale_is_preserved_for_geometry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tro = Path(directory) / "task_template-tro_state.json"
+            tro.write_text("{}")
+            template = Path(directory) / "task_template.json"
+            template.write_text(
+                json.dumps(
+                    {
+                        "metadata": {
+                            "task": {"inst_to_name": {"fridge.n.01_1": "fridge_0"}}
+                        },
+                        "objects_info": {
+                            "init_info": {
+                                "fridge_0": {
+                                    "args": {
+                                        "model": "abc123",
+                                        "scale": [1.5, 2.0, 0.75],
+                                    }
+                                }
+                            }
+                        },
+                    }
+                )
+            )
+            self.assertEqual(
+                scope_assets(str(tro))["fridge.n.01_1"],
+                {"model": "abc123", "scale": (1.5, 2.0, 0.75)},
+            )
+
+    def test_support_host_can_be_exempted_from_aabb_occlusion(self):
+        view = SimpleNamespace(x=0.0, y=0.0, yaw=0.0, pitch=0.0)
+        entries = [
+            ("scope:host", "cabinet", (2.0, 0.0, 1.2), (1.0, 1.0, 1.0)),
+            ("scope:item", "cup", (3.0, 0.0, 1.2), (0.1, 0.1, 0.1)),
+        ]
+        hidden = project_detections(view, entries)
+        self.assertNotIn("scope:item", {d.key for d in hidden})
+        visible = project_detections(
+            view,
+            entries,
+            occlusion_exempt_pairs=frozenset({("scope:item", "scope:host")}),
+        )
+        self.assertIn("scope:item", {d.key for d in visible})
 
 
 class HarnessCapabilityTest(unittest.TestCase):

@@ -999,10 +999,12 @@ class SymbolicACI:
             extent_for_model,
             offset_for_model,
             scene_furniture,
+            scope_assets,
             scope_models,
             scope_scene_names,
         )
 
+        assets = scope_assets(self.layout.instance_path or "")
         models = scope_models(self.layout.instance_path or "")
         bound_scene_names = scope_scene_names(self.layout.instance_path or "")
 
@@ -1030,15 +1032,18 @@ class SymbolicACI:
             # cannot size is omitted rather than guessed, because a wrong size is
             # silently wrong: it changes what occludes what and what is visible from
             # where.
+            asset = assets.get(name)
+            scale = asset["scale"] if asset else (1.0, 1.0, 1.0)
             ext = (extent_for_model(models[name]) if name in models else None) \
                 or extent_for_category(cat)
             if ext is None:
                 self._det_audit[audit_key].add("missing_extent")
                 continue
+            ext = tuple(ext[k] * scale[k] for k in range(3))
             # The instance file records the BASE LINK pose; the bbox is centred at
             # pose + ig:offsetBaseLink.
             off = offset_for_model(models[name]) if name in models else (0.0, 0.0, 0.0)
-            centre = tuple(pos[k] + off[k] for k in range(3))
+            centre = tuple(pos[k] + off[k] * scale[k] for k in range(3))
             entries.append((f"scope:{name}", cat, centre, ext))
         for i, so in enumerate(scene_furniture(self.layout.scene or "")):
             if so.name in bound_scene_names:
@@ -1048,7 +1053,30 @@ class SymbolicACI:
                 continue
             entries.append((f"scene:{i}", so.category, so.pos, so.extent))
 
-        dets = detect(self.view, entries, audit=self._det_audit)
+        # An AABB is a coarse outer bound, not a solid object. A cabinet or table's
+        # box must not hide the objects BDDL says are inside/on it; otherwise opening
+        # a container changes the symbolic state while its full AABB continues to
+        # occlude every content forever. Exempt the complete support ancestry while
+        # preserving occlusion from unrelated furniture and sibling objects.
+        exempt_pairs = set()
+        for name in self.world.scope_names:
+            child = name
+            seen = set()
+            while child not in seen:
+                seen.add(child)
+                support = self.world.support_of(child)
+                if support is None:
+                    break
+                parent = support[1]
+                exempt_pairs.add((f"scope:{name}", f"scope:{parent}"))
+                child = parent
+
+        dets = detect(
+            self.view,
+            entries,
+            audit=self._det_audit,
+            occlusion_exempt_pairs=frozenset(exempt_pairs),
+        )
         if self.obs_mode == "detect_scope":
             kept = [d for d in dets if d.key.startswith("scope:")]
             # Renumber, or the handles carry gaps (d2, d5, d9) that leak how many
@@ -1123,7 +1151,19 @@ class SymbolicACI:
                     dx = -math.cos(self.view.yaw)
                     dy = -math.sin(self.view.yaw)
                     norm = 1.0
+                # Stand outside the concrete scaled AABB. A fixed 0.9 m stop put
+                # the camera *inside* v3.9 cabinets scaled beyond 2x, so the tour
+                # could detect them from afar but never reacquire/open them nearby.
+                from rlinf.envs.behavior.detect import extent_for_model, scope_assets
+
+                asset = scope_assets(self.layout.instance_path or "").get(scope_name)
                 stop = 0.9
+                if asset:
+                    native = extent_for_model(asset["model"])
+                    if native:
+                        scaled_x = native[0] * asset["scale"][0]
+                        scaled_y = native[1] * asset["scale"][1]
+                        stop = max(stop, math.hypot(scaled_x, scaled_y) + 0.3)
                 camera_x = pos[0] + stop * dx / norm
                 camera_y = pos[1] + stop * dy / norm
                 yaw = math.atan2(pos[1] - camera_y, pos[0] - camera_x)

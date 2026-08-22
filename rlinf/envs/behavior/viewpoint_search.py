@@ -189,13 +189,49 @@ def tour(aci, budget, on_view=None) -> int:
                 # privileged findability tour; its step count is never a policy
                 # budget. The policy has the equivalent look_down tools.
                 saved_pitch = aci.view.pitch
-                for pitch_index in PITCHES:
-                    aci.view.pitch = pitch_index * math.radians(30.0)
-                    aci._view_epoch += 1
-                    aci.observe()
-                    reacquired = next((d for d in aci._dets if d.key == key), None)
-                    if reacquired is not None and aci.open(reacquired.det).ok:
-                        opened.add(key)
+                target_name = key[len("scope:"):]
+                target_pos = aci.layout.pos(target_name)
+                stands = [(aci.view.x, aci.view.y)]
+                if target_pos is not None:
+                    current_radius = max(
+                        1.2,
+                        math.hypot(
+                            aci.view.x - target_pos[0],
+                            aci.view.y - target_pos[1],
+                        ),
+                    )
+                    # If the approach side is blocked, orbit two reachable radii.
+                    # This is a privileged certificate search, not a policy action
+                    # trace; the policy has equivalent strafe/move primitives.
+                    for radius in (current_radius, current_radius + 1.0):
+                        for angle_index in range(8):
+                            angle = angle_index * math.pi / 4.0
+                            stands.append(
+                                (
+                                    target_pos[0] + radius * math.cos(angle),
+                                    target_pos[1] + radius * math.sin(angle),
+                                )
+                            )
+                did_open = False
+                for stand_x, stand_y in stands:
+                    if target_pos is not None:
+                        yaw = math.atan2(
+                            target_pos[1] - stand_y,
+                            target_pos[0] - stand_x,
+                        )
+                        aci.view.teleport(stand_x, stand_y, yaw)
+                    for pitch_index in PITCHES:
+                        aci.view.pitch = pitch_index * math.radians(30.0)
+                        aci._view_epoch += 1
+                        aci.observe()
+                        reacquired = next(
+                            (d for d in aci._dets if d.key == key), None
+                        )
+                        if reacquired is not None and aci.open(reacquired.det).ok:
+                            opened.add(key)
+                            did_open = True
+                            break
+                    if did_open:
                         break
                 aci.view.pitch = saved_pitch
                 aci._view_epoch += 1

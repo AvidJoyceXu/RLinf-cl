@@ -123,21 +123,34 @@ def _template_data(instance_path: str) -> dict:
 
 
 @functools.lru_cache(maxsize=4)
-def scope_models(instance_path: str) -> dict:
-    """BDDL scope name -> asset model id, for one task instance.
+def scope_assets(instance_path: str) -> dict:
+    """BDDL scope name -> concrete asset model and per-axis instance scale.
 
     Chain: the instance's activity template carries ``inst_to_name`` and the scene
-    registry's ``init_info[name].args.model``. Both are sampler output.
+    registry's ``init_info[name].args``. Both are sampler output.
     """
     d = _template_data(instance_path)
     i2n = d.get("metadata", {}).get("task", {}).get("inst_to_name") or {}
     init = d.get("objects_info", {}).get("init_info", {})
     out = {}
     for inst, name in i2n.items():
-        model = (init.get(name) or {}).get("args", {}).get("model")
+        args = (init.get(name) or {}).get("args", {})
+        model = args.get("model")
         if model:
-            out[inst] = model
+            scale = args.get("scale") or (1.0, 1.0, 1.0)
+            out[inst] = {
+                "model": str(model),
+                "scale": tuple(float(value) for value in scale),
+            }
     return out
+
+
+def scope_models(instance_path: str) -> dict:
+    """Backward-compatible scope -> model view over :func:`scope_assets`."""
+    return {
+        scope_name: asset["model"]
+        for scope_name, asset in scope_assets(instance_path).items()
+    }
 
 
 @functools.lru_cache(maxsize=4)
@@ -328,7 +341,7 @@ def _audit_mark(audit, key: str, event: str) -> None:
         audit.setdefault(key, set()).add(event)
 
 
-def detect(view, entries, audit=None) -> list:
+def detect(view, entries, audit=None, occlusion_exempt_pairs=frozenset()) -> list:
     """Project @entries -> visible detections, nearest first, occluded ones dropped.
 
     @entries is an iterable of (key, category, pos, extent). The key is how the caller
@@ -384,8 +397,15 @@ def detect(view, entries, audit=None) -> list:
         # cover drops a detection now; anything less shrinks the reported box and the
         # score, which is both more faithful and still a real cost to the policy,
         # since a sliver of a box is harder to select against and easier to confuse.
-        covered = max((_frac_covered(box, nb) for nb, ncat in occluders
-                       if ncat != cat), default=0.0)
+        covered = max(
+            (
+                _frac_covered(box, nearer_box)
+                for nearer_box, nearer_cat, nearer_key in occluders
+                if nearer_cat != cat
+                and (key, nearer_key) not in occlusion_exempt_pairs
+            ),
+            default=0.0,
+        )
         if covered > 0.95:
             _audit_mark(audit, key, "occluded")
             continue                    # essentially entirely hidden
@@ -397,7 +417,7 @@ def detect(view, entries, audit=None) -> list:
             key=key, depth=round(depth, 2)))
         _audit_mark(audit, key, "visible")
         if not flat:
-            occluders.append((box, cat))
+            occluders.append((box, cat, key))
     return out
 
 
