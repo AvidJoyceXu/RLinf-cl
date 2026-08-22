@@ -9,13 +9,11 @@
 """Integrated online GRPO for the BEHAVIOR semantic-tool planner.
 
 Same wiring as examples/agent/eqa_qwen/train.py with the BEHAVIOR agent loop and
-tool worker substituted in. Runs in the **py3.11 trainer venv**; the OmniGibson
-half lives in separate env-server processes (see
-``scripts/launch_behavior_env_servers.sh``) which must already be up — the tool
-worker asserts on an empty server list rather than discovering the problem
-mid-rollout.
+tool worker substituted in. The current deployment uses one Python 3.10 venv: the
+tool worker holds OmniGibson in process, so no env-server pool or HTTP hop is on the
+training path. ``env_server.py`` remains a debugging surface only.
 
-    with-trainer python examples/agent/behavior_qwen/train.py \\
+    python examples/agent/behavior_qwen/train.py \\
         --config-path config --config-name behavior_grpo_qwen25_7b_1gpu
 """
 import json
@@ -46,6 +44,14 @@ mp.set_start_method("spawn", force=True)
 @output_redirector
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
+    agent_obs_mode = str(cfg.agentloop.get("obs_mode", "full"))
+    tool_obs_mode = str(cfg.tools.behavior.get("obs_mode", "full"))
+    if agent_obs_mode != tool_obs_mode:
+        raise ValueError(
+            "agentloop.obs_mode and tools.behavior.obs_mode must match: the former "
+            f"renders the policy schema ({agent_obs_mode!r}) while the latter "
+            f"constructs the environment ({tool_obs_mode!r})"
+        )
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(cluster_cfg=cfg.cluster)
@@ -112,7 +118,7 @@ def main(cfg) -> None:
     tool_workers = {
         BehaviorToolWorker.create_group(cfg).launch(
             cluster, name="behavior", placement_strategy=NodePlacementStrategy([0])
-        ): ToolWorkerInfo(tool_names=tool_names(), has_session=True),
+        ): ToolWorkerInfo(tool_names=tool_names(agent_obs_mode), has_session=True),
     }
 
     runner = AgentRunner(

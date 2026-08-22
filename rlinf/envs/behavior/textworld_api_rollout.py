@@ -13,9 +13,10 @@ text protocol:
   * **multi-turn tool results fed back as `role="tool"` messages**, the shape these
     APIs expect.
 
-Everything else is held identical to `textworld_rollout.py`: the same 17 tool
-schemas, the same system prompt, the same environment, and success read from the
-same real BDDL evaluator. Only the policy differs.
+Everything else is held identical to `textworld_rollout.py`: the same mode-specific
+tool schemas (17 core tools plus 8 viewpoint tools in camera modes), the same system
+prompt, the same environment, and success read from the same real BDDL evaluator.
+Only the policy differs.
 
 TWO INDEPENDENT AXES, and they are easy to conflate:
 
@@ -52,6 +53,7 @@ from rlinf.envs.behavior import sft_build as sb
 from rlinf.envs.behavior.rft_sample import result_payload
 from rlinf.envs.behavior.symbolic_world import SymbolicACI, SymbolicWorld
 from rlinf.envs.behavior.textworld_env import BehaviorTextWorld
+from rlinf.envs.behavior.turn_budget import TurnBudget, turn_budget_for
 
 DEFAULT_BASE_URL = "https://ai-gateway.roboparty.com/v1"
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
@@ -90,7 +92,7 @@ def _assistant_msg(msg, **extra) -> dict:
 
 
 def openai_tools(obs_mode: str = "full", minimal: bool = False) -> list[dict]:
-    """The same 17 schemas, in OpenAI function-calling shape.
+    """The same mode-specific schemas, in OpenAI function-calling shape.
 
     Sourced from `sft_build.tool_schemas()` so the API baseline and the RL policy
     can never drift apart in what actions they are offered.
@@ -136,7 +138,8 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
                 temperature, usage: Usage, aci=None,
                 layout_prefer: str = "sampled",
                 prompt_mode: str = "guided",
-                reason_mode: str = "terse") -> dict:
+                reason_mode: str = "terse",
+                budget_meta: dict | None = None) -> dict:
     """One episode. Returns a record; never raises -- an API failure is a datum.
 
     @aci lets a caller supply its own ACI -- ``demo_render.RecordingACI`` wraps one
@@ -249,8 +252,13 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
     gs = world.goal_status()
     n_sat = len(gs["satisfied"])
     n_goal = n_sat + len(gs["unsatisfied"])
-    return {
+    record = {
         "activity": activity, "obs_mode": obs_mode, "goal_format": goal_format,
+        # The budget is per-EPISODE once it is oracle-relative, so it has to travel with
+        # the episode. A record that does not carry its own budget cannot be compared
+        # with any other record, and `max_turns` is the variable that dominates every
+        # result measured on this benchmark so far.
+        "max_turns": max_turns,
         "n_steps": len(steps), "ended": ended, "stop_reason": stop_reason,
         "api_error": api_error,
         "coverage": (n_sat / n_goal) if n_goal else 0.0,
@@ -260,6 +268,16 @@ def run_episode(client, model, activity, obs_mode, goal_format, max_turns,
                        for s in steps
                        if s["name"] != "end_task" and s["payload"].get("ok") is False],
     }
+    if budget_meta:
+        record.update(budget_meta)
+        # The effective value passed to the loop is authoritative. Refuse metadata
+        # drift rather than writing a self-contradictory benchmark record.
+        if record["max_turns"] != max_turns:
+            raise ValueError(
+                f"budget metadata says max_turns={record['max_turns']}, "
+                f"episode ran with {max_turns}"
+            )
+    return record
 
 
 def summarise(records: list[dict], label: str, usage: Usage, seconds: float) -> dict:
@@ -337,6 +355,35 @@ def main() -> None:
                              "both"])
     ap.add_argument("--goal-format", default="both", choices=["atoms", "nl", "both"])
     ap.add_argument("--max-turns", type=int, default=20)
+    ap.add_argument("--oracle-steps", default=None,
+                    help="JSON table from `viewpoint_search --out`. Switches the "
+                         "turn budget from a flat --max-turns to an ORACLE-RELATIVE "
+                         "one: max_turns = ceil(K * oracle_steps[activity]). A flat "
+                         "budget is "
+                         "unfair in both directions -- the reference search needs a "
+                         "median 56 steps and a p90 in the hundreds -- so a flat 40 "
+                         "floors the hard activities (measured: 32/32 episodes hit the "
+                         "ceiling and none terminated) while a flat 400 lets the easy "
+                         "third idle.")
+    ap.add_argument("--budget-cap", type=int, default=0,
+                    help="hard ceiling on the oracle-relative budget, 0 = none. "
+                         "Cost is SUPERLINEAR in turns (context accumulates), and "
+                         "the oracle's "
+                         "step counts span 56..1127 here, so K=2 would ask for 2254 "
+                         "turns on the worst activity. Cap it and REPORT the cap: a "
+                         "capped episode is scored under a different rule from an "
+                         "uncapped one, and the record says which via `capped`.")
+    ap.add_argument("--budget-k", type=float, default=2.0,
+                    help="K in max_turns = K * oracle_steps. REPORT IT: it is an "
+                         "axis of the result, not a constant. K also absorbs the "
+                         "fact that the "
+                         "oracle is privileged, so its step count is a LOWER bound on "
+                         "what an unprivileged policy needs.")
+    ap.add_argument("--allow-missing-oracle", action="store_true",
+                    help="explicitly fall back to --max-turns for activities absent "
+                         "from --oracle-steps. Off by default because mixing budget "
+                         "rules inside one condition is not directly comparable; "
+                         "fallback episodes are labelled budget_source=flat_fallback.")
     ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--concurrency", type=int, default=8,
                     help="parallel episodes; each has its own world, so they are "
@@ -360,12 +407,50 @@ def main() -> None:
     goal_formats = (["atoms", "nl"] if args.goal_format == "both"
                     else [args.goal_format])
 
+    oracle_steps = {}
+    if args.oracle_steps:
+        with open(args.oracle_steps) as f:
+            oracle_steps = json.load(f).get("oracle_steps", {})
+        if not oracle_steps:
+            raise SystemExit(f"{args.oracle_steps} carries no oracle_steps; run "
+                             "`viewpoint_search --all --out <file>` first")
+
+    try:
+        budgets: dict[str, TurnBudget] = {
+            activity: turn_budget_for(
+                activity,
+                flat_max_turns=args.max_turns,
+                oracle_steps=oracle_steps,
+                budget_k=args.budget_k,
+                budget_cap=args.budget_cap,
+                allow_missing_oracle=args.allow_missing_oracle,
+            )
+            for activity in acts
+        }
+    except (KeyError, ValueError) as ex:
+        raise SystemExit(f"invalid turn budget: {ex}") from ex
+
     print(f"model       : {args.model}  @ {args.base_url}")
     print(f"activities  : {len(acts)} (held-out S2)")
+    if oracle_steps:
+        _b = [budgets[a].max_turns for a in acts]
+        _capped = sum(b.capped for b in budgets.values())
+        _fallback = sum(b.budget_source == "flat_fallback" for b in budgets.values())
+        print(f"budget      : ORACLE-RELATIVE K={args.budget_k}"
+              f"{f' cap {args.budget_cap}' if args.budget_cap else ''} -> "
+              f"median {sorted(_b)[len(_b)//2]} turns, min {min(_b)}, max {max(_b)}"
+              f"{f'  ({_capped} episodes hit the cap)' if _capped else ''}"
+              f"{f'  ({_fallback} flat fallbacks)' if _fallback else ''}")
+    else:
+        print(f"budget      : FLAT {args.max_turns} turns")
     print(f"conditions  : obs={obs_modes} x goal={goal_formats}")
     print(f"prompt      : {args.prompt_mode}  refusals: {args.reason_mode}")
-    print(f"budget      : <= {len(acts) * len(obs_modes) * len(goal_formats) * args.max_turns} "
-          f"API calls at temperature {args.temperature}")
+    max_calls = (
+        sum(b.max_turns for b in budgets.values())
+        * len(obs_modes)
+        * len(goal_formats)
+    )
+    print(f"API ceiling : <= {max_calls} calls at temperature {args.temperature}")
 
     all_records, summaries = [], []
     for obs_mode in obs_modes:
@@ -375,9 +460,11 @@ def main() -> None:
             t0 = time.time()
             with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
                 futures = [pool.submit(run_episode, client, args.model, a, obs_mode,
-                                       goal_format, args.max_turns, args.temperature,
+                                       goal_format, budgets[a].max_turns,
+                                       args.temperature,
                                        usage, None, "sampled",
-                                       args.prompt_mode, args.reason_mode)
+                                       args.prompt_mode, args.reason_mode,
+                                       budgets[a].record())
                            for a in acts]
                 records = []
                 for i, fut in enumerate(futures, 1):
@@ -391,7 +478,7 @@ def main() -> None:
             all_records.extend(records)
 
     print("\n--- zero-shot summary "
-          "(same env, same 17 tools, same BDDL evaluator as the RL policy) ---")
+          "(same env, same mode-specific tools and evaluator as the RL policy) ---")
     print(f"{'condition':28s} {'success':>8s} {'coverage':>9s} {'end_task':>9s} "
           f"{'steps':>6s}")
     for s in summaries:
@@ -406,6 +493,11 @@ def main() -> None:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         with open(args.out.replace(".jsonl", "_summary.json"), "w") as f:
             json.dump({"model": args.model, "n_activities": len(acts),
+                       "budget": {"oracle_steps_file": args.oracle_steps,
+                                  "flat_max_turns": args.max_turns,
+                                  "budget_k": args.budget_k,
+                                  "budget_cap": args.budget_cap or None,
+                                  "allow_missing_oracle": args.allow_missing_oracle},
                        "summaries": summaries}, f, indent=1)
         print(f"\nwrote {args.out}")
 

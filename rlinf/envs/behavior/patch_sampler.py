@@ -1,13 +1,13 @@
-"""Apply the three recorded fixes to OmniGibson's task-instance validator.
+"""Apply the recorded fixes to OmniGibson's task-instance sampling pipeline.
 
-`validate_task` cannot pass on this dataset unmodified. The three edits below were
-established over 13 sampling runs and are recorded in
+`validate_task` and online BDDL sampling cannot pass on this dataset unmodified.
+The validator edits below were established over 13 sampling runs and are recorded in
 `code-reading/BEHAVIOR task instance sampling & validation.md` §8.1; this script exists
 so they can be re-applied to any container instead of being hand-typed into
 site-packages and lost when the machine changes (which is what happened to the
 `native_bbox.json` extractor -- see `extract_bbox.py`).
 
-They cannot be monkeypatched from the outside: all three live inside
+The validator edits cannot be monkeypatched from the outside: they live inside
 `_validate_identical_object_kinematic_state`, which is a *nested* function defined
 inside `validate_task`, so there is no importable symbol to wrap. Hence in-place source
 editing, made idempotent and verbose.
@@ -98,22 +98,19 @@ EDITS = [
 # has loaded. Measured: 3 of the first 5 completed attempts in a 12-activity batch.
 EDITS_BDDL = [
     (
-        "5. drop (and log) conditions whose scope entry is None (BOTH sort sites)",
-        """                        rigid_conditions = [c for c in conditions_to_sample if c[2].prim_type != PrimType.CLOTH]""",
-        """                        # RLinf: entities can be None here -- the scope is not fully
-                        # instantiated during online sampling -- and `.prim_type` on None
-                        # aborts the whole activity. Drop them, but SAY SO: a silently
-                        # dropped condition would mean an instance that does not satisfy
-                        # its own BDDL. validate_task step 3 re-checks the initial
-                        # conditions, so a bad drop fails the instance instead of
-                        # shipping it.
-                        _missing = [c[3] for c in conditions_to_sample if c[2] is None]
-                        if _missing:
-                            print(f"[rlinf] unfilled object_scope entries, conditions "
-                                  f"skipped: {_missing}", flush=True)
-                            conditions_to_sample = [c for c in conditions_to_sample
-                                                    if c[2] is not None]
-                        rigid_conditions = [c for c in conditions_to_sample if c[2].prim_type != PrimType.CLOTH]""",
+        "8. third `entity.prim_type` site: None cannot be rescaled, so terminate",
+        '                                group != "kinematic"\n                                or condition.STATE_NAME == "attached"\n                                or "agent" in child_scope_name\n                                or entity.prim_type == PrimType.CLOTH',
+        '                                group != "kinematic"\n                                or condition.STATE_NAME == "attached"\n                                or "agent" in child_scope_name\n                                # RLinf: third site of the same defect. `entity` can be None\n                                # (child not instantiated), and `.prim_type` on it aborts the\n                                # activity. Upstream terminates here for anything it cannot\n                                # rescale -- an unknown entity is exactly that, so treat None\n                                # the same way rather than guessing it is rigid.\n                                or entity is None\n                                or entity.prim_type == PrimType.CLOTH',
+    ),
+    (
+        "5. keep every condition; sort unsized (None) entities last, BOTH sites",
+        '                        rigid_conditions = [c for c in conditions_to_sample if c[2].prim_type != PrimType.CLOTH]\n                        cloth_conditions = [c for c in conditions_to_sample if c[2].prim_type == PrimType.CLOTH]',
+        '                        # RLinf: `entity` is used ONLY to sort here -- the sampling below\n                        # calls `condition.sample()`, which resolves the child itself. During\n                        # `_filter_object_scope` the child is often not imported yet, so the\n                        # entity is legitimately None and `.prim_type` on it aborts the whole\n                        # activity.\n                        #\n                        # DROPPING those conditions (an earlier version of this patch) is\n                        # WRONG: it silently removes real task objects from the sampling set.\n                        # Measured on `bag_groceries` it dropped sack/canned_food/egg/apple and\n                        # the instance then failed validate_task step 3 with ZERO initial\n                        # conditions satisfied. Keep every condition; sort the unsized ones\n                        # last, since a size we do not have cannot order them.\n                        _unsized = [c for c in conditions_to_sample if c[2] is None]\n                        _sized = [c for c in conditions_to_sample if c[2] is not None]\n                        rigid_conditions = [c for c in _sized if c[2].prim_type != PrimType.CLOTH]\n                        cloth_conditions = [c for c in _sized if c[2].prim_type == PrimType.CLOTH]',
+    ),
+    (
+        "5b. append the unsized conditions so none is lost, BOTH sites",
+        '                        ) + list(reversed(sorted(cloth_conditions, key=lambda x: th.prod(x[2].aabb_extent))))',
+        '                        ) + list(reversed(sorted(cloth_conditions, key=lambda x: th.prod(x[2].aabb_extent)))) + _unsized',
     ),
 ]
 
@@ -155,7 +152,7 @@ def main() -> None:
     ap.add_argument("--check", action="store_true", help="report only")
     args = ap.parse_args()
 
-    applied = skipped = missing = 0
+    applied = applicable = skipped = missing = 0
 
     for path, edits in ((args.file, EDITS), (args.task_file, EDITS_TASK),
                         (args.bddl_file, EDITS_BDDL)):
@@ -171,8 +168,12 @@ def main() -> None:
                 # `count` matters: the None-guard has two byte-identical sites in
                 # bddl_utils and patching only the first leaves the second to fail.
                 src = src.replace(old, new)
-                print(f"  [apply  ] {name}")
-                applied += 1
+                if args.check:
+                    print(f"  [would  ] {name}")
+                    applicable += 1
+                else:
+                    print(f"  [apply  ] {name}")
+                    applied += 1
                 changed = True
             else:
                 print(f"  [MISSING] {name}  <- anchor not found; file may have changed")
@@ -180,8 +181,13 @@ def main() -> None:
         if not args.check and changed:
             open(path, "w").write(src)
 
-    print(f"\napplied={applied} already={skipped} missing={missing}"
-          f"{'  (check only, nothing written)' if args.check else ''}")
+    summary = f"applied={applied} already={skipped} missing={missing}"
+    if args.check:
+        summary = (
+            f"would_apply={applicable} already={skipped} missing={missing} "
+            "(check only, nothing written)"
+        )
+    print(f"\n{summary}")
     if missing:
         raise SystemExit(1)
 

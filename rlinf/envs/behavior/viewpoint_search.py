@@ -74,8 +74,83 @@ def sweep(aci: SymbolicACI, on_view=None) -> int:
     return steps
 
 
+
+def _waypoints(aci, spacing=2.5):
+    """Coarse coverage waypoints over the scene's own furniture positions.
+
+    The blind-translation search walks a lattice of headings through whatever corridor
+    it started in; it has no way to know that a room it never entered exists. This
+    reads the scene layout -- which the oracle is allowed to do -- and returns one
+    waypoint per @spacing-metre cell of occupied floor, so a tour visits every part of
+    the scene that has furniture in it.
+    """
+    from rlinf.envs.behavior.detect import scene_furniture
+
+    cells = {}
+    for so in scene_furniture(aci.layout.scene or ""):
+        key = (round(so.pos[0] / spacing), round(so.pos[1] / spacing))
+        cells.setdefault(key, so.pos)
+    here = (aci.view.x, aci.view.y)
+    pts = sorted(cells.values(),
+                 key=lambda p: (p[0] - here[0]) ** 2 + (p[1] - here[1]) ** 2)
+    return [(float(p[0]), float(p[1])) for p in pts]
+
+
+def tour(aci, budget, on_view=None) -> int:
+    """PRIVILEGED coverage tour: stand at every occupied cell of the scene and sweep.
+
+    This answers a different question from `explore` and the two must not be confused.
+
+        explore   unprivileged, primitive-only. Its step count is what an
+                  ORACLE-RELATIVE turn budget for a policy is computed from.
+        tour      privileged: it teleports the viewpoint to waypoints derived from the
+                  scene layout. Its step count is NOT a policy budget. It answers
+                  "is this object findable from ANY reachable viewpoint at all?" --
+                  the solvability certificate that tells breakage apart from difficulty.
+
+    Keeping both is the point. If `tour` finds everything and `explore` does not, the
+    mode is solvable and our search is weak. If `tour` also misses objects, the geometry
+    or the instance is wrong and no amount of search strength will fix it.
+    """
+    opened = set()
+
+    def _look_and_open():
+        # OPEN WHAT IS SHUT, IN THIS VIEW. Standing everywhere is not enough: a sealed
+        # cabinet hides its contents from every viewpoint in the scene, so a tour that
+        # only looks reports them unfindable and understates solvability.
+        #
+        # This MUST happen inside the sweep callback rather than after it. `sweep`
+        # leaves `aci._dets` holding only its LAST view, so a check afterwards sees one
+        # view out of twelve -- measured: 77 detections accumulated, 0 openables found,
+        # on an activity whose scope contains a washer and a cabinet. Det handles are
+        # view-local and expire when the camera moves, so the only moment a container
+        # can be opened is while it is still in frame.
+        if on_view is not None:
+            on_view()
+        for x in list(aci._dets):
+            if not x.key.startswith("scope:") or x.key in opened:
+                continue                 # open each container ONCE, not once per view
+            if "openable" in properties_of(x.key[len("scope:"):]):
+                # Mark only on SUCCESS. `open` has a proximity precondition, so a
+                # container seen across the room is refused; marking it as done then
+                # would mean the waypoint that actually stands next to it never tries.
+                # Measured: marking before the call left the certificate byte-identical
+                # to no opening at all -- every open was refused as `not near`.
+                if aci.open(x.det).ok:
+                    opened.add(x.key)
+
+    steps = 0
+    for (wx, wy) in _waypoints(aci):
+        if steps >= budget:
+            break
+        aci.view.teleport(wx, wy)
+        steps += 1
+        steps += sweep(aci, on_view=_look_and_open)
+    return steps
+
 def explore(activity: str, layout_prefer: str = "sampled",
-            budget: int = 400, obs_mode: str = "fov") -> dict:
+            budget: int = 400, obs_mode: str = "fov",
+            use_tour: bool = False) -> dict:
     """Search until nothing new is found or the budget runs out.
 
     @obs_mode "fov" tracks `view.seen` (scope names, because the mode still reports
@@ -95,7 +170,7 @@ def explore(activity: str, layout_prefer: str = "sampled",
     steps = sweep(aci)
     visited: set = set()
     if obs_mode in SymbolicACI.DETECT_MODES:
-        return _explore_detect(world, aci, locatable, steps, budget)
+        return _explore_detect(world, aci, locatable, steps, budget, use_tour)
     while steps < budget:
         frontier = [n for n in aci.view.seen if n not in visited
                     and aci.layout.pos(n) is not None]
@@ -136,7 +211,7 @@ def explore(activity: str, layout_prefer: str = "sampled",
     }
 
 
-def _explore_detect(world, aci, locatable, steps, budget) -> dict:
+def _explore_detect(world, aci, locatable, steps, budget, use_tour=False) -> dict:
     """Frontier expansion when selection is spatial rather than by name.
 
     Everything the fov search does by name is done here by handle: go to a detection,
@@ -153,7 +228,9 @@ def _explore_detect(world, aci, locatable, steps, budget) -> dict:
 
     explored = 0
     steps += sweep(aci, on_view=harvest)
-    while steps < budget and not locatable <= found:
+    if use_tour:
+        steps += tour(aci, budget - steps, on_view=harvest)
+    while (not use_tour) and steps < budget and not locatable <= found:
         target = None
         aci.observe()
         steps += 1
@@ -182,6 +259,11 @@ def _explore_detect(world, aci, locatable, steps, budget) -> dict:
             for _ in range(2):
                 aci.move_ahead()
                 steps += 1
+            # One lateral step per excursion, alternating side. Blind forward walking
+            # traces a lattice of headings through the same corridors; adding a
+            # perpendicular offset makes successive excursions cover different ground.
+            (aci.strafe_left if explored % 2 else aci.strafe_right)()
+            steps += 1
             explored += 1
             steps += sweep(aci, on_view=harvest)
             continue
@@ -200,16 +282,20 @@ def _explore_detect(world, aci, locatable, steps, budget) -> dict:
                 aci.open(x.det)
                 steps += 1
             steps += sweep(aci, on_view=harvest)
-            # Step back and sweep again. Occlusion is asymmetric coverage from ONE
-            # viewpoint, so a small object hidden behind large furniture from where we
-            # arrived may be plainly visible half a metre away. Turning alone cannot
-            # recover it -- only translation can, which is the difficulty the true
-            # sizes introduced and the reason a turn-only search under-reports.
-            for _ in range(2):
-                aci.turn_left()
-                aci.turn_left()
-                aci.move_ahead()
-                steps += 3
+            # PARALLAX. Occlusion is asymmetric coverage from ONE viewpoint, so a small
+            # object hidden behind large furniture from where we arrived may be plainly
+            # visible half a metre to the side. Turning cannot recover it; only
+            # translation can.
+            #
+            # This used to be `turn_left, turn_left, move_ahead` -- a 3-call reversal
+            # that walks BACKWARDS along the approach and re-sweeps from a point we have
+            # effectively already seen. Strafing costs 1 call instead of 3 and moves
+            # PERPENDICULAR to the line of sight, which is the direction that actually
+            # changes what is behind what. Left then right also brackets the arrival
+            # point rather than retreating from it.
+            for strafe in (aci.strafe_left, aci.strafe_right, aci.strafe_right):
+                strafe()
+                steps += 1
                 steps += sweep(aci, on_view=harvest)
         else:
             steps += 1
@@ -230,9 +316,25 @@ def _main() -> None:
     ap.add_argument("--n", type=int, default=0, help="limit --all to the first N")
     ap.add_argument("--prefer", default="sampled", choices=["sampled", "generated"])
     ap.add_argument("--budget", type=int, default=400)
+    ap.add_argument("--tour", action="store_true",
+                    help="privileged coverage tour instead of primitive-only search: "
+                         "certifies findability, does NOT produce a policy budget")
+    ap.add_argument("--out", help="write {activity: oracle_steps} as JSON. This table is "
+                                  "what an ORACLE-RELATIVE turn budget is computed from: "
+                                  "max_turns = K * oracle_steps(activity). A flat budget "
+                                  "is unfair in both directions -- the oracle needs a "
+                                  "median 56 steps here but a p90 in the hundreds -- so a "
+                                  "flat 40 floors the hard activities while a flat 400 "
+                                  "lets the easy ones idle.")
     ap.add_argument("--obs-mode", default="fov",
                     choices=["fov", "fov_distract", "detect_scope", "detect"])
     args = ap.parse_args()
+
+    if args.tour and args.out:
+        ap.error(
+            "--tour cannot be combined with --out: tour teleports using privileged "
+            "scene layout, so its steps must never become a policy turn budget"
+        )
 
     if not args.all:
         print(json.dumps(explore(args.activity, args.prefer, args.budget,
@@ -244,15 +346,17 @@ def _main() -> None:
         acts = acts[:args.n]
     complete = partial = fail = 0
     steps_ok, worst = [], []
+    oracle_steps = {}
     for a in acts:
         try:
-            r = explore(a, args.prefer, args.budget, args.obs_mode)
+            r = explore(a, args.prefer, args.budget, args.obs_mode, use_tour=args.tour)
         except Exception:                                          # noqa: BLE001
             fail += 1
             continue
         if r["complete"]:
             complete += 1
             steps_ok.append(r["steps"])
+            oracle_steps[a] = r["steps"]
         else:
             partial += 1
             worst.append((r["found"] / max(r["locatable"], 1), a, r["missing"]))
@@ -261,6 +365,14 @@ def _main() -> None:
     print(f"  ALL objects found   : {complete} = {complete / n:.1%}")
     print(f"  incomplete          : {partial}")
     print(f"  errored             : {fail}")
+    if args.out:
+        # Only COMPLETE runs define a budget: an incomplete search spent its whole
+        # allowance without finding everything, so its step count is a censored
+        # observation, not a measurement of how long the activity takes.
+        with open(args.out, "w") as f:
+            json.dump({"obs_mode": args.obs_mode, "search_budget": args.budget,
+                       "oracle_steps": oracle_steps}, f, indent=1)
+        print(f"  wrote {len(oracle_steps)} oracle step counts -> {args.out}")
     if worst:
         # Mean coverage over the activities the mode can actually attempt. The
         # all-or-nothing `ALL objects found` gate is the certificate we need before

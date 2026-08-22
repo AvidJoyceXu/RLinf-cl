@@ -19,11 +19,12 @@ refusal in `viewpoint.py` to report distances as if they meant anything physical
 the source is generated.
 
 WHY A GENERATED LAYOUT IS STILL THE DEFAULT. Real poses cover a small fraction of the
-benchmark: 32 of the 740 solvable activities have cached instances, and sampling new
-ones runs at ~43% hit rate and 10-16 min each. The research question the viewpoint
-layer exists to answer -- does explicit camera control separate a prompted baseline
-from the SFT checkpoint -- is answerable on any consistent layout. Waiting for pose
-provenance would trade months for a property the measurement does not need.
+benchmark: as of 2026-08-21, 117 activities have an instance on disk and 71 of the 740
+verified-solvable activities are resolvable here. The research question the viewpoint
+layer originally addressed -- whether explicit camera control separates a prompted
+baseline from the SFT checkpoint -- is answerable on any consistent layout. Modes that
+claim real geometry (`detect`, `detect_scope`, `fov_distract`) override this default and
+refuse generated layouts.
 """
 from __future__ import annotations
 
@@ -42,6 +43,13 @@ from rlinf.envs.behavior.symbolic_world import SymbolicWorld, properties_of
 # Where sampled instances land. Both the official challenge tree and anything our own
 # sampler wrote are searched, official first.
 INSTANCE_ROOTS = (
+    # The 2026 challenge set has 100 activities and ~324 instances per activity,
+    # which makes within-activity splits possible. It is NOT a superset of the 2025
+    # set: 16 activities exist only in 2025, so both roots are required. 2026 goes
+    # first only because its many instances are preferable when an activity overlaps.
+    # Fetched with `download_and_unpack_zipped_dataset("2026-challenge-task-instances")`;
+    # 0.11 GB. The union covers 116 activities before our own generated instances.
+    "/data/behavior-data/2026-challenge-task-instances/scenes",
     "/data/behavior-data/2025-challenge-task-instances/scenes",
     # Instances we generate ourselves with upstream's multiply_b1k_tasks.py land in the
     # ASSET tree, not the challenge tree -- that script derives its save_dir from
@@ -91,16 +99,15 @@ def _find_instance(activity: str) -> Optional[str]:
     """Newest `*-tro_state.json` for @activity, or None.
 
     INSTANCE_ROOTS is ordered by PREFERENCE, and the first root wins outright; mtime
-    only breaks ties within a root. That ordering is load-bearing rather than
-    cosmetic: the official challenge instances carry `robot_poses` (a sampled robot
-    start pose) and instances we generate with `multiply_b1k_tasks.py` do not, because
-    the stage that writes them -- `sample_robot_pose.py` -- does not exist in this
-    OmniGibson version. Without a sampled pose `_from_instance` falls back to the
-    centroid of the task objects, which stands the robot on top of them.
+    only breaks ties within a root. Official challenge instances are preferred because
+    they passed the published pipeline and, in the 2026 set, provide hundreds of
+    within-activity variants. Locally generated instances remain the fallback.
 
-    Ranking every root together by mtime therefore let 5 freshly generated pose-less
-    instances shadow 351 official ones that had real poses, and `detect` went from
-    reporting objects to reporting nothing.
+    An earlier rationale claimed this ordering was required because generated files
+    lack `robot_poses`. A paired test on 22 activities found no material detect-coverage
+    difference between the sampled pose and `_from_instance`'s centroid fallback. Keep
+    the provenance preference, but do not describe generated instances as second-class
+    for detect on that basis.
     """
     for root in INSTANCE_ROOTS:
         hits = glob.glob(os.path.join(root, "*", "json", f"*_task_{activity}_instances",

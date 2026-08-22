@@ -32,9 +32,9 @@ Two properties are load-bearing:
   *solve*. That asymmetry is the point, and it is why this is not a way of
   gaming the metric.
 
-Stdlib only, and no OmniGibson: the s-expression scanner below is ~20 lines, which
-is cheaper than making the py3.11 trainer venv carry ``bddl``. ``bddl`` is imported
-only to locate ``activity_definitions/`` when no explicit path is given.
+Stdlib only, and no OmniGibson: the s-expression scanner below is ~20 lines.
+``bddl`` is imported only to locate ``activity_definitions/`` when no explicit path
+is given, so rendering stays sim-free inside the current single Python 3.10 venv.
 
     # render one
     python -m rlinf.envs.behavior.nl_goal picking_up_trash

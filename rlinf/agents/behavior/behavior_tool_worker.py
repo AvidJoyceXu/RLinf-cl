@@ -444,14 +444,16 @@ class BehaviorToolWorker(ToolWorker):
         return env
 
 
-def tool_names() -> list[str]:
+def tool_names(obs_mode: str = "full") -> list[str]:
     """Names the agent loop registers with the tool router.
 
     Sourced from the SFT schema so the RL action space cannot silently drift from
-    the one the cold-start was trained on."""
-    from rlinf.envs.behavior.sft_build import tool_schemas
+    the one rendered into its prompt. Camera observation modes include their
+    viewpoint primitives; non-camera modes remain byte-identical at 17 tools.
+    """
+    from rlinf.envs.behavior.sft_build import all_schemas
 
-    return [t["name"] for t in tool_schemas()]
+    return [t["name"] for t in all_schemas(obs_mode)]
 
 
 __all__ = ["BehaviorToolWorker", "tool_names"]

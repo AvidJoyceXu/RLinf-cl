@@ -135,13 +135,17 @@ class BehaviorAgentLoopWorker(MultiAgentLoopWorker):
 
     # ------------------------------------------------------------------ helpers
 
-    @staticmethod
-    def _tool_schemas() -> list[dict]:
+    def _tool_schemas(self) -> list[dict]:
         """Imported lazily: sft_build is sim-free, but keep the import local so
-        the agent loop never grows a hard dependency on the env package."""
-        from rlinf.envs.behavior.sft_build import tool_schemas
+        the agent loop never grows a hard dependency on the env package.
 
-        return list(tool_schemas())
+        Camera-controlled observation modes add viewpoint actions. Using the core
+        17-tool schema here while the API baseline used ``all_schemas`` made the two
+        policies incomparable and left an RL policy unable to search at all.
+        """
+        from rlinf.envs.behavior.sft_build import all_schemas
+
+        return list(all_schemas(self.obs_mode))
 
     def _dump_trace(self, record: dict) -> None:
         if not self.trace_dump_dir:
