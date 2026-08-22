@@ -35,6 +35,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -63,6 +64,7 @@ class Layout:
     activity: str
     source: str  # "sampled" | "generated"
     xyz: dict = field(default_factory=dict)  # scope name -> (x, y, z)
+    orientation: dict = field(default_factory=dict)  # scope name -> xyzw quaternion
     rooms: dict = field(default_factory=dict)  # room name -> (cx, cy)
     robot_xy: tuple = (0.0, 0.0)
     robot_yaw: float = 0.0
@@ -94,8 +96,8 @@ def _find_instance(
     """Preferred compatible `*-tro_state.json` for @activity, or None.
 
     The selected source registry is ordered by PREFERENCE, and the first source wins
-    outright; mtime
-    only breaks ties within a root. Official challenge instances are preferred because
+    outright. Within a source, the natural-lowest filename wins (``..._0_9`` before
+    ``..._0_10``). Official challenge instances are preferred because
     they passed the published pipeline and, in the 2026 set, provide hundreds of
     within-activity variants. Locally generated instances remain the fallback.
 
@@ -122,7 +124,7 @@ def _find_instance(
             )
         )
         hits += glob.glob(os.path.join(root, activity, "*tro_state.json"))
-        for path in sorted(hits, key=os.path.getmtime, reverse=True):
+        for path in sorted(hits, key=_instance_sort_key):
             if (
                 expected_scope is None
                 or scope_mismatch(expected_scope, path, ignored_scope=ignored_scope)
@@ -130,6 +132,14 @@ def _find_instance(
             ):
                 return path, source
     return None
+
+
+def _instance_sort_key(path: str) -> tuple:
+    """Natural, extraction-time-independent ordering for immutable instances."""
+    return tuple(
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", os.path.basename(path))
+    )
 
 
 def _scene_of_path(path: str) -> str:
@@ -192,6 +202,9 @@ def _from_instance(activity: str, path: str, source: InstanceSource) -> Layout:
             continue
         x, y, z = (float(v) for v in rl["pos"])
         lay.xyz[name] = (x, y, z)
+        ori = rl.get("ori")
+        if ori and len(ori) == 4:
+            lay.orientation[name] = tuple(float(v) for v in ori)
     if lay.xyz and lay.robot_xy == (0.0, 0.0):
         # No robot_poses in the file: start the robot at the centroid of the task
         # objects rather than at the origin, which would usually be outside the house.

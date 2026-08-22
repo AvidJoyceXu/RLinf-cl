@@ -141,7 +141,7 @@ def _waypoints(aci, spacing=2.5):
 
 
 def _target_orbit_waypoints(aci):
-    """Eight close views around every locatable required object.
+    """Three rings of eight target-facing views around every required object.
 
     The scene-furniture grid covers rooms, not necessarily the small object itself.
     This second privileged pass distinguishes "our coarse tour never stood nearby"
@@ -150,34 +150,62 @@ def _target_orbit_waypoints(aci):
     These are geometric candidate viewpoints, not navmesh certificates. Physical
     reachability remains a synchronized OmniGibson smoke-test obligation.
     """
-    from rlinf.envs.behavior.detect import extent_for_model, scope_assets
+    from rlinf.envs.behavior.detect import (
+        extent_for_model,
+        offset_for_model,
+        scope_assets,
+        world_bbox,
+    )
 
     assets = scope_assets(aci.layout.instance_path or "")
     for name in aci.world.scope_names:
         if name == aci.world.agent or not aci.world.is_real(name):
             continue
-        pos = aci.layout.pos(name)
-        if pos is None:
+        base_pos = aci.layout.pos(name)
+        if base_pos is None:
             continue
         radius = 1.2
+        pos = base_pos
         asset = assets.get(name)
         if asset:
             native = extent_for_model(asset["model"])
             if native:
+                pos, world_extent = world_bbox(
+                    base_pos,
+                    native,
+                    local_offset=offset_for_model(asset["model"]),
+                    scale=asset["scale"],
+                    orientation=aci.layout.orientation.get(
+                        name, (0.0, 0.0, 0.0, 1.0)
+                    ),
+                )
                 radius = max(
                     radius,
-                    math.hypot(
-                        native[0] * asset["scale"][0],
-                        native[1] * asset["scale"][1],
-                    )
-                    + 0.5,
+                    math.hypot(world_extent[0], world_extent[1]) + 0.5,
                 )
-        for angle_index in range(8):
-            angle = angle_index * math.pi / 4.0
-            x = pos[0] + radius * math.cos(angle)
-            y = pos[1] + radius * math.sin(angle)
-            yaw = math.atan2(pos[1] - y, pos[0] - x)
-            yield x, y, yaw
+        for ring_offset in (0.0, 1.0, 2.0):
+            ring_radius = radius + ring_offset
+            for angle_index in range(8):
+                angle = angle_index * math.pi / 4.0
+                x = pos[0] + ring_radius * math.cos(angle)
+                y = pos[1] + ring_radius * math.sin(angle)
+                yaw = math.atan2(pos[1] - y, pos[0] - x)
+                yield x, y, yaw
+
+
+def _focused_pitch_sweep(aci, on_view=None) -> int:
+    """Look at one known target at every supported pitch, without turning away."""
+    steps = 0
+    for pitch_index in PITCHES:
+        aci.view.pitch = pitch_index * math.radians(30.0)
+        aci._view_epoch += 1
+        aci.observe()
+        steps += 1
+        if on_view is not None:
+            on_view()
+    aci.view.pitch = 0.0
+    aci._view_epoch += 1
+    return steps
 
 
 def tour(aci, budget, on_view=None) -> int:
@@ -291,7 +319,7 @@ def tour(aci, budget, on_view=None) -> int:
             break
         aci.view.teleport(wx, wy, yaw)
         steps += 1
-        steps += sweep(aci, on_view=_look_and_open)
+        steps += _focused_pitch_sweep(aci, on_view=_look_and_open)
     return steps
 
 def explore(activity: str, layout_prefer: str = "sampled",
@@ -517,8 +545,16 @@ def _main() -> None:
             ap.error("--certificate requires --source-id and --container-id")
 
     if not args.all:
-        print(json.dumps(explore(args.activity, args.prefer, args.budget,
-                                 args.obs_mode), indent=1))
+        print(json.dumps(
+            explore(
+                args.activity,
+                args.prefer,
+                args.budget,
+                args.obs_mode,
+                use_tour=args.tour,
+            ),
+            indent=1,
+        ))
         return
 
     try:

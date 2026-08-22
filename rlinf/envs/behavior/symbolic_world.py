@@ -1002,6 +1002,7 @@ class SymbolicACI:
             scope_assets,
             scope_models,
             scope_scene_names,
+            world_bbox,
         )
 
         assets = scope_assets(self.layout.instance_path or "")
@@ -1039,11 +1040,17 @@ class SymbolicACI:
             if ext is None:
                 self._det_audit[audit_key].add("missing_extent")
                 continue
-            ext = tuple(ext[k] * scale[k] for k in range(3))
             # The instance file records the BASE LINK pose; the bbox is centred at
-            # pose + ig:offsetBaseLink.
+            # pose + the ROTATED ig:offsetBaseLink. Its local extents must likewise
+            # be rotated into a conservative world AABB.
             off = offset_for_model(models[name]) if name in models else (0.0, 0.0, 0.0)
-            centre = tuple(pos[k] + off[k] * scale[k] for k in range(3))
+            centre, ext = world_bbox(
+                pos,
+                ext,
+                local_offset=off,
+                scale=scale,
+                orientation=self.layout.orientation.get(name, (0.0, 0.0, 0.0, 1.0)),
+            )
             entries.append((f"scope:{name}", cat, centre, ext))
         for i, so in enumerate(scene_furniture(self.layout.scene or "")):
             if so.name in bound_scene_names:

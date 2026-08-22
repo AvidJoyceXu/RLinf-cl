@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import math
 import sys
 import tempfile
 import unittest
@@ -41,6 +42,9 @@ _trajectory_video = _load_pure_module(
     "_behavior_trajectory_video_test", "trajectory_video.py"
 )
 _detect = _load_pure_module("_behavior_detect_test", "detect.py")
+_layout_source = (
+    Path(__file__).resolve().parents[2] / "rlinf/envs/behavior/layout.py"
+).read_text()
 CAMERA_OBS_MODES = _sft_build.CAMERA_OBS_MODES
 all_schemas = _sft_build.all_schemas
 tool_schemas = _sft_build.tool_schemas
@@ -59,6 +63,8 @@ TrajectoryVideoRecorder = _trajectory_video.TrajectoryVideoRecorder
 scope_scene_names = _detect.scope_scene_names
 scope_assets = _detect.scope_assets
 project_detections = _detect.detect
+project_bbox = _detect._project
+world_bbox = _detect.world_bbox
 
 
 class ToolSchemaTest(unittest.TestCase):
@@ -93,6 +99,35 @@ class ToolSchemaTest(unittest.TestCase):
 
 
 class InstanceSourcePolicyTest(unittest.TestCase):
+    def test_instance_choice_does_not_depend_on_file_mtime(self):
+        tree = ast.parse(_layout_source)
+        find_instance = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_find_instance"
+        )
+        calls = [node for node in ast.walk(find_instance) if isinstance(node, ast.Call)]
+        self.assertFalse(
+            any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "getmtime"
+                for call in calls
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(call.func, ast.Name)
+                and call.func.id == "sorted"
+                and any(
+                    keyword.arg == "key"
+                    and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id == "_instance_sort_key"
+                    for keyword in call.keywords
+                )
+                for call in calls
+            )
+        )
+
     def test_default_layout_sources_exclude_local_samples(self):
         names = [source.name for source in selected_layout_sources(data_root="/tmp/x")]
         self.assertEqual(names, ["2026-v3.9.1", "2025-official"])
@@ -214,6 +249,19 @@ class InstanceSourcePolicyTest(unittest.TestCase):
                 {"model": "abc123", "scale": (1.5, 2.0, 0.75)},
             )
 
+    def test_world_bbox_rotates_scaled_extent_and_base_link_offset(self):
+        centre, extent = world_bbox(
+            (10.0, 20.0, 1.0),
+            (2.0, 0.5, 0.25),
+            local_offset=(1.0, 0.0, 0.0),
+            scale=(2.0, 1.0, 1.0),
+            orientation=(0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5)),
+        )
+        for actual, expected in zip(centre, (10.0, 22.0, 1.0)):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(extent, (0.5, 4.0, 0.25)):
+            self.assertAlmostEqual(actual, expected)
+
     def test_support_host_can_be_exempted_from_aabb_occlusion(self):
         view = SimpleNamespace(x=0.0, y=0.0, yaw=0.0, pitch=0.0)
         entries = [
@@ -228,6 +276,16 @@ class InstanceSourcePolicyTest(unittest.TestCase):
             occlusion_exempt_pairs=frozenset({("scope:item", "scope:host")}),
         )
         self.assertIn("scope:item", {d.key for d in visible})
+
+    def test_projection_depth_is_bbox_centre_not_nearest_corner(self):
+        view = SimpleNamespace(x=0.0, y=0.0, yaw=0.0, pitch=0.0)
+        projected = project_bbox(view, (3.0, 0.0, 1.2), (2.0, 0.5, 0.5))
+        self.assertIsNotNone(projected)
+        self.assertAlmostEqual(projected[1], 3.0)
+
+    def test_projection_rejects_bbox_entirely_behind_camera(self):
+        view = SimpleNamespace(x=0.0, y=0.0, yaw=0.0, pitch=0.0)
+        self.assertIsNone(project_bbox(view, (-3.0, 0.0, 1.2), (0.5, 0.5, 0.5)))
 
 
 class HarnessCapabilityTest(unittest.TestCase):
@@ -356,6 +414,30 @@ class TurnBudgetTest(unittest.TestCase):
 
 
 class SolvabilityCertificateTest(unittest.TestCase):
+    def test_single_activity_cli_forwards_privileged_tour_flag(self):
+        root = Path(__file__).resolve().parents[2]
+        tree = ast.parse(
+            (root / "rlinf/envs/behavior/viewpoint_search.py").read_text()
+        )
+        explore_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "explore"
+        ]
+        self.assertTrue(
+            any(
+                any(
+                    keyword.arg == "use_tour"
+                    and isinstance(keyword.value, ast.Attribute)
+                    and keyword.value.attr == "tour"
+                    for keyword in call.keywords
+                )
+                for call in explore_calls
+            )
+        )
+
     def test_miss_taxonomy_is_mutually_exclusive(self):
         cases = {
             "nonvisual_substance": ([], ["nonvisual_substance"]),

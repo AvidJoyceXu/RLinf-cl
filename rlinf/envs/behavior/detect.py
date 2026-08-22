@@ -179,6 +179,53 @@ def offset_for_model(model: str) -> tuple:
     return tuple(bb["offset"]) if bb and "offset" in bb else (0.0, 0.0, 0.0)
 
 
+def world_bbox(
+    base_pos: tuple,
+    local_half_extent: tuple,
+    *,
+    local_offset: tuple = (0.0, 0.0, 0.0),
+    scale: tuple = (1.0, 1.0, 1.0),
+    orientation: tuple = (0.0, 0.0, 0.0, 1.0),
+) -> tuple[tuple, tuple]:
+    """Transform an asset-local bbox into a conservative world-axis AABB.
+
+    BEHAVIOR records ``root_link.pos`` and an xyzw ``root_link.ori`` while
+    ``ig:nativeBB`` and ``ig:offsetBaseLink`` are asset-local.  Scaling without
+    rotating these quantities moves a rotated object's centre to the wrong side of
+    its base link and leaves long objects' x/y dimensions on the wrong axes.
+    """
+    x, y, z, w = (float(value) for value in orientation)
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1e-12:
+        x, y, z, w = 0.0, 0.0, 0.0, 1.0
+    else:
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    rotation = (
+        (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+        (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+        (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+    )
+    scaled_offset = tuple(
+        float(local_offset[k]) * float(scale[k]) for k in range(3)
+    )
+    scaled_half_extent = tuple(
+        float(local_half_extent[k]) * abs(float(scale[k])) for k in range(3)
+    )
+    centre = tuple(
+        float(base_pos[row])
+        + sum(rotation[row][col] * scaled_offset[col] for col in range(3))
+        for row in range(3)
+    )
+    extent = tuple(
+        max(
+            sum(abs(rotation[row][col]) * scaled_half_extent[col] for col in range(3)),
+            MIN_EXTENT_M,
+        )
+        for row in range(3)
+    )
+    return centre, extent
+
+
 def extent_for_category(category: str):
     """Half-extent from the per-category median of real model boxes, or None.
 
@@ -241,7 +288,8 @@ def scene_furniture(scene_model: str) -> tuple:
         if not cat or cat in STUFF_CATEGORIES:
             continue
         st = reg.get(name) or {}
-        pos = st.get("root_link", {}).get("pos")
+        root_link = st.get("root_link", {})
+        pos = root_link.get("pos")
         if not pos:
             continue
         # TRUE size: the asset's own native bbox for THIS model, times the instance's
@@ -250,10 +298,18 @@ def scene_furniture(scene_model: str) -> tuple:
         if base is None:
             continue                  # unknown model: omit rather than invent a size
         sc = args.get("scale") or [1.0, 1.0, 1.0]
-        ext = tuple(max(float(b) * float(v) / 2.0, MIN_EXTENT_M)
-                    for b, v in zip(base["bbox"], sc))
+        local_ext = tuple(max(float(b) / 2.0, MIN_EXTENT_M)
+                          for b in base["bbox"])
         off = base.get("offset") or (0.0, 0.0, 0.0)
-        centre = tuple(float(pos[k]) + float(off[k]) * float(sc[k]) for k in range(3))
+        centre, ext = world_bbox(
+            tuple(float(value) for value in pos),
+            local_ext,
+            local_offset=tuple(float(value) for value in off),
+            scale=tuple(float(value) for value in sc),
+            orientation=tuple(
+                float(value) for value in root_link.get("ori", (0, 0, 0, 1))
+            ),
+        )
         jp = st.get("joint_pos") or []
         rooms = args.get("in_rooms") or []
         out.append(SceneObject(
@@ -282,7 +338,18 @@ def _project(view, pos, ext) -> tuple | None:
     cos_y, sin_y = math.cos(-view.yaw), math.sin(-view.yaw)
     cos_p, sin_p = math.cos(-cy_pitch), math.sin(-cy_pitch)
 
-    xs, ys, depths = [], [], []
+    # Sort projected boxes by their centre depth. Using the nearest of eight AABB
+    # corners made every large cabinet/table win the painter's ordering across its
+    # entire projected rectangle, even where that near corner was nowhere near the
+    # small target ray. Centre depth is still an analytic approximation, but it does
+    # not systematically turn large conservative AABBs into foreground billboards.
+    centre_wx = pos[0] - view.x
+    centre_wy = pos[1] - view.y
+    centre_wz = pos[2] - CAMERA_HEIGHT_M
+    centre_cx = centre_wx * cos_y - centre_wy * sin_y
+    centre_fwd = centre_cx * cos_p - centre_wz * sin_p
+
+    xs, ys, raw_depths = [], [], []
     for dx in (-ext[0], ext[0]):
         for dy in (-ext[1], ext[1]):
             for dz in (-ext[2], ext[2]):
@@ -294,6 +361,7 @@ def _project(view, pos, ext) -> tuple | None:
                 cyy = wx * sin_y + wy * cos_y
                 fwd = cx * cos_p - wz * sin_p
                 up = cx * sin_p + wz * cos_p
+                raw_depths.append(fwd)
                 # CLAMP to the near plane rather than dropping corners behind the
                 # camera. Dropping them silently collapses the box of any object that
                 # straddles the camera: standing on a 12 m floor, the four corners in
@@ -303,14 +371,16 @@ def _project(view, pos, ext) -> tuple | None:
                 near = max(fwd, 0.05)
                 xs.append(IMAGE_W / 2 - fx * cyy / near)
                 ys.append(IMAGE_H / 2 - fx * up / near)
-                depths.append(near)
-    if not xs:
+    # Clamping is only valid for a box that STRADDLES the near plane. A box whose
+    # eight corners are behind the camera is not visible; clamping all of them turns
+    # it into a giant mirrored rectangle and lets a backwards-facing sweep "find" it.
+    if not xs or max(raw_depths) <= 0.05:
         return None
     x0, x1 = max(0.0, min(xs)), min(float(IMAGE_W), max(xs))
     y0, y1 = max(0.0, min(ys)), min(float(IMAGE_H), max(ys))
     if x1 - x0 < 1 or y1 - y0 < 1:
         return None
-    return (int(x0), int(y0), int(x1), int(y1)), min(depths)
+    return (int(x0), int(y0), int(x1), int(y1)), max(centre_fwd, 0.05)
 
 
 def _frac_covered(a, b) -> float:
@@ -397,17 +467,15 @@ def detect(view, entries, audit=None, occlusion_exempt_pairs=frozenset()) -> lis
         # cover drops a detection now; anything less shrinks the reported box and the
         # score, which is both more faithful and still a real cost to the policy,
         # since a sliver of a box is harder to select against and easier to confuse.
-        covered = max(
-            (
-                _frac_covered(box, nearer_box)
-                for nearer_box, nearer_cat, nearer_key in occluders
-                if nearer_cat != cat
-                and (key, nearer_key) not in occlusion_exempt_pairs
-            ),
-            default=0.0,
-        )
+        coverage = [
+            (_frac_covered(box, nearer_box), nearer_key)
+            for nearer_box, nearer_cat, nearer_key in occluders
+            if nearer_cat != cat and (key, nearer_key) not in occlusion_exempt_pairs
+        ]
+        covered, occluder_key = max(coverage, default=(0.0, ""))
         if covered > 0.95:
             _audit_mark(audit, key, "occluded")
+            _audit_mark(audit, key, f"occluded_by:{occluder_key}")
             continue                    # essentially entirely hidden
         area = (box[2] - box[0]) * (box[3] - box[1]) * (1.0 - covered)
         out.append(Detection(
