@@ -47,6 +47,7 @@ build_activity_certificate = _certificate.build_activity_certificate
 classify_object = _certificate.classify_object
 instance_scope = _compatibility.instance_scope
 scope_mismatch = _compatibility.scope_mismatch
+expand_problem_wildcards = _compatibility.expand_problem_wildcards
 assert_detect_eligible = _sources.assert_detect_eligible
 resolve_activity_location = _sources.resolve_activity_location
 selected_layout_sources = _sources.selected_layout_sources
@@ -123,6 +124,36 @@ class InstanceSourcePolicyTest(unittest.TestCase):
                 resolve_activity_location(
                     "task_a", source_name="2026-v3.9.1", data_root=str(root)
                 )
+
+    def test_scene_wildcard_is_removed_when_minimum_already_fills_room(self):
+        problem = """(:objects
+  sink.n.01_1 sink.n.01_* - sink.n.01
+)
+(:init
+  (inroom sink.n.01_* bathroom)
+)
+"""
+        expanded = expand_problem_wildcards(problem, {"sink.n.01_1"})
+        self.assertNotIn("*", expanded)
+        self.assertNotIn("(inroom sink.n.01_", expanded)
+        self.assertIn("sink.n.01_1", expanded)
+
+    def test_scene_wildcard_expands_extra_template_bindings(self):
+        problem = """(:objects
+  cabinet.n.01_1 cabinet.n.01_* - cabinet.n.01
+)
+(:init
+  (inroom cabinet.n.01_* kitchen)
+)
+"""
+        expanded = expand_problem_wildcards(
+            problem,
+            {"cabinet.n.01_1", "cabinet.n.01_2", "cabinet.n.01_3"},
+        )
+        self.assertNotIn("*", expanded)
+        self.assertIn("cabinet.n.01_2 cabinet.n.01_3 - cabinet.n.01", expanded)
+        self.assertIn("(inroom cabinet.n.01_2 kitchen)", expanded)
+        self.assertIn("(inroom cabinet.n.01_3 kitchen)", expanded)
 
 
 class HarnessCapabilityTest(unittest.TestCase):

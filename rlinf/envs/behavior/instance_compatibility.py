@@ -11,6 +11,56 @@ from typing import Iterable, Optional
 IGNORED_TRO_KEYS = {"robot_poses"}
 
 
+def expand_problem_wildcards(problem: str, concrete_scope: Iterable[str]) -> str:
+    """Expand v3.9 scene selectors using the paired template's concrete scope.
+
+    ``category.n.01_*`` is a placeholder for additional scene objects beyond the
+    explicitly required minimum. The official sampler expands it before creating
+    ``inst_to_name``; the v3.7 symbolic evaluator does not know that syntax, so the
+    synchronized compatibility bridge performs the same textual expansion from the
+    authoritative template scope.
+    """
+    lines = problem.splitlines(keepends=True)
+    concrete = set(concrete_scope)
+    expansions: dict[str, list[str]] = {}
+
+    for index, line in enumerate(lines):
+        if "*" not in line or " - " not in line:
+            continue
+        declaration, synset = line.strip().split(" - ", 1)
+        instances = declaration.split()
+        wildcard = next((name for name in instances if name.endswith("_*")), None)
+        if wildcard is None:
+            continue
+        explicit = set(instances) - {wildcard}
+        candidates = sorted(
+            name for name in concrete if name.startswith(f"{synset}_")
+        )
+        extras = [name for name in candidates if name not in explicit]
+        expansions[wildcard] = extras
+        lines[index] = line.replace(wildcard, " ".join(extras))
+
+    if not expansions:
+        return problem
+
+    out = []
+    for line in lines:
+        wildcard = next((name for name in expansions if name in line), None)
+        if wildcard is None:
+            out.append(line)
+            continue
+        if " - " in line:
+            # Already replaced in the first pass; this branch is defensive for an
+            # unusual declaration containing two wildcard selectors.
+            out.append(line.replace(wildcard, " ".join(expansions[wildcard])))
+            continue
+        stripped = line.strip()
+        if not stripped.startswith("(inroom "):
+            raise ValueError(f"unsupported wildcard use: {stripped}")
+        out.extend(line.replace(wildcard, name) for name in expansions[wildcard])
+    return "".join(out)
+
+
 def template_path_for(tro_state_path: str) -> Path:
     """Return the template paired with a ``*-tro_state.json`` snapshot."""
     path = Path(tro_state_path)

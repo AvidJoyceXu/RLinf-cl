@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import glob
 import json
 import math
 import os
@@ -294,6 +295,36 @@ class SymbolicWorld:
                     f"pinned BDDL definition missing: {problem_path}"
                 )
             predefined_problem = open(problem_path).read()
+            # Resolve v3.9 scene-object selectors against the same versioned
+            # template population the layout resolver will use. Without this, the
+            # old evaluator treats ``cabinet.n.01_*`` as a literal object and adds a
+            # guaranteed missing-pose target to the detect denominator.
+            from rlinf.envs.behavior.instance_compatibility import (
+                expand_problem_wildcards,
+                instance_scope,
+            )
+            from rlinf.envs.behavior.instance_sources import selected_layout_sources
+
+            template_probe = None
+            for source in selected_layout_sources():
+                candidates = sorted(
+                    glob.glob(
+                        os.path.join(
+                            source.root,
+                            "*",
+                            "json",
+                            f"*_task_{activity}_instances",
+                            "*tro_state.json",
+                        )
+                    )
+                )
+                if candidates:
+                    template_probe = candidates[0]
+                    break
+            if template_probe:
+                predefined_problem = expand_problem_wildcards(
+                    predefined_problem, instance_scope(template_probe)
+                )
             # The installed v3.7 evaluator calls its equivalent domain
             # ``omnigibson``; v3.9.1 renamed it to ``behavior-1k`` while retaining
             # the predicates this symbolic backend uses. Feed the pinned problem to
@@ -1158,7 +1189,7 @@ class SymbolicACI:
         self._held = scope_name
         return self._result(True, "grasp", args, f"holding {name}")
 
-    def release(self, name: str = None) -> ToolResult:
+    def release(self, name: str | None = None) -> ToolResult:
         if self._held is None:
             return self._result(False, "release", {},
                                 "precondition failed: not holding anything")
