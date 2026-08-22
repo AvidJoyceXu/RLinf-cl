@@ -140,6 +140,46 @@ def _waypoints(aci, spacing=2.5):
     return [(float(p[0]), float(p[1])) for p in pts]
 
 
+def _target_orbit_waypoints(aci):
+    """Eight close views around every locatable required object.
+
+    The scene-furniture grid covers rooms, not necessarily the small object itself.
+    This second privileged pass distinguishes "our coarse tour never stood nearby"
+    from "the analytic geometry hides the object from every tested side".
+
+    These are geometric candidate viewpoints, not navmesh certificates. Physical
+    reachability remains a synchronized OmniGibson smoke-test obligation.
+    """
+    from rlinf.envs.behavior.detect import extent_for_model, scope_assets
+
+    assets = scope_assets(aci.layout.instance_path or "")
+    for name in aci.world.scope_names:
+        if name == aci.world.agent or not aci.world.is_real(name):
+            continue
+        pos = aci.layout.pos(name)
+        if pos is None:
+            continue
+        radius = 1.2
+        asset = assets.get(name)
+        if asset:
+            native = extent_for_model(asset["model"])
+            if native:
+                radius = max(
+                    radius,
+                    math.hypot(
+                        native[0] * asset["scale"][0],
+                        native[1] * asset["scale"][1],
+                    )
+                    + 0.5,
+                )
+        for angle_index in range(8):
+            angle = angle_index * math.pi / 4.0
+            x = pos[0] + radius * math.cos(angle)
+            y = pos[1] + radius * math.sin(angle)
+            yaw = math.atan2(pos[1] - y, pos[0] - x)
+            yield x, y, yaw
+
+
 def tour(aci, budget, on_view=None) -> int:
     """PRIVILEGED coverage tour: stand at every occupied cell of the scene and sweep.
 
@@ -244,6 +284,12 @@ def tour(aci, budget, on_view=None) -> int:
         if steps >= budget:
             break
         aci.view.teleport(wx, wy)
+        steps += 1
+        steps += sweep(aci, on_view=_look_and_open)
+    for wx, wy, yaw in _target_orbit_waypoints(aci):
+        if steps >= budget:
+            break
+        aci.view.teleport(wx, wy, yaw)
         steps += 1
         steps += sweep(aci, on_view=_look_and_open)
     return steps
