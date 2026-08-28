@@ -25,6 +25,7 @@ at the first env boot, so a second ``boot_env`` in the same process fails with
 driver must launch a fresh process per activity; passing several activities here
 only records boot errors for all but the first.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -57,10 +58,13 @@ def load_model(policy_dir: str):
 
 def result_payload(tool: str, res):
     """Mirror the SFT tool-response contract (sft_build / rollout_sft):
-    observe -> the full obs dict; end_task -> {ok,success}; others -> {ok,reason}.
+    observe/scan tools -> the full obs dict; end_task -> {ok,success}; others ->
+    {ok,reason}.
     observe() returns a plain dict; every other tool returns a ToolResult."""
     if tool == "observe":
-        return res                                   # res IS the obs dict
+        return res  # res IS the obs dict
+    if tool in ("scan_next", "scan_at"):
+        return res.observation
     if tool == "end_task":
         return {"ok": bool(res.ok), "success": bool(res.ok)}
     return {"ok": bool(res.ok), "reason": getattr(res, "reason", "")}
@@ -69,8 +73,18 @@ def result_payload(tool: str, res):
 # --------------------------------------------------------------------------- #
 # One rollout (temperature sampling)
 # --------------------------------------------------------------------------- #
-def rollout_once(model, tok, aci, activity, goal_lines, obs_mode,
-                 max_turns, temperature, top_p, max_new_tokens=256):
+def rollout_once(
+    model,
+    tok,
+    aci,
+    activity,
+    goal_lines,
+    obs_mode,
+    max_turns,
+    temperature,
+    top_p,
+    max_new_tokens=256,
+):
     """Run one flat-continuation episode; return (tool_steps, tool_trace).
 
     tool_steps -> SFT-row shape [{name, arguments, result_text}]; the FIRST is an
@@ -78,32 +92,47 @@ def rollout_once(model, tok, aci, activity, goal_lines, obs_mode,
     tool_trace -> [{name, arguments, meta}] for the reward module (meta carries
     the BDDL goal_status snapshot after each tool)."""
     import torch
+
     from rlinf.envs.behavior import sft_build as sb
 
     messages = sb.build_prompt_messages(activity, goal_lines, obs_mode)
-    prompt = tok.apply_chat_template(messages, tools=sb.tool_schemas(),
-                                     tokenize=False, add_generation_prompt=True)
+    prompt = tok.apply_chat_template(
+        messages, tools=sb.tool_schemas(), tokenize=False, add_generation_prompt=True
+    )
     ctx = prompt
     tool_steps, tool_trace = [], []
+    initial_progress = aci.world.ground_goal_progress()
 
     def _meta():
         gs = aci.goal_status()
-        n_sat, n_goal = len(gs["satisfied"]), len(gs["satisfied"]) + len(gs["unsatisfied"])
-        return {"num_satisfied": n_sat, "num_goal": n_goal,
-                "is_success": (len(gs["unsatisfied"]) == 0 and n_sat > 0)}
+        n_sat, n_goal = (
+            len(gs["satisfied"]),
+            len(gs["satisfied"]) + len(gs["unsatisfied"]),
+        )
+        return {
+            "num_satisfied": n_sat,
+            "num_goal": n_goal,
+            "is_success": (len(gs["unsatisfied"]) == 0 and n_sat > 0),
+            **aci.world.ground_goal_progress(),
+            "initial_atom_coverage": initial_progress["atom_coverage"],
+        }
 
     for _ in range(max_turns):
         ids = tok(ctx, return_tensors="pt", add_special_tokens=False).input_ids.cuda()
         with torch.no_grad():
             out = model.generate(
-                ids, max_new_tokens=max_new_tokens,
-                do_sample=temperature > 0, temperature=max(temperature, 1e-5),
-                top_p=top_p, pad_token_id=tok.eos_token_id)
-        gen = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+                ids,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+                temperature=max(temperature, 1e-5),
+                top_p=top_p,
+                pad_token_id=tok.eos_token_id,
+            )
+        gen = tok.decode(out[0, ids.shape[1] :], skip_special_tokens=True)
         m = TC.search(gen)
         if not m:
-            break                                    # unparseable -> episode ends
-        model_out = gen[:m.end()]
+            break  # unparseable -> episode ends
+        model_out = gen[: m.end()]
         try:
             call = json.loads(m.group(1))
             name, args = call["name"], call.get("arguments", {}) or {}
@@ -117,8 +146,13 @@ def rollout_once(model, tok, aci, activity, goal_lines, obs_mode,
         except Exception:
             break
         payload = result_payload(name, res)
-        tool_steps.append({"name": name, "arguments": args,
-                           "result_text": json.dumps(payload, ensure_ascii=False)})
+        tool_steps.append(
+            {
+                "name": name,
+                "arguments": args,
+                "result_text": json.dumps(payload, ensure_ascii=False),
+            }
+        )
         tool_trace.append({"name": name, "arguments": args, "meta": _meta()})
         ctx = ctx + model_out + "\n" + json.dumps(payload, ensure_ascii=False) + "\n"
         if name == "end_task":
@@ -132,14 +166,19 @@ def rollout_once(model, tok, aci, activity, goal_lines, obs_mode,
 def boot_env(activity, scene):
     from omegaconf import OmegaConf
     from omnigibson.envs import VectorEnvironment
+
     from rlinf.envs.behavior.semantic_tools import SemanticACI
     from rlinf.envs.behavior.utils import setup_omni_cfg
 
-    cfg = OmegaConf.load("/workspace/RLinf/examples/embodiment/config/env/behavior_r1pro.yaml")
+    cfg = OmegaConf.load(
+        "/workspace/RLinf/examples/embodiment/config/env/behavior_r1pro.yaml"
+    )
     OmegaConf.update(cfg, "omni_config.env.env_wrapper", None, force_add=True)
     OmegaConf.update(cfg, "omni_config.task.activity_name", activity, force_add=True)
     OmegaConf.update(cfg, "omni_config.scene.scene_model", scene, force_add=True)
-    env = VectorEnvironment(1, OmegaConf.to_container(setup_omni_cfg(cfg), resolve=True))
+    env = VectorEnvironment(
+        1, OmegaConf.to_container(setup_omni_cfg(cfg), resolve=True)
+    )
     env.reset()
     e0 = env.envs[0]
     aci = SemanticACI(e0, obs_mode="full")
@@ -160,8 +199,9 @@ def prep_plan(task, activity, inst_dir):
     return plan, files
 
 
-def reset_to_instance(aci, e0, inst, reset_scene: bool = True,
-                      hard_reset: bool = False):
+def reset_to_instance(
+    aci, e0, inst, reset_scene: bool = True, hard_reset: bool = False
+):
     """Load an instance's task-relevant object state and clear held-object bookkeeping.
 
     ``reset_scene=False`` skips the trailing ``env.scene.reset()``. That call is the
@@ -177,8 +217,10 @@ def reset_to_instance(aci, e0, inst, reset_scene: bool = True,
     containers -- there the reset is what restores a clean start. Callers must check
     the start state (``goal_status`` / ``observe``) when they pass False."""
     from rlinf.envs.behavior.instance_loader import load_activity_instance_tro_state
-    load_activity_instance_tro_state(e0, inst.instance_id, inst.path,
-                                     reset_scene=reset_scene)
+
+    load_activity_instance_tro_state(
+        e0, inst.instance_id, inst.path, reset_scene=reset_scene
+    )
     aci._held = None
 
 
@@ -199,16 +241,27 @@ def build_cache_on_instance(aci, e0, plan, inst):
     for tgt in plan.place_targets:
         o = aci._resolve(tgt)
         if o is not None and Open in getattr(o, "states", {}):
-            aci.go_to(tgt); aci.open(tgt)
-    aci.build_pose_cache(plan.pairs)      # seats objects into containers
-    reset_to_instance(aci, e0, inst)      # restore clean start; cache persists on aci
+            aci.go_to(tgt)
+            aci.open(tgt)
+    aci.build_pose_cache(plan.pairs)  # seats objects into containers
+    reset_to_instance(aci, e0, inst)  # restore clean start; cache persists on aci
 
 
-def sample_activity(model, tok, activity, group_size, instances_per_activity,
-                    temperature, top_p, max_turns, obs_mode, seed):
+def sample_activity(
+    model,
+    tok,
+    activity,
+    group_size,
+    instances_per_activity,
+    temperature,
+    top_p,
+    max_turns,
+    obs_mode,
+    seed,
+):
+    from rlinf.algorithms.rewards import behavior as bhr
     from rlinf.envs.behavior import sft_build as sb
     from rlinf.envs.behavior.harvest_sft import resolve_scene_and_dir
-    from rlinf.algorithms.rewards import behavior as bhr
 
     scene, inst_dir = resolve_scene_and_dir(activity)
     env, e0, aci = boot_env(activity, scene)
@@ -224,36 +277,53 @@ def sample_activity(model, tok, activity, group_size, instances_per_activity,
     for g in range(group_size):
         inst = files[g % n_inst]
         reset_to_instance(aci, e0, inst)
-        build_cache_on_instance(aci, e0, plan, inst)   # per-instance pose cache
-        if aci.is_success():                        # contamination guard
+        build_cache_on_instance(aci, e0, plan, inst)  # per-instance pose cache
+        if aci.is_success():  # contamination guard
             n_contam += 1
             continue
         tool_steps, tool_trace = rollout_once(
-            model, tok, aci, activity, goal_lines, obs_mode,
-            max_turns, temperature, top_p)
+            model,
+            tok,
+            aci,
+            activity,
+            goal_lines,
+            obs_mode,
+            max_turns,
+            temperature,
+            top_p,
+        )
         terminal = bhr.compute_score(tool_trace)
         staged = bhr.compute_staged_rewards(tool_trace)
         success = bhr.episode_is_success(tool_trace)
         n_success += int(success)
-        rows.append({
-            "activity": activity,
-            "task": sb.activity_to_task(activity),
-            "success": bool(success),
-            "num_turns": len(tool_steps),
-            "prompt_messages": sb.build_prompt_messages(activity, goal_lines, obs_mode),
-            "tool_steps": tool_steps,
-            "answer": "",
-            # RFT sidecar (Phase B reads these; the SFT dataset ignores them):
-            "group_id": f"{activity}#inst{inst.instance_id}",
-            "instance_id": inst.instance_id,
-            "reward_terminal": float(terminal),
-            "reward_staged": float(sum(staged)),
-            "properly_ended": bhr.episode_properly_ended(tool_trace),
-        })
+        rows.append(
+            {
+                "activity": activity,
+                "task": sb.activity_to_task(activity),
+                "success": bool(success),
+                "num_turns": len(tool_steps),
+                "prompt_messages": sb.build_prompt_messages(
+                    activity, goal_lines, obs_mode
+                ),
+                "tool_steps": tool_steps,
+                "answer": "",
+                # RFT sidecar (Phase B reads these; the SFT dataset ignores them):
+                "group_id": f"{activity}#inst{inst.instance_id}",
+                "instance_id": inst.instance_id,
+                "reward_terminal": float(terminal),
+                "reward_staged": float(sum(staged)),
+                "properly_ended": bhr.episode_properly_ended(tool_trace),
+            }
+        )
     env.close()
-    stat = {"activity": activity, "scene": scene, "n_rollouts": len(rows),
-            "n_success": n_success, "n_contaminated": n_contam,
-            "success_rate": round(n_success / max(len(rows), 1), 3)}
+    stat = {
+        "activity": activity,
+        "scene": scene,
+        "n_rollouts": len(rows),
+        "n_success": n_success,
+        "n_contaminated": n_contam,
+        "success_rate": round(n_success / max(len(rows), 1), 3),
+    }
     return rows, stat
 
 
@@ -261,8 +331,11 @@ def sample_activity(model, tok, activity, group_size, instances_per_activity,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--policy", required=True, help="HF policy dir (e.g. SFT export)")
-    ap.add_argument("--activities", required=True,
-                    help="comma-separated activity names, or @path to a newline file")
+    ap.add_argument(
+        "--activities",
+        required=True,
+        help="comma-separated activity names, or @path to a newline file",
+    )
     ap.add_argument("--group-size", type=int, default=8)
     ap.add_argument("--instances-per-activity", type=int, default=4)
     ap.add_argument("--temperature", type=float, default=0.9)
@@ -280,6 +353,7 @@ def main():
         activities = [a.strip() for a in args.activities.split(",") if a.strip()]
 
     import torch
+
     torch.manual_seed(args.seed)
     model, tok = load_model(args.policy)
 
@@ -291,25 +365,52 @@ def main():
         for i, activity in enumerate(activities):
             try:
                 rows, stat = sample_activity(
-                    model, tok, activity, args.group_size,
-                    args.instances_per_activity, args.temperature, args.top_p,
-                    args.max_turns, args.obs_mode, args.seed)
+                    model,
+                    tok,
+                    activity,
+                    args.group_size,
+                    args.instances_per_activity,
+                    args.temperature,
+                    args.top_p,
+                    args.max_turns,
+                    args.obs_mode,
+                    args.seed,
+                )
             except Exception as ex:
-                import traceback; traceback.print_exc()
-                stat = {"activity": activity, "error": f"{type(ex).__name__}: {str(ex)[:200]}"}
+                import traceback
+
+                traceback.print_exc()
+                stat = {
+                    "activity": activity,
+                    "error": f"{type(ex).__name__}: {str(ex)[:200]}",
+                }
                 rows = []
             for r in rows:
                 fout.write(json.dumps(r, ensure_ascii=False) + "\n")
                 fout.flush()
             n_rows += len(rows)
             all_stats.append(stat)
-            print(f"[{i+1}/{len(activities)}] {activity}: {json.dumps(stat)}", flush=True)
+            print(
+                f"[{i + 1}/{len(activities)}] {activity}: {json.dumps(stat)}",
+                flush=True,
+            )
     with open(stat_path, "w") as f:
-        json.dump({"policy": args.policy, "n_activities": len(activities),
-                   "n_rows": n_rows, "elapsed_s": round(time.time() - t0, 1),
-                   "per_activity": all_stats}, f, indent=2)
-    print("RFT_SAMPLE_DONE " + json.dumps({"out": args.out, "n_rows": n_rows,
-          "stats": stat_path}), flush=True)
+        json.dump(
+            {
+                "policy": args.policy,
+                "n_activities": len(activities),
+                "n_rows": n_rows,
+                "elapsed_s": round(time.time() - t0, 1),
+                "per_activity": all_stats,
+            },
+            f,
+            indent=2,
+        )
+    print(
+        "RFT_SAMPLE_DONE "
+        + json.dumps({"out": args.out, "n_rows": n_rows, "stats": stat_path}),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

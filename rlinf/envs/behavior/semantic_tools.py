@@ -77,8 +77,9 @@ class ToolResult:
 class SemanticACI:
     """High-level semantic tool interface over one OmniGibson BehaviorTask env."""
 
-    def __init__(self, env, near_threshold: float = NEAR_THRESHOLD_M,
-                 obs_mode: str = "full"):
+    def __init__(
+        self, env, near_threshold: float = NEAR_THRESHOLD_M, obs_mode: str = "full"
+    ):
         # env: an omnigibson.envs.Environment (e.g. vec_env.envs[0]).
         assert obs_mode in ("full", "partial", "fov"), obs_mode
         self.env = env
@@ -91,7 +92,7 @@ class SemanticACI:
         self.obs_mode = obs_mode
         self.camera_pitch = 0.0
         self._pred = self.task._termination_conditions["predicate"]
-        self._held = None          # name of the object currently grasped, or None
+        self._held = None  # name of the object currently grasped, or None
         # slice/dice create half-objects and fill/spray instantiate particle systems,
         # all of which change the scene's OBJECT SET. scene.reset(hard=False) ignores
         # objects absent from the initial file, so it is only sound while this is
@@ -208,7 +209,10 @@ class SemanticACI:
         robot_xy = self._robot_xy()
         objs = []
         for entity in self.task.object_scope.values():
-            obj = getattr(entity, "wrapped_obj", None)
+            # Pre-v3.9 BDDL exposes a wrapper; v3.9 stores the concrete object
+            # directly. This compatibility branch is state-only and does not
+            # import, render, or capture RGB.
+            obj = getattr(entity, "wrapped_obj", None) or entity
             if obj is None or getattr(entity, "is_system", False):
                 continue
             if self.obs_mode in ("partial", "fov") and not self._in_fov(obj):
@@ -229,8 +233,9 @@ class SemanticACI:
     # tools
     # ------------------------------------------------------------------ #
     def _result(self, ok, tool, args, reason):
-        return ToolResult(ok=ok, tool=tool, args=args, reason=reason,
-                          observation=self.observe())
+        return ToolResult(
+            ok=ok, tool=tool, args=args, reason=reason, observation=self.observe()
+        )
 
     def go_to(self, name: str) -> ToolResult:
         """Symbolic navigation: teleport the robot base to a point near @name,
@@ -251,8 +256,9 @@ class SemanticACI:
         quat = th.tensor([0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2)])
         target_pos = th.tensor([float(target_xy[0]), float(target_xy[1]), rz])
         self.robot.set_position_orientation(position=target_pos, orientation=quat)
-        return self._result(True, "go_to", {"name": name},
-                            f"now {self._distance(obj):.2f}m from {name}")
+        return self._result(
+            True, "go_to", {"name": name}, f"now {self._distance(obj):.2f}m from {name}"
+        )
 
     # ------------------------------------------------------------------ #
     # camera / base viewpoint controls (fov mode)
@@ -301,7 +307,8 @@ class SemanticACI:
 
     def turn_right(self) -> ToolResult:
         return self._camera_mode_result(
-            "turn_right", lambda: self._set_base_yaw(self._robot_yaw() - CAMERA_TURN_RAD)
+            "turn_right",
+            lambda: self._set_base_yaw(self._robot_yaw() - CAMERA_TURN_RAD),
         )
 
     def move_ahead(self) -> ToolResult:
@@ -347,12 +354,17 @@ class SemanticACI:
         if obj is None:
             return self._result(False, tool, {"name": name}, "no such object")
         if state_cls not in getattr(obj, "states", {}):
-            return self._result(False, tool, {"name": name},
-                                f"{name} has no {state_cls.__name__} state")
+            return self._result(
+                False, tool, {"name": name}, f"{name} has no {state_cls.__name__} state"
+            )
         if not self._is_near(obj):
-            return self._result(False, tool, {"name": name},
-                                f"precondition failed: not near {name} "
-                                f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
+            return self._result(
+                False,
+                tool,
+                {"name": name},
+                f"precondition failed: not near {name} "
+                f"({self._distance(obj):.2f}m > {self.near_threshold}m)",
+            )
         # Set the state, settle one step so the actuated joint registers, and
         # VERIFY the change actually took. Open._set_value samples partial joint
         # positions and can miss (esp. multi-door objects like cars), so on a miss
@@ -367,8 +379,9 @@ class SemanticACI:
                 st.set_value(value)
             og.sim.step_physics()
         got = bool(st.get_value())
-        return self._result(got == value, tool, {"name": name},
-                            f"{state_cls.__name__}={got}")
+        return self._result(
+            got == value, tool, {"name": name}, f"{state_cls.__name__}={got}"
+        )
 
     def toggle_on(self, name: str) -> ToolResult:
         return self._set_flag("toggle_on", name, ToggledOn, True)
@@ -442,18 +455,24 @@ class SemanticACI:
                 #    no valid slot.
                 if not ok:
                     try:
-                        sample_kinematics(self._SAMPLE_PRED[pred], m, t,
-                                          use_last_ditch_effort=True)
+                        sample_kinematics(
+                            self._SAMPLE_PRED[pred], m, t, use_last_ditch_effort=True
+                        )
                         ok = bool(m.states[cls].get_value(t))
                         via = "sample_kinematics" if ok else "failed"
                     except Exception:
                         ok, via = False, "failed"
                 if ok:
                     pos, orn = m.get_position_orientation()
-                    self._pose_cache[(movable, target, pred)] = (pos.clone(), orn.clone())
-            print(f"[pose_cache] {movable} -> {target} {pred}: "
-                  f"{'ok' if ok else 'FAIL'} via={via} {_t.time() - _t0:.1f}s",
-                  flush=True)
+                    self._pose_cache[(movable, target, pred)] = (
+                        pos.clone(),
+                        orn.clone(),
+                    )
+            print(
+                f"[pose_cache] {movable} -> {target} {pred}: "
+                f"{'ok' if ok else 'FAIL'} via={via} {_t.time() - _t0:.1f}s",
+                flush=True,
+            )
             out[(movable, target, pred)] = ok
         return out
 
@@ -469,7 +488,9 @@ class SemanticACI:
         mlo, mhi = m.states[AABB].get_value()
         half_h = float(mhi[2] - mlo[2]) / 2
         base_z = float(lo[2]) if pred == "Inside" else float(hi[2])
-        m.set_position_orientation(position=th.tensor([cx + dx, cy + dy, base_z + half_h + 0.03]))
+        m.set_position_orientation(
+            position=th.tensor([cx + dx, cy + dy, base_z + half_h + 0.03])
+        )
         for _ in range(self._SETTLE_STEPS):
             og.sim.step_physics()
         return bool(m.states[cls].get_value(t))
@@ -479,12 +500,20 @@ class SemanticACI:
         if obj is None:
             return self._result(False, "grasp", {"name": name}, "no such object")
         if self._held is not None:
-            return self._result(False, "grasp", {"name": name},
-                                f"precondition failed: already holding {self._held}")
+            return self._result(
+                False,
+                "grasp",
+                {"name": name},
+                f"precondition failed: already holding {self._held}",
+            )
         if not self._is_near(obj):
-            return self._result(False, "grasp", {"name": name},
-                                f"precondition failed: not near {name} "
-                                f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
+            return self._result(
+                False,
+                "grasp",
+                {"name": name},
+                f"precondition failed: not near {name} "
+                f"({self._distance(obj):.2f}m > {self.near_threshold}m)",
+            )
         # oracle grasp: lift the object to a carry pose above the robot base so it
         # is no longer resting on its support (kept physically real, not a flag).
         rpos, _ = self._robot_pose()
@@ -496,28 +525,46 @@ class SemanticACI:
 
     def release(self, name: str | None = None) -> ToolResult:
         if self._held is None:
-            return self._result(False, "release", {}, "precondition failed: not holding anything")
+            return self._result(
+                False, "release", {}, "precondition failed: not holding anything"
+            )
         held = self._held
         self._held = None
         return self._result(True, "release", {"name": held}, f"released {held}")
 
     def _place(self, tool, name, target, pred):
         if self._held != name:
-            return self._result(False, tool, {"name": name, "target": target},
-                                f"precondition failed: not holding {name} (held={self._held})")
+            return self._result(
+                False,
+                tool,
+                {"name": name, "target": target},
+                f"precondition failed: not holding {name} (held={self._held})",
+            )
         t = self._resolve(target)
         if t is None:
-            return self._result(False, tool, {"name": name, "target": target},
-                                f"no such target {target}")
+            return self._result(
+                False,
+                tool,
+                {"name": name, "target": target},
+                f"no such target {target}",
+            )
         if not self._is_near(t):
-            return self._result(False, tool, {"name": name, "target": target},
-                                f"precondition failed: not near {target} "
-                                f"({self._distance(t):.2f}m > {self.near_threshold}m)")
+            return self._result(
+                False,
+                tool,
+                {"name": name, "target": target},
+                f"precondition failed: not near {target} "
+                f"({self._distance(t):.2f}m > {self.near_threshold}m)",
+            )
         key = (name, target, pred)
         if key not in self._pose_cache:
-            return self._result(False, tool, {"name": name, "target": target},
-                                f"no cached pose for {key}; run build_pose_cache offline "
-                                f"(rollout must not call sample_kinematics)")
+            return self._result(
+                False,
+                tool,
+                {"name": name, "target": target},
+                f"no cached pose for {key}; run build_pose_cache offline "
+                f"(rollout must not call sample_kinematics)",
+            )
         pos, orn = self._pose_cache[key]
         obj = self._resolve(name)
         obj.set_position_orientation(position=pos, orientation=orn)
@@ -525,8 +572,9 @@ class SemanticACI:
         ok = bool(obj.states[self._PRED[pred]].get_value(t))
         if ok:
             self._held = None
-        return self._result(ok, tool, {"name": name, "target": target},
-                            f"{pred}({name},{target})={ok}")
+        return self._result(
+            ok, tool, {"name": name, "target": target}, f"{pred}({name},{target})={ok}"
+        )
 
     def place_on(self, name: str, surface: str) -> ToolResult:
         return self._place("place_on", name, surface, "OnTop")
@@ -547,33 +595,52 @@ class SemanticACI:
         if Cooked not in getattr(obj, "states", {}):
             return self._result(False, "cook", {"name": name}, f"{name} not cookable")
         if not self._is_near(obj):
-            return self._result(False, "cook", {"name": name},
-                                f"precondition failed: not near {name}")
+            return self._result(
+                False, "cook", {"name": name}, f"precondition failed: not near {name}"
+            )
         obj.states[Cooked].set_value(True)
         og.sim.step_physics()
-        return self._result(bool(obj.states[Cooked].get_value()), "cook", {"name": name},
-                            f"Cooked={obj.states[Cooked].get_value()}")
+        return self._result(
+            bool(obj.states[Cooked].get_value()),
+            "cook",
+            {"name": name},
+            f"Cooked={obj.states[Cooked].get_value()}",
+        )
 
     def _set_covered(self, tool, name, system_name, value):
         obj = self._resolve(name)
         if obj is None:
             return self._result(False, tool, {"name": name}, "no such object")
         if Covered not in getattr(obj, "states", {}):
-            return self._result(False, tool, {"name": name}, f"{name} has no Covered state")
+            return self._result(
+                False, tool, {"name": name}, f"{name} has no Covered state"
+            )
         if not self._is_near(obj):
-            return self._result(False, tool, {"name": name, "system": system_name},
-                                f"precondition failed: not near {name}")
+            return self._result(
+                False,
+                tool,
+                {"name": name, "system": system_name},
+                f"precondition failed: not near {name}",
+            )
         try:
             system = self._system(system_name)
         except Exception as ex:
-            return self._result(False, tool, {"name": name, "system": system_name},
-                                f"no such system {system_name} ({type(ex).__name__})")
+            return self._result(
+                False,
+                tool,
+                {"name": name, "system": system_name},
+                f"no such system {system_name} ({type(ex).__name__})",
+            )
         obj.states[Covered].set_value(system, value)
-        self.object_set_dirty = True      # particle system instantiated
+        self.object_set_dirty = True  # particle system instantiated
         og.sim.step_physics()
         got = bool(obj.states[Covered].get_value(system))
-        return self._result(got == value, tool, {"name": name, "system": system_name},
-                            f"Covered({name},{system_name})={got}")
+        return self._result(
+            got == value,
+            tool,
+            {"name": name, "system": system_name},
+            f"Covered({name},{system_name})={got}",
+        )
 
     def spray(self, name: str, system_name: str) -> ToolResult:
         """Cover @name with the @system_name substance (e.g. pesticide)."""
@@ -591,17 +658,29 @@ class SemanticACI:
         if Filled not in getattr(obj, "states", {}):
             return self._result(False, "fill", {"name": name}, f"{name} not fillable")
         if not self._is_near(obj):
-            return self._result(False, "fill", {"name": name, "system": system_name},
-                                f"precondition failed: not near {name}")
+            return self._result(
+                False,
+                "fill",
+                {"name": name, "system": system_name},
+                f"precondition failed: not near {name}",
+            )
         try:
             system = self._system(system_name)
         except Exception as ex:
-            return self._result(False, "fill", {"name": name, "system": system_name},
-                                f"no such system {system_name} ({type(ex).__name__})")
+            return self._result(
+                False,
+                "fill",
+                {"name": name, "system": system_name},
+                f"no such system {system_name} ({type(ex).__name__})",
+            )
         obj.states[Filled].set_value(system, True)
         og.sim.step_physics()
-        return self._result(bool(obj.states[Filled].get_value(system)), "fill",
-                            {"name": name, "system": system_name}, "filled")
+        return self._result(
+            bool(obj.states[Filled].get_value(system)),
+            "fill",
+            {"name": name, "system": system_name},
+            "filled",
+        )
 
     # ---- class B2: slice / dice (product-creating transforms) --------------
     # These invoke the REAL OmniGibson transition rules (SlicingRule/DicingRule),
@@ -622,7 +701,7 @@ class SemanticACI:
         results = rule.transition({filter_key: [obj]})
         api = self.scene.transition_rule_api
         api.execute_transition(added_obj_attrs=results.add, removed_objs=results.remove)
-        self.object_set_dirty = True      # slice/dice add half-objects, remove whole
+        self.object_set_dirty = True  # slice/dice add half-objects, remove whole
         # One full sim step applies the added-object init callbacks (which propagate
         # cooked/saturated onto the parts) and lets scope rebind / systems init.
         og.sim.step()
@@ -634,20 +713,33 @@ class SemanticACI:
         Parts spawn as real DatasetObjects; the future BDDL scope entries bind to
         them so ``real(half__...)`` becomes satisfied."""
         from omnigibson.transition_rules import SlicingRule
+
         obj = self._resolve(name)
         if obj is None:
             return self._result(False, "slice", {"name": name}, "no such object")
         if "sliceable" not in self._abilities(obj):
-            return self._result(False, "slice", {"name": name},
-                                f"precondition failed: {name} is not sliceable")
+            return self._result(
+                False,
+                "slice",
+                {"name": name},
+                f"precondition failed: {name} is not sliceable",
+            )
         if not self._is_near(obj):
-            return self._result(False, "slice", {"name": name},
-                                f"precondition failed: not near {name} "
-                                f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
+            return self._result(
+                False,
+                "slice",
+                {"name": name},
+                f"precondition failed: not near {name} "
+                f"({self._distance(obj):.2f}m > {self.near_threshold}m)",
+            )
         results = self._do_transition(SlicingRule, "sliceable", obj)
         n = len(results.add)
-        return self._result(n > 0 and self._resolve(name) is None, "slice",
-                            {"name": name}, f"sliced into {n} part(s)")
+        return self._result(
+            n > 0 and self._resolve(name) is None,
+            "slice",
+            {"name": name},
+            f"sliced into {n} part(s)",
+        )
 
     def dice(self, name: str) -> ToolResult:
         """Mince @name into its ``diced__<category>`` particle system.
@@ -659,31 +751,55 @@ class SemanticACI:
         diceable part. Both stages are genuine transitions; the resulting particles
         are real, which is what flips ``real(diced__...)`` / ``contains(...)``."""
         from omnigibson.transition_rules import DicingRule, SlicingRule
+
         obj = self._resolve(name)
         if obj is None:
             return self._result(False, "dice", {"name": name}, "no such object")
         abil = self._abilities(obj)
         if not self._is_near(obj):
-            return self._result(False, "dice", {"name": name},
-                                f"precondition failed: not near {name} "
-                                f"({self._distance(obj):.2f}m > {self.near_threshold}m)")
+            return self._result(
+                False,
+                "dice",
+                {"name": name},
+                f"precondition failed: not near {name} "
+                f"({self._distance(obj):.2f}m > {self.near_threshold}m)",
+            )
         if "diceable" in abil:
             self._do_transition(DicingRule, "diceable", obj)
-            return self._result(self._resolve(name) is None, "dice",
-                                {"name": name}, "diced into particle system")
+            return self._result(
+                self._resolve(name) is None,
+                "dice",
+                {"name": name},
+                "diced into particle system",
+            )
         if "sliceable" in abil:
-            parts = [a.obj for a in self._do_transition(SlicingRule, "sliceable", obj).add]
+            parts = [
+                a.obj for a in self._do_transition(SlicingRule, "sliceable", obj).add
+            ]
             diced = 0
             for part in parts:
                 if "diceable" in self._abilities(part):
                     self._do_transition(DicingRule, "diceable", part)
                     diced += 1
-            return self._result(diced > 0, "dice", {"name": name},
-                                f"sliced into {len(parts)} part(s), diced {diced}")
-        return self._result(False, "dice", {"name": name},
-                            f"precondition failed: {name} is neither diceable nor sliceable")
+            return self._result(
+                diced > 0,
+                "dice",
+                {"name": name},
+                f"sliced into {len(parts)} part(s), diced {diced}",
+            )
+        return self._result(
+            False,
+            "dice",
+            {"name": name},
+            f"precondition failed: {name} is neither diceable nor sliceable",
+        )
 
     def end_task(self) -> ToolResult:
         gs = self.goal_status()
-        return ToolResult(ok=self.is_success(), tool="end_task", args={},
-                          reason=f"goal_status={gs}", observation=self.observe())
+        return ToolResult(
+            ok=self.is_success(),
+            tool="end_task",
+            args={},
+            reason=f"goal_status={gs}",
+            observation=self.observe(),
+        )

@@ -21,12 +21,12 @@ and where it does (``not open(fridge)`` after ``inside(x, fridge)``) sorting
 negative atoms last is enough. Anything a greedy pass cannot reach is reported as
 unsolved rather than papered over with a search that hides how hard the task is.
 """
+
 from __future__ import annotations
 
 from rlinf.envs.behavior.symbolic_world import (
     SymbolicACI,
     SymbolicWorld,
-    lemma_of,
     producer_of,
     properties_of,
 )
@@ -42,17 +42,6 @@ def _split(atom) -> tuple[bool, str, list]:
     return positive, body[0], list(body[1:])
 
 
-def _whole_object_for(world: SymbolicWorld, product: str) -> str | None:
-    """The real object whose slice/dice yields @product, or None.
-
-    Thin wrapper over ``symbolic_world.producer_of``, which the ACI also needs for
-    its refusal message; keeping one implementation means the plan and the refusal
-    can never disagree about what creates a future object.
-    """
-    made = producer_of(world, product)
-    return made[0] if made else None
-
-
 def _reach(world: SymbolicWorld, obj: str) -> list:
     """Navigate to @obj, opening anything shut between the robot and it.
 
@@ -64,8 +53,10 @@ def _reach(world: SymbolicWorld, obj: str) -> list:
     disp = world.to_display.get
     steps = []
     for container in reversed(world.enclosing_closed(obj)):
-        steps += [("go_to", {"name": disp(container)}),
-                  ("open", {"name": disp(container)})]
+        steps += [
+            ("go_to", {"name": disp(container)}),
+            ("open", {"name": disp(container)}),
+        ]
     steps.append(("go_to", {"name": disp(obj)}))
     return steps
 
@@ -78,9 +69,23 @@ def _plan_atom(world: SymbolicWorld, positive: bool, pred: str, args: list) -> l
     if pred == "ontop" and positive:
         # The destination needs opening too: `_place` runs `_require` on the target,
         # so a chopping board shut in a cabinet cannot be placed onto either.
-        return (_reach(world, obj) + [("grasp", {"name": disp(obj)})]
-                + _reach(world, args[1])
-                + [("place_on", {"name": disp(obj), "surface": disp(args[1])})])
+        return (
+            _reach(world, obj)
+            + [("grasp", {"name": disp(obj)})]
+            + _reach(world, args[1])
+            + [("place_on", {"name": disp(obj), "surface": disp(args[1])})]
+        )
+
+    if pred == "nextto" and positive and obj != args[1]:
+        # There is no dedicated nextto tool. `place_on` establishes both ontop and
+        # nextto in the symbolic dynamics, matching the relation used by existing
+        # placement plans. A self-nextto atom is invalid and remains unplanned.
+        return (
+            _reach(world, obj)
+            + [("grasp", {"name": disp(obj)})]
+            + _reach(world, args[1])
+            + [("place_on", {"name": disp(obj), "surface": disp(args[1])})]
+        )
 
     if pred == "inside" and positive:
         target = args[1]
@@ -94,24 +99,28 @@ def _plan_atom(world: SymbolicWorld, positive: bool, pred: str, args: list) -> l
     if pred == "covered":
         tool = "spray" if positive else "uncover"
         return _reach(world, obj) + [
-            (tool, {"name": disp(obj), "system_name": disp(args[1])})]
+            (tool, {"name": disp(obj), "system_name": disp(args[1])})
+        ]
 
     if pred == "filled" or pred == "contains":
         if not positive:
             return []
         return _reach(world, obj) + [
-            ("fill", {"name": disp(obj), "system_name": disp(args[1])})]
+            ("fill", {"name": disp(obj), "system_name": disp(args[1])})
+        ]
 
     if pred == "cooked" and positive:
         return _reach(world, obj) + [("cook", {"name": disp(obj)})]
 
     if pred == "open":
         return _reach(world, obj) + [
-            ("open" if positive else "close", {"name": disp(obj)})]
+            ("open" if positive else "close", {"name": disp(obj)})
+        ]
 
     if pred == "toggled_on":
         return _reach(world, obj) + [
-            ("toggle_on" if positive else "toggle_off", {"name": disp(obj)})]
+            ("toggle_on" if positive else "toggle_off", {"name": disp(obj)})
+        ]
 
     if pred in ("ontop", "inside") and not positive:
         # Getting an object OFF something: picking it up clears every positional
@@ -119,8 +128,7 @@ def _plan_atom(world: SymbolicWorld, positive: bool, pred: str, args: list) -> l
         # when the atom is still unsatisfied -- `solve` skips satisfied ones, so a
         # `not ontop(x, floor)` that an earlier `inside(x, box)` already cleared
         # does not undo that placement.
-        return _reach(world, obj) + [("grasp", {"name": disp(obj)}),
-                                     ("release", {})]
+        return _reach(world, obj) + [("grasp", {"name": disp(obj)}), ("release", {})]
 
     if pred == "real":
         if not positive:
@@ -128,10 +136,10 @@ def _plan_atom(world: SymbolicWorld, positive: bool, pred: str, args: list) -> l
             # which the slice/dice that creates its products already does. Emitting
             # nothing here is correct, not a gap.
             return []
-        whole = _whole_object_for(world, obj)
-        if whole is None:
+        producer = producer_of(world, obj)
+        if producer is None:
             return []
-        tool = "slice" if lemma_of(obj).startswith("half__") else "dice"
+        whole, tool = producer
         return _reach(world, whole) + [(tool, {"name": disp(whole)})]
 
     return []
@@ -163,15 +171,22 @@ def solve(activity: str, obs_mode: str = "full", max_steps: int = 400) -> dict:
         plan = _plan_atom(world, positive, pred, args)
         if not plan:
             if not (pred == "real" and not positive):
-                unplanned.append(("" if positive else "not ")
-                                 + f"{pred}({', '.join(args)})")
+                unplanned.append(
+                    ("" if positive else "not ") + f"{pred}({', '.join(args)})"
+                )
             continue
         for tool, kwargs in plan:
             if len(trace) >= max_steps:
                 break
             res = getattr(aci, tool)(**kwargs)
-            trace.append({"name": tool, "arguments": kwargs, "ok": bool(res.ok),
-                          "reason": res.reason})
+            trace.append(
+                {
+                    "name": tool,
+                    "arguments": kwargs,
+                    "ok": bool(res.ok),
+                    "reason": res.reason,
+                }
+            )
             if not res.ok:
                 rejected.append(f"{tool}({kwargs}) -> {res.reason}")
 
@@ -194,9 +209,12 @@ def _main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("activity", nargs="?")
-    ap.add_argument("--all", action="store_true",
-                    help="solve every predicate-compatible activity and report the "
-                         "VERIFIED solvable set")
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="solve every predicate-compatible activity and report the "
+        "VERIFIED solvable set",
+    )
     ap.add_argument("--out", help="write the verified activity list as JSON")
     args = ap.parse_args()
 
@@ -204,8 +222,10 @@ def _main() -> None:
         act = args.activity or "picking_up_trash"
         out = solve(act)
         for step in out["trace"]:
-            print(f"  {'OK ' if step['ok'] else 'REJ'} {step['name']}"
-                  f"({step['arguments']}) -> {step['reason'][:80]}")
+            print(
+                f"  {'OK ' if step['ok'] else 'REJ'} {step['name']}"
+                f"({step['arguments']}) -> {step['reason'][:80]}"
+            )
         print(json.dumps({k: v for k, v in out.items() if k != "trace"}, indent=1))
         return
 
@@ -219,24 +239,28 @@ def _main() -> None:
     for i, act in enumerate(candidates, 1):
         try:
             out = solve(act)
-        except Exception as ex:                                    # noqa: BLE001
+        except Exception as ex:  # noqa: BLE001
             failed[act] = f"{type(ex).__name__}: {ex}"
             reasons[type(ex).__name__] += 1
             continue
         if out["success"]:
             solved.append(act)
         else:
-            why = ("unplanned:" + ",".join(sorted({a.split("(")[0]
-                                                   for a in out["unplanned_atoms"]}))
-                   if out["unplanned_atoms"] else
-                   f"rejected:{out['n_rejected']}")
+            why = (
+                "unplanned:"
+                + ",".join(sorted({a.split("(")[0] for a in out["unplanned_atoms"]}))
+                if out["unplanned_atoms"]
+                else f"rejected:{out['n_rejected']}"
+            )
             failed[act] = why
             reasons[why.split(":")[0]] += 1
         if i % 100 == 0:
             print(f"  ... {i}/{len(candidates)} solved={len(solved)}", flush=True)
 
-    print(f"\nVERIFIED SOLVABLE: {len(solved)} / {len(candidates)} "
-          f"predicate-compatible ({report['n_total']} total activities)")
+    print(
+        f"\nVERIFIED SOLVABLE: {len(solved)} / {len(candidates)} "
+        f"predicate-compatible ({report['n_total']} total activities)"
+    )
     print("failure classes:")
     for k, v in reasons.most_common(12):
         print(f"  {k:24s} {v:4d}")

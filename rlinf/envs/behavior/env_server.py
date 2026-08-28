@@ -37,11 +37,11 @@ Launch:
     with-env python -m rlinf.envs.behavior.env_server \\
         --activity picking_up_trash --port 18801 --obs-mode full
 """
+
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import threading
 import traceback
@@ -57,13 +57,21 @@ os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
 class BehaviorEnv:
     """One booted activity + its expert plan + per-instance pose cache."""
 
-    def __init__(self, activity: str, obs_mode: str = "full",
-                 instances_per_activity: int = 0, rgb: bool = False,
-                 partial_scene: bool = True, fast_reset: bool = False,
-                 instance_source: str | None = None,
-                 debug_video_dir: str | None = None,
-                 debug_video_fps: int = 4,
-                 debug_render_iters: int = 3):
+    def __init__(
+        self,
+        activity: str,
+        obs_mode: str = "full",
+        instances_per_activity: int = 0,
+        rgb: bool = False,
+        partial_scene: bool = True,
+        fast_reset: bool = False,
+        instance_source: str | None = None,
+        debug_video_dir: str | None = None,
+        debug_video_fps: int = 4,
+        debug_render_iters: int = 3,
+        scene_profile: str | None = None,
+        rgb_manipulation_evidence: bool = False,
+    ):
         from omegaconf import OmegaConf
         from omnigibson.envs import VectorEnvironment
 
@@ -79,27 +87,52 @@ class BehaviorEnv:
         self.fast_reset = fast_reset
         self.debug_video_dir = debug_video_dir
         self.debug_render_iters = debug_render_iters
-        self.debug_camera_forward_m = 0.4
+        self.rgb_manipulation_evidence = bool(rgb_manipulation_evidence)
         self.debug_renderer = {
-            "render_mode": "PathTracing",
-            "spp": 8,
-            "total_spp": max(64, self.debug_render_iters * 8),
+            "render_mode": "runtime_default",
             "render_iters": self.debug_render_iters,
-            "camera_forward_m": self.debug_camera_forward_m,
         }
+        if debug_video_dir and not rgb:
+            raise ValueError(
+                "debug video records the physical R1 head sensor; pass rgb=True/--rgb"
+            )
+        if self.rgb_manipulation_evidence and not debug_video_dir:
+            raise ValueError(
+                "rgb_manipulation_evidence is debug evidence and requires "
+                "debug_video_dir (and rgb=True)"
+            )
         self.instance_source = instance_source or os.environ.get(
             "BEHAVIOR_INSTANCE_SOURCE", "2025-official"
         )
         self.scene, inst_dir = resolve_scene_and_dir(
             activity, source=self.instance_source
         )
+        # Preserve the old boolean API, but make formal scene composition explicit.
+        # ``task_relevant`` is a fast plumbing ablation; it is never an official
+        # BEHAVIOR visual condition. ``official_rooms`` mirrors the 2026 evaluator:
+        # load the complete task template, then filter by B100 room instances.
+        self.scene_profile = scene_profile or (
+            "task_relevant" if partial_scene else "full"
+        )
+        valid_scene_profiles = {"task_relevant", "official_rooms", "full"}
+        if self.scene_profile not in valid_scene_profiles:
+            raise ValueError(
+                f"unknown scene_profile={self.scene_profile!r}; "
+                f"expected one of {sorted(valid_scene_profiles)}"
+            )
+        self.official_scene_contract = None
 
         cfg = OmegaConf.load(
-            "/workspace/RLinf/examples/embodiment/config/env/behavior_r1pro.yaml")
+            "/workspace/RLinf/examples/embodiment/config/env/behavior_r1pro.yaml"
+        )
         OmegaConf.update(cfg, "omni_config.env.env_wrapper", None, force_add=True)
-        OmegaConf.update(cfg, "omni_config.task.activity_name", activity, force_add=True)
-        OmegaConf.update(cfg, "omni_config.scene.scene_model", self.scene, force_add=True)
-        if partial_scene:
+        OmegaConf.update(
+            cfg, "omni_config.task.activity_name", activity, force_add=True
+        )
+        OmegaConf.update(
+            cfg, "omni_config.scene.scene_model", self.scene, force_add=True
+        )
+        if self.scene_profile == "task_relevant":
             # `load_task_relevant_only` loads the task-relevant objects plus the
             # building structure and skips every other object in the house. This is
             # the ONLY lever that reduces N, and N is what makes reset expensive:
@@ -120,8 +153,65 @@ class BehaviorEnv:
             # goal only references task-relevant objects, so scoring is unaffected --
             # but solvability is. Keep this OFF for headline S2 numbers; it is for
             # pipeline work and for ablations where the cost is prohibitive.
-            OmegaConf.update(cfg, "omni_config.scene.load_task_relevant_only", True,
-                             force_add=True)
+            OmegaConf.update(
+                cfg, "omni_config.scene.load_task_relevant_only", True, force_add=True
+            )
+            # The base YAML still carries the pre-v3.9 evaluator switch
+            # ``partial_scene_load``.  ``setup_omni_cfg`` interprets that switch via
+            # gello's room-selection helpers, while v3.9 has a native scene option
+            # for the task-object subset requested above.  Do not activate both
+            # mechanisms: apart from requiring an unrelated teleoperation package,
+            # they select different subsets of the scene.
+            OmegaConf.update(
+                cfg, "omni_config.scene.partial_scene_load", False, force_add=True
+            )
+        elif self.scene_profile == "official_rooms":
+            from rlinf.envs.behavior.official_scene import (
+                resolve_official_scene_contract,
+            )
+
+            self.official_scene_contract = resolve_official_scene_contract(
+                activity=activity,
+                scene_model=self.scene,
+                instance_dir=inst_dir,
+            )
+            OmegaConf.update(
+                cfg,
+                "omni_config.scene.scene_file",
+                self.official_scene_contract.full_template["path"],
+                force_add=True,
+            )
+            OmegaConf.update(
+                cfg, "omni_config.scene.scene_instance", None, force_add=True
+            )
+            OmegaConf.update(
+                cfg,
+                "omni_config.scene.load_room_instances",
+                list(self.official_scene_contract.room_instances),
+                force_add=True,
+            )
+            OmegaConf.update(
+                cfg, "omni_config.scene.load_room_types", None, force_add=True
+            )
+            OmegaConf.update(
+                cfg, "omni_config.scene.load_task_relevant_only", False, force_add=True
+            )
+            OmegaConf.update(
+                cfg, "omni_config.scene.partial_scene_load", False, force_add=True
+            )
+        else:
+            OmegaConf.update(
+                cfg, "omni_config.scene.load_room_instances", None, force_add=True
+            )
+            OmegaConf.update(
+                cfg, "omni_config.scene.load_room_types", None, force_add=True
+            )
+            OmegaConf.update(
+                cfg, "omni_config.scene.load_task_relevant_only", False, force_add=True
+            )
+            OmegaConf.update(
+                cfg, "omni_config.scene.partial_scene_load", False, force_add=True
+            )
         if not rgb:
             # The semantic ACI never reads pixels, and loading the R1's head+wrist
             # cameras costs ~10 min of the ~16 min boot: `VisionSensor._post_load`
@@ -129,32 +219,67 @@ class BehaviorEnv:
             # non-ray-tracing GPU (H20/H100/A100) is the slowest thing in the boot.
             # Dropping `rgb` skips sensor creation entirely. Pass --rgb for the
             # vision-augmentation ablation, where the cost is the point.
-            OmegaConf.update(cfg, "omni_config.robots.0.obs_modalities",
-                             ["proprio"], force_add=True)
-        if debug_video_dir:
-            # The recorder uses one viewer camera rather than loading all R1 camera
-            # sensors. This is a boot-time macro and cannot be enabled later.
             OmegaConf.update(
-                cfg, "omni_config.macro.render_viewer_camera", True, force_add=True
+                cfg, "omni_config.robots.0.obs_modalities", ["proprio"], force_add=True
             )
+        else:
+            # Replicator render products are created while the robot sensors load.
+            # Resizing a sensor after the first reset requires detaching live
+            # annotators and is not safe on Isaac Sim 5.1. Configure the official
+            # BEHAVIOR resolutions before the environment is constructed instead.
+            for path, value in (
+                (
+                    "omni_config.robots.0.sensor_config.VisionSensor."
+                    "sensor_kwargs.image_height",
+                    480,
+                ),
+                (
+                    "omni_config.robots.0.sensor_config.VisionSensor."
+                    "sensor_kwargs.image_width",
+                    480,
+                ),
+                (
+                    "omni_config.robots.0.sensor_config.zed_link:Camera:0."
+                    "sensor_kwargs.image_height",
+                    720,
+                ),
+                (
+                    "omni_config.robots.0.sensor_config.zed_link:Camera:0."
+                    "sensor_kwargs.image_width",
+                    720,
+                ),
+                (
+                    "omni_config.robots.0.sensor_config.zed_link:Camera:0."
+                    "sensor_kwargs.horizontal_aperture",
+                    40.0,
+                ),
+            ):
+                OmegaConf.update(cfg, path, value, force_add=True)
         self.vec_env = VectorEnvironment(
-            1, OmegaConf.to_container(setup_omni_cfg(cfg), resolve=True))
+            1, OmegaConf.to_container(setup_omni_cfg(cfg), resolve=True)
+        )
+        if rgb:
+            from rlinf.envs.behavior.utils import apply_env_wrapper
+
+            apply_env_wrapper(self.vec_env, "rgb")
         self.vec_env.reset()
         self.env = self.vec_env.envs[0]
         self.aci = SemanticACI(self.env, obs_mode=obs_mode)
         self.video_recorder = None
+        self.rgb_manipulation = None
         if debug_video_dir:
-            from rlinf.envs.behavior.render_rgb import configure_debug_renderer
             from rlinf.envs.behavior.trajectory_video import TrajectoryVideoRecorder
 
-            configure_debug_renderer(
-                render_mode=self.debug_renderer["render_mode"],
-                spp=self.debug_renderer["spp"],
-                total_spp=self.debug_renderer["total_spp"],
-            )
             self.video_recorder = TrajectoryVideoRecorder(
                 debug_video_dir, fps=debug_video_fps
             )
+        if self.rgb_manipulation_evidence:
+            # Keep this import behind the explicit RGB-only gate. TextWorld never
+            # imports this module and the ordinary semantic path never creates a
+            # physical grasp constraint or captures paired frames.
+            from rlinf.envs.behavior.rgb_manipulation import RGBManipulationEvidence
+
+            self.rgb_manipulation = RGBManipulationEvidence(self.env, self.aci)
 
         task = self.env.task
         self.goal_lines = sb.goal_atoms_to_lines(task.ground_goal_state_options[0])
@@ -189,6 +314,7 @@ class BehaviorEnv:
         ``sample_kinematics`` per place target (documented at 20-78 s each) plus a
         second full ``scene.reset()``; skipping it when the instance has not
         changed removes both."""
+        from rlinf.envs.behavior.expert_planner import plan as build_expert_plan
         from rlinf.envs.behavior.rft_sample import (
             build_cache_on_instance,
             reset_to_instance,
@@ -229,12 +355,28 @@ class BehaviorEnv:
         import time as _t
 
         hard = bool(getattr(self.aci, "object_set_dirty", False))
+        if self.rgb_manipulation is not None:
+            self.rgb_manipulation.release_before_reset()
         _t0 = _t.time()
-        reset_to_instance(self.aci, self.env, inst,
-                          reset_scene=not self.fast_reset, hard_reset=hard)
+        reset_to_instance(
+            self.aci, self.env, inst, reset_scene=not self.fast_reset, hard_reset=hard
+        )
         self.aci.camera_pitch = 0.0
         d_reset = _t.time() - _t0
         self.aci.object_set_dirty = False
+
+        # v3.9 binds task-scope entities while loading the concrete TRO state.
+        # Planning in __init__ is therefore too early for 2026 instances: every
+        # wrapped_obj is None and valid goal arguments become ``unresolved-args``.
+        # Refresh only after reset/binding and before the per-instance pose cache.
+        # This is OmniGibson bookkeeping; TextWorld has its own planner and never
+        # constructs this environment.
+        self.plan = build_expert_plan(self.env.task)
+        print(
+            f"[start] plan calls={len(self.plan.calls)} pairs={len(self.plan.pairs)} "
+            f"unsupported={len(self.plan.unsupported)}",
+            flush=True,
+        )
 
         d_cache = 0.0
         cache_built = False
@@ -297,66 +439,182 @@ class BehaviorEnv:
             payload = {"ok": False, "reason": f"unknown_tool:{name}"}
             self._record_debug_frame(name or "unknown_tool", ok=False)
             return {"payload": payload, "meta": self._meta(), "terminal": False}
+        rgb_pair = self.rgb_manipulation is not None and self.rgb_manipulation.handles(
+            name
+        )
+        pre_capture = self._capture_debug_frame() if rgb_pair else None
+        control_capture = self._capture_debug_frame() if rgb_pair else None
+        context = (
+            self.rgb_manipulation.before(name, arguments or {}) if rgb_pair else None
+        )
         try:
             res = fn(**(arguments or {}))
-        except TypeError as ex:                       # bad/missing arguments
+        except TypeError as ex:  # bad/missing arguments
+            if rgb_pair:
+                self.rgb_manipulation.abort(context)
             payload = {"ok": False, "reason": f"bad_arguments: {ex}"}
-            self._record_debug_frame(name, ok=False)
+            if rgb_pair:
+                post_capture = self._capture_debug_frame()
+                self._append_debug_capture(
+                    pre_capture,
+                    tool=f"{name}:pre",
+                    ok=False,
+                    event_metadata={"phase": "pre", "arguments": arguments or {}},
+                )
+                self._append_debug_capture(
+                    post_capture,
+                    tool=f"{name}:post",
+                    ok=False,
+                    event_metadata={
+                        "phase": "post",
+                        "arguments": arguments or {},
+                        "rgb_manipulation": {
+                            "physical_ok": False,
+                            "physical_reason": "bad_arguments",
+                        },
+                    },
+                )
+            else:
+                self._record_debug_frame(name, ok=False)
             return {"payload": payload, "meta": self._meta(), "terminal": False}
+        except Exception:
+            if rgb_pair:
+                self.rgb_manipulation.abort(context)
+            raise
+        if rgb_pair:
+            evidence = self.rgb_manipulation.after(context, res)
+            post_capture = self._capture_debug_frame()
+            evidence["pixel_audit"] = self.rgb_manipulation.pixel_audit(
+                before_frame=pre_capture[0],
+                control_frame=control_capture[0],
+                after_frame=post_capture[0],
+                before_camera=pre_capture[1],
+                after_camera=post_capture[1],
+                evidence=evidence,
+            )
+            self._append_debug_capture(
+                pre_capture,
+                tool=f"{name}:pre",
+                ok=bool(res.ok),
+                event_metadata={
+                    "phase": "pre",
+                    "arguments": arguments or {},
+                    "rgb_manipulation_state": evidence["state_before"],
+                },
+            )
+            self._append_debug_capture(
+                post_capture,
+                tool=f"{name}:post",
+                ok=bool(res.ok),
+                event_metadata={
+                    "phase": "post",
+                    "arguments": arguments or {},
+                    "rgb_manipulation": evidence,
+                },
+            )
         payload = result_payload(name, res)
-        self._record_debug_frame(name, ok=bool(payload.get("ok", True)))
-        return {"payload": payload, "meta": self._meta(),
-                "terminal": name == "end_task"}
+        if not rgb_pair:
+            self._record_debug_frame(name, ok=bool(payload.get("ok", True)))
+        return {
+            "payload": payload,
+            "meta": self._meta(),
+            "terminal": name == "end_task",
+        }
 
     def _record_debug_frame(self, tool: str, ok: bool) -> None:
-        """Capture the camera after every tool, independent of policy RGB delivery."""
+        """Capture the physical R1 head camera after every tool."""
         if self.video_recorder is None:
             return
+        capture = self._capture_debug_frame()
+        self._append_debug_capture(capture, tool=tool, ok=ok)
+
+    def _capture_debug_frame(self):
+        """Render and return one lossless head frame plus camera calibration."""
+        if self.video_recorder is None:
+            raise RuntimeError("debug frame requested without a video recorder")
         import numpy as np
         import omnigibson as og
-        import torch as th
 
-        from rlinf.envs.behavior.render_rgb import look_quat
-        from rlinf.envs.behavior.semantic_tools import CAMERA_HEIGHT_M
+        from rlinf.envs.behavior.utils import convert_uint8_rgb
 
-        cam = og.sim.viewer_camera
-        if cam is None:
-            raise RuntimeError("debug video requested but viewer camera was not created")
-        base_pos, _ = self.aci._robot_pose()
-        yaw = self.aci._robot_yaw()
-        pitch = float(getattr(self.aci, "camera_pitch", 0.0))
-        # The robot base origin is inside R1's body. Raising that exact x/y to head
-        # height still leaves a viewer camera inside the head mesh; on the Blackwell
-        # smoke test it produced alternating black/grey interior surfaces. Put the
-        # virtual lens just in front of the head, in the robot's current yaw frame.
-        camera_pos = th.tensor(
-            [
-                float(base_pos[0]) + self.debug_camera_forward_m * math.cos(yaw),
-                float(base_pos[1]) + self.debug_camera_forward_m * math.sin(yaw),
-                float(base_pos[2]) + CAMERA_HEIGHT_M,
-            ],
-            dtype=base_pos.dtype,
-            device=base_pos.device,
-        )
-        cam.set_position_orientation(
-            position=camera_pos, orientation=look_quat(yaw, pitch)
-        )
+        matches = [
+            (name, sensor)
+            for name, sensor in self.env.robots[0].sensors.items()
+            if "zed_link:Camera:0" in name
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "debug video requires exactly one R1 ZED head sensor; "
+                f"found {[name for name, _ in matches]!r}"
+            )
+        sensor_name, cam = matches[0]
         for _ in range(max(1, self.debug_render_iters)):
             og.sim.render()
         raw = cam.get_obs()[0]["rgb"]
-        frame = raw[..., :3]
+        frame = convert_uint8_rgb(raw)
         frame = frame.cpu().numpy() if hasattr(frame, "cpu") else np.asarray(frame)
         if frame.size == 0:
-            raise RuntimeError("viewer camera returned an empty RGB frame")
+            raise RuntimeError("R1 head camera returned an empty RGB frame")
+        camera_pos, camera_orn = cam.get_position_orientation()
+        try:
+            intrinsic = cam.intrinsic_matrix
+            intrinsic = (
+                intrinsic.detach().cpu().tolist()
+                if hasattr(intrinsic, "detach")
+                else np.asarray(intrinsic).tolist()
+            )
+            intrinsic_source = "vision_sensor_intrinsic_matrix"
+        except AssertionError:
+            # A scene.reset() can transiently leave Replicator's camera-parameter
+            # annotator degenerate on Isaac 5.1 even though the physical sensor's
+            # RGB render and authored optics are valid. Derive the same pinhole K
+            # from those optics instead of making RGB evidence depend on an
+            # auxiliary annotator. Record this fallback explicitly in the sidecar.
+            width, height = int(cam.image_width), int(cam.image_height)
+            focal = float(cam.focal_length)
+            horizontal = float(cam.horizontal_aperture)
+            vertical = float(
+                getattr(cam, "vertical_aperture", horizontal * height / width)
+            )
+            fx, fy = focal * width / horizontal, focal * height / vertical
+            intrinsic = [
+                [fx, 0.0, width / 2.0],
+                [0.0, fy, height / 2.0],
+                [0.0, 0.0, 1.0],
+            ]
+            intrinsic_source = "pinhole_from_focal_length_and_aperture"
+        metadata = {
+            "camera_xyz": [round(float(value), 6) for value in camera_pos],
+            "camera_orientation_xyzw": [round(float(value), 8) for value in camera_orn],
+            "intrinsic": [
+                [round(float(value), 6) for value in row] for row in intrinsic
+            ],
+            "intrinsic_source": intrinsic_source,
+            "sensor_name": sensor_name,
+            "sensor_prim_path": cam.prim_path,
+            "resolution": [int(cam.image_height), int(cam.image_width)],
+        }
+        return frame, metadata
+
+    def _append_debug_capture(
+        self,
+        capture,
+        *,
+        tool: str,
+        ok: bool,
+        event_metadata: dict | None = None,
+    ) -> None:
+        if self.video_recorder is None:
+            return
+        frame, camera_metadata = capture
+        metadata = dict(camera_metadata)
+        if event_metadata:
+            metadata.update(event_metadata)
         self.video_recorder.append(
             frame,
             tool=tool,
             ok=ok,
-            event_metadata={
-                "camera_xyz": [round(float(value), 4) for value in camera_pos],
-                "yaw_deg": round(math.degrees(yaw), 2),
-                "pitch_deg": round(math.degrees(pitch), 2),
-            },
+            event_metadata=metadata,
         )
 
     def _meta(self) -> dict:
@@ -364,10 +622,15 @@ class BehaviorEnv:
         gs = self.aci.goal_status()
         n_sat = len(gs["satisfied"])
         n_goal = n_sat + len(gs["unsatisfied"])
-        return {"num_satisfied": n_sat, "num_goal": n_goal,
-                "is_success": (len(gs["unsatisfied"]) == 0 and n_sat > 0)}
+        return {
+            "num_satisfied": n_sat,
+            "num_goal": n_goal,
+            "is_success": (len(gs["unsatisfied"]) == 0 and n_sat > 0),
+        }
 
     def end(self) -> dict:
+        if self.rgb_manipulation is not None:
+            self.rgb_manipulation.release_before_reset()
         video = None
         if self.video_recorder is not None:
             video = self.video_recorder.finish(complete=True, reason="session_end")
@@ -375,6 +638,8 @@ class BehaviorEnv:
         return {"ok": True, "debug_video": video}
 
     def close(self):
+        if self.rgb_manipulation is not None:
+            self.rgb_manipulation.release_before_reset()
         if self.video_recorder is not None:
             self.video_recorder.finish(complete=False, reason="environment_closed")
         try:
@@ -388,7 +653,7 @@ def make_handler(env: BehaviorEnv):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def log_message(self, *_):            # one line per tool call is far too noisy
+        def log_message(self, *_):  # one line per tool call is far too noisy
             pass
 
         def _send(self, code: int, body: dict):
@@ -406,10 +671,18 @@ def make_handler(env: BehaviorEnv):
         def do_GET(self):
             if self.path != "/health":
                 return self._send(404, {"error": "not_found"})
-            self._send(200, {"ok": True, "activity": env.activity, "scene": env.scene,
-                             "obs_mode": env.obs_mode, "busy": env.session_id is not None,
-                             "goal_nl": env.goal_nl,
-                             "instances": [f.instance_id for f in env.instances]})
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "activity": env.activity,
+                    "scene": env.scene,
+                    "obs_mode": env.obs_mode,
+                    "busy": env.session_id is not None,
+                    "goal_nl": env.goal_nl,
+                    "instances": [f.instance_id for f in env.instances],
+                },
+            )
 
         def do_POST(self):
             try:
@@ -432,8 +705,10 @@ def make_handler(env: BehaviorEnv):
                     if sid != env.session_id:
                         return self._send(410, {"error": "stale_session"})
                     if verb == "tool":
-                        return self._send(200, env.call(body.get("name", ""),
-                                                        body.get("arguments") or {}))
+                        return self._send(
+                            200,
+                            env.call(body.get("name", ""), body.get("arguments") or {}),
+                        )
                     if verb == "end":
                         out = env.end()
                         env.lock.release()
@@ -479,44 +754,77 @@ def main():
     ap.add_argument("--activity", required=True)
     ap.add_argument("--port", type=int, required=True)
     ap.add_argument("--obs-mode", default="full", choices=["full", "partial", "fov"])
-    ap.add_argument("--instances-per-activity", type=int, default=0,
-                    help="0 = all pre-sampled instances")
-    ap.add_argument("--instance-source", default=None,
-                    choices=["2025-official", "2026-v3.9.1", "local-v3.7"],
-                    help="one versioned instance population; defaults to "
-                         "BEHAVIOR_INSTANCE_SOURCE or 2025-official")
-    ap.add_argument("--rgb", action="store_true",
-                    help="load the robot's cameras (adds ~10 min to boot; only the "
-                         "vision-augmentation ablation needs them)")
-    ap.add_argument("--full-scene", action="store_true",
-                    help="instantiate the whole house instead of the activity's "
-                         "rooms (much slower boot AND reset; see __init__)")
-    ap.add_argument("--fast-reset", action="store_true",
-                    help="skip the trailing scene.reset() on instance load. This is "
-                         "the fix for the >90 min reset (DEBUG-LOG §5); verify the "
-                         "start state (contaminated flag + observe) before trusting "
-                         "a training run with it on.")
-    ap.add_argument("--debug-video-dir", default=None,
-                    help="record one viewer-camera MP4 plus JSON sidecar per complete "
-                         "tool trajectory; frames are captured after every tool")
+    ap.add_argument(
+        "--instances-per-activity",
+        type=int,
+        default=0,
+        help="0 = all pre-sampled instances",
+    )
+    ap.add_argument(
+        "--instance-source",
+        default=None,
+        choices=["2025-official", "2026-v3.9.1", "local-v3.7"],
+        help="one versioned instance population; defaults to "
+        "BEHAVIOR_INSTANCE_SOURCE or 2025-official",
+    )
+    ap.add_argument(
+        "--rgb",
+        action="store_true",
+        help="load the robot's cameras (adds ~10 min to boot; only the "
+        "vision-augmentation ablation needs them)",
+    )
+    ap.add_argument(
+        "--full-scene",
+        action="store_true",
+        help="instantiate the whole house instead of the activity's "
+        "rooms (much slower boot AND reset; see __init__)",
+    )
+    ap.add_argument(
+        "--fast-reset",
+        action="store_true",
+        help="skip the trailing scene.reset() on instance load. This is "
+        "the fix for the >90 min reset (DEBUG-LOG §5); verify the "
+        "start state (contaminated flag + observe) before trusting "
+        "a training run with it on.",
+    )
+    ap.add_argument(
+        "--debug-video-dir",
+        default=None,
+        help="record one R1 head-camera MP4 plus JSON sidecar per complete "
+        "tool trajectory; frames are captured after every tool",
+    )
     ap.add_argument("--debug-video-fps", type=int, default=4)
     ap.add_argument("--debug-render-iters", type=int, default=3)
+    ap.add_argument(
+        "--rgb-manipulation-evidence",
+        action="store_true",
+        help="RGB debug only: add assisted-grasp synchronization and paired "
+        "pre/post manipulation frames; requires --rgb and --debug-video-dir",
+    )
     args = ap.parse_args()
 
-    env = BehaviorEnv(args.activity, args.obs_mode, args.instances_per_activity,
-                      rgb=args.rgb, partial_scene=not args.full_scene,
-                      fast_reset=args.fast_reset,
-                      instance_source=args.instance_source,
-                      debug_video_dir=args.debug_video_dir,
-                      debug_video_fps=args.debug_video_fps,
-                      debug_render_iters=args.debug_render_iters)
+    env = BehaviorEnv(
+        args.activity,
+        args.obs_mode,
+        args.instances_per_activity,
+        rgb=args.rgb,
+        partial_scene=not args.full_scene,
+        fast_reset=args.fast_reset,
+        instance_source=args.instance_source,
+        debug_video_dir=args.debug_video_dir,
+        debug_video_fps=args.debug_video_fps,
+        debug_render_iters=args.debug_render_iters,
+        rgb_manipulation_evidence=args.rgb_manipulation_evidence,
+    )
     server = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(env))
     # Boot is ~5 min (shader compile); the trainer polls /health, so announce
     # readiness on a line it can grep rather than making it guess.
-    print(f"BEHAVIOR_ENV_SERVER_READY {json.dumps({'activity': args.activity, 'scene': env.scene, 'port': args.port, 'instances': len(env.instances)})}",
-          flush=True)
+    print(
+        f"BEHAVIOR_ENV_SERVER_READY {json.dumps({'activity': args.activity, 'scene': env.scene, 'port': args.port, 'instances': len(env.instances)})}",
+        flush=True,
+    )
     try:
-        serve_blocking(server)              # NOT serve_forever() — see its docstring
+        serve_blocking(server)  # NOT serve_forever() — see its docstring
     except KeyboardInterrupt:
         pass
     finally:

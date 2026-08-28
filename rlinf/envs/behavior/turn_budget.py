@@ -35,7 +35,7 @@ def turn_budget_for(
     flat_max_turns: int,
     oracle_steps: Mapping[str, int] | None = None,
     budget_k: float = 2.0,
-    budget_cap: int = 0,
+    budget_cap: int | None = 0,
     allow_missing_oracle: bool = False,
 ) -> TurnBudget:
     """Return a flat or oracle-relative budget for one activity.
@@ -46,9 +46,14 @@ def turn_budget_for(
     """
     if flat_max_turns < 1:
         raise ValueError(f"flat_max_turns must be >= 1, got {flat_max_turns}")
+    # Hydra represents an intentionally disabled optional cap as ``null``.  Treat
+    # that identically to the CLI's historical ``0`` sentinel before comparing or
+    # recording it.  Keeping this normalization in the shared policy prevents the
+    # API, standalone runner, and RL agent loop from drifting apart.
+    normalized_cap = 0 if budget_cap is None else int(budget_cap)
     if budget_k <= 0:
         raise ValueError(f"budget_k must be > 0, got {budget_k}")
-    if budget_cap < 0:
+    if normalized_cap < 0:
         raise ValueError(f"budget_cap must be >= 0, got {budget_cap}")
 
     if not oracle_steps:
@@ -74,7 +79,7 @@ def turn_budget_for(
             budget_source="flat_fallback",
             oracle_steps=None,
             budget_k=budget_k,
-            budget_cap=budget_cap or None,
+            budget_cap=normalized_cap or None,
             requested_max_turns=flat_max_turns,
             capped=False,
         )
@@ -83,13 +88,13 @@ def turn_budget_for(
     if base < 1:
         raise ValueError(f"oracle step count for {activity!r} must be >= 1, got {base}")
     requested = max(1, math.ceil(budget_k * base))
-    effective = min(requested, budget_cap) if budget_cap else requested
+    effective = min(requested, normalized_cap) if normalized_cap else requested
     return TurnBudget(
         max_turns=effective,
         budget_source="oracle_relative",
         oracle_steps=base,
         budget_k=budget_k,
-        budget_cap=budget_cap or None,
+        budget_cap=normalized_cap or None,
         requested_max_turns=requested,
         capped=effective < requested,
     )

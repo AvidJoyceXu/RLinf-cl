@@ -176,6 +176,7 @@ def copy_model_config_and_code(
         ".py",
         ".json",
         ".md",
+        ".txt",
     ),
 ) -> None:
     """

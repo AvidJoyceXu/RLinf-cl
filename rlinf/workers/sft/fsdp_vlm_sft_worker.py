@@ -51,6 +51,8 @@ class FSDPVlmSftWorker(FSDPSftWorker):
             state = json.load(f)
         self._data_epoch = int(state.get("data_epoch", 0))
         self._data_iter_offset = int(state.get("data_iter_offset", 0))
+        if self.data_loader is None:
+            return
 
         if hasattr(self.data_loader, "sampler") and hasattr(
             self.data_loader.sampler, "set_epoch"
@@ -297,6 +299,59 @@ class FSDPVlmSftWorker(FSDPSftWorker):
 
         # eval model return the correct number of answers
         return correct
+
+    def run_eval(self):
+        """Use teacher-forced loss for explicit multi-turn tool-call windows."""
+        if not (
+            self.cfg.data.get("dataset_name") == "eqa_toolcall"
+            and self.cfg.data.get("toolcall_eval_mode", "generation") == "loss"
+        ):
+            return super().run_eval()
+        assert self.eval_data_loader is not None, "eval_data_loader is not set"
+        self.model.eval()
+        loss_sum = torch.zeros((), dtype=torch.float64, device=self.device)
+        token_count = torch.zeros((), dtype=torch.float64, device=self.device)
+        batch_count = torch.zeros((), dtype=torch.float64, device=self.device)
+        max_batches = int(self.cfg.data.get("max_eval_batches", -1))
+        with self.worker_timer(), torch.no_grad():
+            for index, batch in enumerate(self.eval_data_loader):
+                if max_batches > 0 and index >= max_batches:
+                    break
+                loss = self.get_train_model_output(batch)
+                attention_mask = batch["attention_mask"].to(dtype=torch.bool)
+                label_mask = batch["label_mask"].to(dtype=torch.bool)
+                # Causal-LM loss predicts token i from positions before i, so
+                # position zero never contributes even when it is trainable.
+                supervised_tokens = (
+                    (attention_mask & ~label_mask)[:, 1:].sum().to(device=self.device)
+                )
+                if supervised_tokens.item() == 0:
+                    raise RuntimeError(
+                        "tool-call validation batch has zero supervised tokens"
+                    )
+                loss_sum += loss.detach().to(dtype=torch.float64) * supervised_tokens
+                token_count += supervised_tokens
+                batch_count += 1
+                if self._rank == 0 and (index + 1) % 100 == 0:
+                    total = len(self.eval_data_loader)
+                    limit = min(total, max_batches) if max_batches > 0 else total
+                    logging.info(
+                        "Tool-call validation progress: %d/%d local batches",
+                        index + 1,
+                        limit,
+                    )
+        stats = torch.stack((loss_sum, token_count, batch_count))
+        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+        if stats[1].item() == 0:
+            raise RuntimeError("tool-call validation consumed zero supervised tokens")
+        value = (stats[0] / stats[1]).item()
+        if not torch.isfinite(stats[0] / stats[1]):
+            raise RuntimeError(f"non-finite tool-call validation loss: {value}")
+        return {
+            "val_loss": float(value),
+            "val_tokens": int(stats[1].item()),
+            "val_batches": int(stats[2].item()),
+        }
 
     def get_train_model_output(self, batch: dict[str, Any]):
         # hundle the input batch

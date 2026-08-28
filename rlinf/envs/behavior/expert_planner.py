@@ -31,15 +31,27 @@ from omnigibson.object_states import Open
 # BDDL predicate -> ordered semantic-tool subsequence + cache pairs.
 # ------------------------------------------------------------------ #
 def _inside(o, t):
-    return ([("go_to", {"name": o}), ("grasp", {"name": o}),
-             ("go_to", {"name": t}), ("place_inside", {"name": o, "container": t})],
-            [(o, t, "Inside")])
+    return (
+        [
+            ("go_to", {"name": o}),
+            ("grasp", {"name": o}),
+            ("go_to", {"name": t}),
+            ("place_inside", {"name": o, "container": t}),
+        ],
+        [(o, t, "Inside")],
+    )
 
 
 def _ontop(o, t):
-    return ([("go_to", {"name": o}), ("grasp", {"name": o}),
-             ("go_to", {"name": t}), ("place_on", {"name": o, "surface": t})],
-            [(o, t, "OnTop")])
+    return (
+        [
+            ("go_to", {"name": o}),
+            ("grasp", {"name": o}),
+            ("go_to", {"name": t}),
+            ("place_on", {"name": o, "surface": t}),
+        ],
+        [(o, t, "OnTop")],
+    )
 
 
 def _toggled_on(o):
@@ -97,6 +109,18 @@ class ExpertTrajectory:
         }
 
 
+def _scope_object(entity):
+    """Return the concrete object across old BDDL wrappers and v3.9 scopes.
+
+    Older runtimes store an entity wrapper with ``wrapped_obj``. BEHAVIOR v3.9
+    stores the concrete OmniGibson object directly (the instance loader calls its
+    ``load_state`` method), so requiring ``wrapped_obj`` makes every valid 2026
+    goal argument look unresolved.
+    """
+    wrapped = getattr(entity, "wrapped_obj", None)
+    return wrapped if wrapped is not None else entity
+
+
 def _resolve_bddl(task, bddl_name):
     """Resolve a BDDL arg to a sim name: object -> wrapped_obj.name, system ->
     system category name (entity.name)."""
@@ -108,7 +132,7 @@ def _resolve_bddl(task, bddl_name):
             return ent.name
         except Exception:
             return None
-    obj = getattr(ent, "wrapped_obj", None)
+    obj = _scope_object(ent)
     return obj.name if obj is not None else None
 
 
@@ -123,9 +147,11 @@ def _atom_pred_args(atom):
 
 @dataclass
 class Plan:
-    calls: list          # [(tool, kwargs)]
-    pairs: list          # [(movable, target, PredicateName)] to pre-cache
-    place_targets: list  # ordered unique inside/ontop targets (candidates to open first)
+    calls: list  # [(tool, kwargs)]
+    pairs: list  # [(movable, target, PredicateName)] to pre-cache
+    place_targets: (
+        list  # ordered unique inside/ontop targets (candidates to open first)
+    )
     close_targets: list  # targets that must end closed ("not open" goals)
     unsupported: list
     open_targets: list = field(default_factory=list)  # targets a goal wants OPEN
@@ -144,10 +170,10 @@ def _product_transform(prod_inst: str):
     Returns (None, None) for products of other rules (e.g. recipe outputs)."""
     cat = _synset_cat(prod_inst)
     if cat.startswith("half__"):
-        return "slice", cat[len("half__"):]
+        return "slice", cat[len("half__") :]
     for pre in ("cooked__diced__", "diced__"):
         if cat.startswith(pre):
-            return "dice", cat[len(pre):]
+            return "dice", cat[len(pre) :]
     return None, None
 
 
@@ -158,18 +184,18 @@ def _sources_of(task, source_cat: str):
     for inst, ent in task.object_scope.items():
         if getattr(ent, "is_system", False) or _synset_cat(inst) != source_cat:
             continue
-        wo = getattr(ent, "wrapped_obj", None)
-        if wo is not None:
-            out.append((inst, wo.name))
+        obj = _scope_object(ent)
+        if obj is not None:
+            out.append((inst, obj.name))
     return out
 
 
 def plan(task, option_index: int = 0) -> Plan:
     atoms = task.ground_goal_state_options[option_index]
     calls, pairs, place_targets, close_targets, unsupported = [], [], [], [], []
-    open_targets = []      # containers a positive open(...) goal wants left open
-    real_products = []     # product bddl_inst that must be created (slice/dice)
-    contains_atoms = []    # (container_sim, system_sim, system_bddl_inst)
+    open_targets = []  # containers a positive open(...) goal wants left open
+    real_products = []  # product bddl_inst that must be created (slice/dice)
+    contains_atoms = []  # (container_sim, system_sim, system_bddl_inst)
     for atom in atoms:
         try:
             if atom.currently_satisfied:
@@ -211,7 +237,7 @@ def plan(task, option_index: int = 0) -> Plan:
         elif pred == "open" and not negated:
             sub, _ = _open(sim_args[0])
             open_targets.append(sim_args[0])
-        elif pred == "open" and negated:                 # "not open" == closed
+        elif pred == "open" and negated:  # "not open" == closed
             if sim_args[0] not in close_targets:
                 close_targets.append(sim_args[0])
             continue
@@ -222,15 +248,20 @@ def plan(task, option_index: int = 0) -> Plan:
         elif pred == "covered" and negated:
             sub, _ = _uncovered(*sim_args)
         else:
-            unsupported.append((pred, bddl_args, "negated" if negated else "unsupported"))
+            unsupported.append(
+                (pred, bddl_args, "negated" if negated else "unsupported")
+            )
             continue
         calls.extend(sub)
         pairs.extend(sub_pairs)
 
     # ---- post-pass: resolve real(...) products via slice/dice ----
     # container that must end up containing each diced system (couples with dice)
-    contains_by_sys = {_synset_cat(sys_inst): cont
-                       for (cont, sys_inst) in contains_atoms if cont is not None}
+    contains_by_sys = {
+        _synset_cat(sys_inst): cont
+        for (cont, sys_inst) in contains_atoms
+        if cont is not None
+    }
     handled_sys, sliced = set(), set()
     for prod_inst in real_products:
         transform, src_cat = _product_transform(prod_inst)
@@ -243,7 +274,7 @@ def plan(task, option_index: int = 0) -> Plan:
             continue
         prod_cat = _synset_cat(prod_inst)
         if transform == "slice":
-            for _, sname in sources:            # slice every whole source once
+            for _, sname in sources:  # slice every whole source once
                 if sname in sliced:
                     continue
                 sliced.add(sname)
@@ -258,16 +289,20 @@ def plan(task, option_index: int = 0) -> Plan:
                     pairs.append((sname, container, "Inside"))
                     if container not in place_targets:
                         place_targets.append(container)
-                    calls += [("go_to", {"name": sname}), ("grasp", {"name": sname}),
-                              ("go_to", {"name": container}),
-                              ("place_inside", {"name": sname, "container": container}),
-                              ("go_to", {"name": sname}), ("dice", {"name": sname})]
+                    calls += [
+                        ("go_to", {"name": sname}),
+                        ("grasp", {"name": sname}),
+                        ("go_to", {"name": container}),
+                        ("place_inside", {"name": sname, "container": container}),
+                        ("go_to", {"name": sname}),
+                        ("dice", {"name": sname}),
+                    ]
                     handled_sys.add(prod_cat)
                 else:
                     calls += [("go_to", {"name": sname}), ("dice", {"name": sname})]
 
     # leftover contains(container, system) not produced by dicing -> fill directly
-    for (cont, sys_inst) in contains_atoms:
+    for cont, sys_inst in contains_atoms:
         if _synset_cat(sys_inst) in handled_sys:
             continue
         sys_sim = _resolve_bddl(task, sys_inst)
@@ -279,19 +314,26 @@ def plan(task, option_index: int = 0) -> Plan:
     return Plan(calls, pairs, place_targets, close_targets, unsupported, open_targets)
 
 
-def run_expert(aci, task, task_description: str = "", option_index: int = 0) -> ExpertTrajectory:
+def run_expert(
+    aci, task, task_description: str = "", option_index: int = 0
+) -> ExpertTrajectory:
     """Drive @aci through the planned tool sequence and record the trajectory.
 
     Order: open door-containers -> all placements/transforms -> close containers
     that the goal requires closed (class-A open-before-place / close-after)."""
     p = plan(task, option_index)
-    traj = ExpertTrajectory(activity=getattr(task, "activity_name", "?"),
-                            task_description=task_description, unsupported=p.unsupported)
+    traj = ExpertTrajectory(
+        activity=getattr(task, "activity_name", "?"),
+        task_description=task_description,
+        unsupported=p.unsupported,
+    )
 
     def run(steps):
         for tool, args in steps:
             res = getattr(aci, tool)(**args)
-            traj.steps.append(ExpertStep(tool=tool, args=args, ok=res.ok, reason=res.reason))
+            traj.steps.append(
+                ExpertStep(tool=tool, args=args, ok=res.ok, reason=res.reason)
+            )
 
     # 1) OPEN openable place-target containers FIRST -- build_pose_cache seats
     #    objects inside them, which fails if the door is still shut.

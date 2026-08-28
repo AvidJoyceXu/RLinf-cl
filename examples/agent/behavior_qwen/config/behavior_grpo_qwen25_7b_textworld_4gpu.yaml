@@ -1,0 +1,25 @@
+# Four-GPU placement for the frozen 48/12 TextWorld GRPO contract.
+# Keep experiment semantics in the parent; this file only applies the TP=4 memory
+# layout already exercised by the two-update smoke configuration.
+defaults:
+  - behavior_grpo_qwen25_7b_textworld
+  - _self_
+
+runner:
+  experiment_name: behavior-grpo-textworld-tp4
+
+cluster:
+  component_placement:
+    actor,rollout,reward: 0-3
+
+rollout:
+  gpu_memory_utilization: 0.35
+  tensor_parallel_size: 4
+
+actor:
+  model:
+    tensor_model_parallel_size: 4
+
+inference:
+  model:
+    tensor_model_parallel_size: 4

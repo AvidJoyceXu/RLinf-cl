@@ -166,6 +166,8 @@ class SFTRunner:
         logging_metrics.update(evaluate_metrics)
 
         logger.info(f"Eval metrics: {evaluate_metrics}")
+        self.metric_logger.log(time_metrics, self.global_step)
+        self.metric_logger.log(evaluate_metrics, self.global_step)
         self.metric_logger.finish()
 
     def _save_checkpoint(self, is_best: bool = False) -> None:

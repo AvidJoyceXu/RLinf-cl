@@ -21,7 +21,7 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 
 from rlinf.utils.logging import get_logger
 
-SUPPORTED_ENV_WRAPPERS = ("rgb", "default", "rgb_lowres", "rich_obs")
+SUPPORTED_ENV_WRAPPERS = ("rgb", "default", "rgb_lowres", "rgbd_fullres")
 
 R1PRO_PROPRIO_KEYS = [
     "joint_qpos",
@@ -91,7 +91,7 @@ def set_camera_resolution(camera_cfg: dict | None) -> None:
     if camera_cfg is None:
         return
 
-    import omnigibson.learning.utils.eval_utils as eval_utils
+    import omnigibson.eval.utils.eval_utils as eval_utils
 
     head_resolution = camera_cfg.get("head_resolution")
     wrist_resolution = camera_cfg.get("wrist_resolution")
@@ -120,17 +120,17 @@ def get_env_wrapper(wrapper_name: str):
 
         return RGBWrapper
     if wrapper_name == "default":
-        from omnigibson.learning.wrappers.default_wrapper import DefaultWrapper
+        from omnigibson.eval.wrappers.default_wrapper import DefaultWrapper
 
         return DefaultWrapper
     if wrapper_name == "rgb_lowres":
-        from omnigibson.learning.wrappers.rgb_low_res_wrapper import RGBLowResWrapper
+        from omnigibson.eval.wrappers.default_wrapper import DefaultWrapper
 
-        return RGBLowResWrapper
-    if wrapper_name == "rich_obs":
-        from omnigibson.learning.wrappers.rich_obs_wrapper import RichObservationWrapper
+        return DefaultWrapper
+    if wrapper_name == "rgbd_fullres":
+        from omnigibson.eval.wrappers.rgbd_full_res_wrapper import RGBDFullResWrapper
 
-        return RichObservationWrapper
+        return RGBDFullResWrapper
     raise ValueError(
         f"Unsupported wrapper name: {wrapper_name}, expected one of {SUPPORTED_ENV_WRAPPERS}"
     )

@@ -576,6 +576,71 @@ class MegatronWorker(MegatronModelManager, Worker):
         return outputs
 
     # Training
+    def _parameter_update_probe(
+        self, *, optimizer_master: bool = False
+    ) -> tuple[str, torch.Tensor] | None:
+        """Sample one dense trainable tensor for explicit optimizer-delta evidence.
+
+        With a distributed BF16 optimizer, the model tensor can remain bitwise
+        unchanged after a small update even though its FP32 master shard changed.
+        ``optimizer_master=True`` exposes that distinction instead of treating a
+        BF16 rounding plateau as evidence that ``optimizer.step`` was a no-op.
+        """
+        if not bool(self.role_cfg.get("log_parameter_probe", False)):
+            return None
+        sample_count = int(self.role_cfg.get("parameter_probe_samples", 4096))
+        if sample_count <= 0:
+            raise ValueError(
+                f"{self.role}.parameter_probe_samples must be positive, got "
+                f"{sample_count}"
+            )
+
+        for chunk_index, model_chunk in enumerate(self.model):
+            for name, parameter in model_chunk.named_parameters():
+                lowered = name.lower()
+                if (
+                    not parameter.requires_grad
+                    or parameter.ndim < 2
+                    or parameter.numel() == 0
+                    or "embedding" in lowered
+                    or "word_embeddings" in lowered
+                    or "output_layer" in lowered
+                ):
+                    continue
+                probe_tensor = parameter
+                probe_suffix = "model"
+                if optimizer_master:
+                    probe_tensor = getattr(parameter, "main_param", None)
+                    if probe_tensor is None:
+                        continue
+                    probe_suffix = "optimizer_master"
+                flat = probe_tensor.detach().reshape(-1)
+                count = min(sample_count, flat.numel())
+                indices = torch.linspace(
+                    0,
+                    flat.numel() - 1,
+                    steps=count,
+                    device=flat.device,
+                    dtype=torch.float64,
+                ).to(dtype=torch.long)
+                sample = flat.index_select(0, indices).float().clone()
+                return f"chunk{chunk_index}:{name}:{probe_suffix}", sample
+        raise RuntimeError(
+            f"parameter update probe found no dense trainable {self.role} "
+            f"{'optimizer master shard' if optimizer_master else 'model tensor'}"
+        )
+
+    @staticmethod
+    def _parameter_probe_fingerprint(sample: torch.Tensor) -> float:
+        weights = torch.linspace(
+            1.0,
+            2.0,
+            steps=sample.numel(),
+            device=sample.device,
+            dtype=torch.float64,
+        )
+        return float(torch.dot(sample.double(), weights).item())
+
     def training_step(self, batch: dict[str, torch.Tensor] | BatchResizingIterator):
         """Run a single training step on the model.
 
@@ -587,6 +652,8 @@ class MegatronWorker(MegatronModelManager, Worker):
             model_chunk.zero_grad_buffer()
         self.optimizer.zero_grad()
 
+        probe_before = self._parameter_update_probe()
+        master_probe_before = self._parameter_update_probe(optimizer_master=True)
         if isinstance(batch, BatchResizingIterator):
             train_metrics = self.run_forward_backward_iterator(batch)
         else:
@@ -597,6 +664,68 @@ class MegatronWorker(MegatronModelManager, Worker):
             // self.cfg.algorithm.n_minibatches
         )
         success, grad_norm, num_zeros_in_grad, lr = self.optimizer_step(increment)
+
+        if probe_before is not None:
+            probe_name, before = probe_before
+            probe_after = self._parameter_update_probe()
+            if probe_after is None or probe_after[0] != probe_name:
+                raise RuntimeError(
+                    f"{self.role} parameter probe changed identity across optimizer step"
+                )
+            after = probe_after[1]
+            delta = (after - before).abs()
+            train_metrics[f"{self.role}/param_probe_before"] = (
+                self._parameter_probe_fingerprint(before)
+            )
+            train_metrics[f"{self.role}/param_probe_after"] = (
+                self._parameter_probe_fingerprint(after)
+            )
+            train_metrics[f"{self.role}/param_probe_changed"] = int(
+                torch.count_nonzero(delta).item()
+            )
+            train_metrics[f"{self.role}/param_probe_l1_delta"] = float(
+                delta.sum().item()
+            )
+            train_metrics[f"{self.role}/param_probe_max_delta"] = float(
+                delta.max().item()
+            )
+            self.log_info(
+                f"{self.role} parameter probe {probe_name}: "
+                f"changed={train_metrics[f'{self.role}/param_probe_changed']} "
+                f"l1={train_metrics[f'{self.role}/param_probe_l1_delta']:.9g}"
+            )
+
+        if master_probe_before is not None:
+            master_probe_name, master_before = master_probe_before
+            master_probe_after = self._parameter_update_probe(optimizer_master=True)
+            if master_probe_after is None or master_probe_after[0] != master_probe_name:
+                raise RuntimeError(
+                    f"{self.role} optimizer-master probe changed identity across "
+                    "optimizer step"
+                )
+            master_after = master_probe_after[1]
+            master_delta = (master_after - master_before).abs()
+            metric_prefix = f"{self.role}/master_param_probe"
+            train_metrics[f"{metric_prefix}_before"] = (
+                self._parameter_probe_fingerprint(master_before)
+            )
+            train_metrics[f"{metric_prefix}_after"] = self._parameter_probe_fingerprint(
+                master_after
+            )
+            train_metrics[f"{metric_prefix}_changed"] = int(
+                torch.count_nonzero(master_delta).item()
+            )
+            train_metrics[f"{metric_prefix}_l1_delta"] = float(
+                master_delta.sum().item()
+            )
+            train_metrics[f"{metric_prefix}_max_delta"] = float(
+                master_delta.max().item()
+            )
+            self.log_info(
+                f"{self.role} parameter probe {master_probe_name}: "
+                f"changed={train_metrics[f'{metric_prefix}_changed']} "
+                f"l1={train_metrics[f'{metric_prefix}_l1_delta']:.9g}"
+            )
 
         # Training metrics
         train_metrics[f"{self.role}/grad_norm"] = (

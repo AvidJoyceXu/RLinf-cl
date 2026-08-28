@@ -187,7 +187,11 @@ def load_activity_instance_tro_state(
         tro_state = recursively_convert_to_torch(json.load(f))
 
     robot = env.task.get_agent(env)
-    robot_name = getattr(robot, "model_name", getattr(robot, "model", None))
+    # Official 2026 files key poses by the public model (for example ``R1Pro``),
+    # while older OmniGibson releases exposed the lowercase asset identifier via
+    # ``model_name``. Prefer the public model and retain a normalized lookup for
+    # old/custom files whose casing differs.
+    robot_name = getattr(robot, "model", None) or getattr(robot, "model_name", None)
     assert robot_name is not None, (
         "Robot model name is required to load task instances."
     )
@@ -226,10 +230,21 @@ def load_activity_instance_tro_state(
             entity.load_state(state, serialized=False)
 
     if robot_poses is not None:
-        assert robot_name in robot_poses, (
-            f"{robot_name} presampled pose is not found in {tro_file_path}"
+        pose_key = robot_name
+        if pose_key not in robot_poses:
+            normalized_name = "".join(
+                ch for ch in str(robot_name).casefold() if ch.isalnum()
+            )
+            normalized_keys = {
+                "".join(ch for ch in str(key).casefold() if ch.isalnum()): key
+                for key in robot_poses
+            }
+            pose_key = normalized_keys.get(normalized_name)
+        assert pose_key is not None and pose_key in robot_poses, (
+            f"{robot_name} presampled pose is not found in {tro_file_path}; "
+            f"available robot pose keys: {sorted(robot_poses)}"
         )
-        robot_pose = robot_poses[robot_name][0]
+        robot_pose = robot_poses[pose_key][0]
         robot.set_position_orientation(
             robot_pose["position"],
             robot_pose["orientation"],
@@ -245,7 +260,14 @@ def load_activity_instance_tro_state(
     for _ in range(25):
         og.sim.step_physics()
         for entity in env.task.object_scope.values():
-            if entity.exists and not entity.is_system:
+            # v3.9 represents the agent as a Robot wrapper in object_scope; it is
+            # neither a BDDL entity with ``exists`` nor something this object-state
+            # stabilization loop should touch.
+            if getattr(entity, "synset", None) == "agent":
+                continue
+            if getattr(entity, "exists", True) and not getattr(
+                entity, "is_system", False
+            ):
                 entity.keep_still()
 
     env.scene.update_initial_file()

@@ -13,8 +13,8 @@ tool worker (SemanticACI.goal_status), never off a leaked answer. Each tool
 turn carries a ``meta`` dict shaped by BehaviorToolWorker:
 
     meta = {
-        "num_satisfied": int,      # |satisfied atoms| after this turn
-        "num_goal": int,           # |satisfied| + |unsatisfied| (constant)
+        "atom_coverage": float,    # best grounded goal-option coverage now
+        "initial_atom_coverage": float,
         "is_success": bool,        # all atoms satisfied AND at least one exists
     }
 
@@ -27,27 +27,47 @@ Two shaping modes (config ``reward.type``):
   policy that rarely satisfies the full goal floors every group sample -> zero
   advantage variance), which is exactly what ``staged`` fixes.
 
-* ``staged`` — dominant terminal PLUS a small process credit for the fraction of
-  goal atoms satisfied at the end (partial progress). Budget-exhausted rollouts
-  that satisfied *some* atoms earn graded reward, restoring within-group variance
-  for GRPO. Terminal stays dominant (|success_reward| >> coverage_weight).
+* ``staged`` — dominant terminal plus net grounded-atom progress, with small
+  penalties for policy-format errors and refused well-formed calls. Initial-state
+  coverage is subtracted, so reset facts are not free reward.
 """
-from __future__ import annotations
 
-from typing import Any
+from __future__ import annotations
 
 
 def _final_meta(tool_trace: list[dict]) -> dict:
     """The goal_status meta from the last tool turn that carried one."""
     for turn in reversed(tool_trace or []):
         meta = turn.get("meta") or {}
-        if "num_goal" in meta:
+        if "atom_coverage" in meta or "num_goal" in meta:
             return meta
     return {}
 
 
 def _ended_with_end_task(tool_trace: list[dict]) -> bool:
     return bool(tool_trace) and tool_trace[-1].get("name") == "end_task"
+
+
+def _policy_error_counts(tool_trace: list[dict]) -> tuple[int, int]:
+    """Return ``(format_errors, refused_calls)`` from explicit trace evidence."""
+    format_errors = refused_calls = 0
+    for turn in tool_trace or []:
+        format_errors += int(turn.get("format_violations", 0) or 0)
+        result = turn.get("result") or {}
+        reason = str(result.get("reason", ""))
+        policy_error = str(turn.get("policy_error", ""))
+        if policy_error in {"no_tool_call", "generation_length", "extra_tool_call"}:
+            format_errors += 1
+            continue
+        if policy_error == "unknown_tool" or reason.startswith("unknown_tool:"):
+            format_errors += 1
+            continue
+        if policy_error == "bad_arguments" or reason.startswith("bad_arguments:"):
+            format_errors += 1
+            continue
+        if result.get("ok") is False:
+            refused_calls += 1
+    return format_errors, refused_calls
 
 
 def compute_score(
@@ -73,8 +93,10 @@ def compute_staged_rewards(
     success_reward: float = 1.0,
     no_end_penalty: float = -0.5,
     coverage_weight: float = 0.3,
+    format_penalty: float = -0.05,
+    refusal_penalty: float = -0.02,
 ) -> list[float]:
-    """Per-turn reward list (terminal dominant + final-coverage shaping).
+    """Minimal v1 return: terminal + net atom progress - policy errors.
 
     Returned list is aligned to ``tool_trace``; the trajectory RETURN is the sum.
     The agent loop assigns the trajectory return uniformly across turns (the
@@ -82,17 +104,21 @@ def compute_staged_rewards(
     only the sum matters here — but we keep it per-turn so token-level credit is a
     later config flip, not a rewrite.
     """
-    rewards = [0.0 for _ in (tool_trace or [])]
-    if not tool_trace:
-        return rewards
+    rewards = [0.0 for _ in (tool_trace or [])] or [0.0]
 
     meta = _final_meta(tool_trace)
-    num_goal = int(meta.get("num_goal", 0) or 0)
-    num_satisfied = int(meta.get("num_satisfied", 0) or 0)
-    coverage = (num_satisfied / num_goal) if num_goal > 0 else 0.0
+    initial_coverage = float(meta.get("initial_atom_coverage", 0.0) or 0.0)
+    if "atom_coverage" in meta:
+        final_coverage = float(meta.get("atom_coverage", 0.0) or 0.0)
+    else:
+        num_goal = int(meta.get("num_goal", 0) or 0)
+        num_satisfied = int(meta.get("num_satisfied", 0) or 0)
+        final_coverage = (num_satisfied / num_goal) if num_goal > 0 else 0.0
+    format_errors, refused_calls = _policy_error_counts(tool_trace)
 
-    # Process credit: fraction of atoms satisfied at the end, on the last turn.
-    rewards[-1] += float(coverage_weight) * float(coverage)
+    rewards[-1] += float(coverage_weight) * (final_coverage - initial_coverage)
+    rewards[-1] += float(format_penalty) * format_errors
+    rewards[-1] += float(refusal_penalty) * refused_calls
 
     # Terminal (dominant), on the last turn.
     rewards[-1] += compute_score(

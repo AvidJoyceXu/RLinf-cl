@@ -1,0 +1,47 @@
+# Matched NL/handle cold start for the frozen text-detect-v1 benchmark.
+#
+# Input rows are explicit single-loss windows produced by
+# ``rlinf.envs.behavior.window_detect_sft``. Every reference call is supervised
+# exactly once; prior complete call/response pairs are masked context. The 6,144
+# token cap and 512-token generation reserve match the online GRPO rollout.
+#
+# Run only after staging a complete Qwen2.5-7B-Instruct checkpoint and overriding
+# ``actor.model.model_path`` if the path inherited below is unavailable:
+#   bash examples/sft/run_vlm_sft.sh behavior_detect_sft_qwen25_7b
+defaults:
+  - behavior_sft_qwen25_7b
+  - _self_
+
+runner:
+  experiment_name: behavior_detect_nl_handle_sft
+  output_dir: /data/behavior-data/sft_runs
+  seq_length: 6144
+  # One near-complete pass: with 8,179 windows, 2 FSDP ranks, micro-batch 1 and
+  # global batch 32, 256 steps consume 8,192 samples. DistributedSampler drops
+  # one odd row and the epoch-boundary wrap repeats 14; 8,178 unique windows are
+  # seen. A measured GBS=32 step took 66.49 s under ~20 GB/GPU co-tenant load.
+  max_steps: 256
+  val_check_interval: 128
+  save_interval: 128
+
+data:
+  train_data_paths: "/data/behavior-data/text_detect_v1/behavior_detect_sft_train.window6144.train.jsonl"
+  val_data_paths: "/data/behavior-data/text_detect_v1/behavior_detect_sft_train.window6144.val.jsonl"
+  tool_schemas_path: "/data/behavior-data/text_detect_v1/behavior_detect_sft_train.window6144.train.jsonl.tools.json"
+  max_prompt_length: 4096
+  max_length: 6144
+  toolcall_eval_mode: loss
+  # Negative means the full validation split. Override with a small positive
+  # value only for smoke tests.
+  max_eval_batches: -1
+  lazy_loading: true
+  num_workers: 2
+
+actor:
+  model:
+    model_path: "/data/hf_home/Qwen2.5-7B-Instruct"
+  optim:
+    total_training_steps: ${runner.max_steps}
+    # A one-pass corpus must not spend its first unique 32-window batch at LR=0.
+    # Nonzero-LR one/two-step smokes were stable; start cosine decay immediately.
+    lr_warmup_steps: 0

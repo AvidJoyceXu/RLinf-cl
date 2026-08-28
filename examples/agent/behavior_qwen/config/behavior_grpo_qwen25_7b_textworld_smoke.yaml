@@ -1,0 +1,52 @@
+# One-update-per-launch harness gate only. Never report this four-activity train subset
+# as a performance result; formal training/evaluation uses the parent's 48/12 rows.
+defaults:
+  - behavior_grpo_qwen25_7b_textworld
+  - _self_
+
+runner:
+  experiment_name: behavior-grpo-textworld-two-update-smoke
+  max_epochs: 2
+  # Phase A stops at global_step_1. Phase B resumes the checkpoint with the explicit
+  # override runner.max_steps=2 and therefore performs exactly one further update.
+  max_steps: 1
+  # The two-update gate isolates optimizer/checkpoint/resume. Validation is run as
+  # a separate post-gate job: after a long native-context rollout, SGLang's
+  # in-process CUDA-graph weight reload currently faults on sm_120. Keeping that
+  # known failure out of this gate does not waive it for the full-run harness.
+  val_check_interval: -1
+  save_interval: 1
+
+cluster:
+  # TP=2 reached the first optimizer step but exhausted the ~60 GiB currently
+  # free per shared RTX 6000D while lazily allocating Adam states. TP=4 keeps
+  # the model, gradients, and optimizer states below that per-rank ceiling.
+  component_placement:
+    actor,rollout,reward: 0-3
+
+data:
+  train_data_paths: ["/data/behavior-data/text_detect_scan_v5/rl/smoke/train.jsonl"]
+  val_data_paths: ["/data/behavior-data/text_detect_scan_v5/rl/smoke/val_s2.jsonl"]
+
+rollout:
+  # The parent value (0.22) was sized on a 143-GiB H20. On an 85.65-GiB RTX
+  # 6000D it leaves only ~4.4 GiB after the 14.4-GiB Qwen weights, and SGLang
+  # rejects the token pool during startup. 0.35 reserves ~30 GiB while the
+  # collocated actor/rollout memory-saver path releases inactive weights.
+  gpu_memory_utilization: 0.35
+  tensor_parallel_size: 4
+
+actor:
+  model:
+    tensor_model_parallel_size: 4
+  optim:
+    # A single 1e-6 Adam update is normally below one BF16 ULP. The production
+    # parent keeps 1e-6; this diagnostic rate makes the model-visible delta large
+    # enough to distinguish a real update from an FP32-master-only rounding change.
+    lr: 1.0e-04
+  lr_sched:
+    max_lr: 1.0e-04
+
+inference:
+  model:
+    tensor_model_parallel_size: 4

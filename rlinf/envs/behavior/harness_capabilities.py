@@ -31,6 +31,8 @@ CAPABILITIES = {
                 "fov_distract",
                 "detect",
                 "detect_scope",
+                "detect_scope_scan",
+                "detect_scope_memory",
             }
         ),
         policy_rgb_transport=False,

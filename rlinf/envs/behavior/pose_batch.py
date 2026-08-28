@@ -86,7 +86,27 @@ def batched_pose_writes(label: str = "restore"):
             env.scene.reset()
     """
     import omnigibson as og
-    from omnigibson.utils.usd_utils import PoseAPI
+
+    try:
+        from omnigibson.utils.usd_utils import PoseAPI
+    except ImportError:
+        # OmniGibson v3.9 removed the global PoseAPI cache. XFormPrim now writes
+        # through ``sim.fabric_hierarchy.update_world_xforms()``, so there is no
+        # invalidate/refresh pair to collapse. Keep the context manager as a
+        # functional no-op: callers still need one code path for the pinned v3.9
+        # RGB runtime and the older text-runtime deployments.
+        t0 = time.time()
+        try:
+            yield
+        finally:
+            PoseBatchStats.suppressed = 0
+            PoseBatchStats.elapsed_s = time.time() - t0
+            print(
+                f"[pose_batch] {label}: native fabric hierarchy; "
+                f"no PoseAPI batching required ({PoseBatchStats.elapsed_s:.1f}s)",
+                flush=True,
+            )
+        return
 
     # One sync up front: after this, every parent world pose is valid, and parents do
     # not move for the rest of the block.
@@ -115,7 +135,7 @@ def batched_pose_writes(label: str = "restore"):
 
     def _step_physics_then_invalidate(*a, **k):
         result = orig_step_physics(*a, **k)
-        PoseAPI.VALID = False          # what the real invalidate() does
+        PoseAPI.VALID = False  # what the real invalidate() does
         return result
 
     sim.step_physics = _step_physics_then_invalidate
@@ -147,7 +167,7 @@ def assert_no_moved_ancestors(prim_paths) -> None:
     paths = sorted(set(prim_paths))
     for i, parent in enumerate(paths):
         prefix = parent.rstrip("/") + "/"
-        for child in paths[i + 1:]:
+        for child in paths[i + 1 :]:
             if not child.startswith(prefix):
                 break
             raise AssertionError(

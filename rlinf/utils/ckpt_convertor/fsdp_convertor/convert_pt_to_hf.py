@@ -29,6 +29,7 @@ import os
 import hydra
 import torch
 
+from rlinf.config import torch_dtype_from_precision
 from rlinf.models import get_model
 from rlinf.scheduler.cluster import load_user_extension_module
 
@@ -45,6 +46,17 @@ from .utils import (
 def main(cfg) -> None:
     load_user_extension_module()
     model = get_model(cfg.model)
+    if model is None:
+        # Text backbones such as Qwen2.5 use the generic Hugging Face fallback in
+        # FSDPModelManager and therefore are intentionally absent from RLinf's
+        # embodiment registry. Mirror that fallback for checkpoint export.
+        from transformers import AutoModelForCausalLM
+
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model.model_path,
+            torch_dtype=torch_dtype_from_precision(cfg.model.precision),
+            low_cpu_mem_usage=True,
+        )
 
     model_dict = torch.load(cfg.convertor.ckpt_path)
     model.load_state_dict(model_dict)

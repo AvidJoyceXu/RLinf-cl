@@ -22,6 +22,10 @@ tabs 4
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TOKENIZERS_PARALLELISM=false
 export RAY_DEDUP_LOGS=0
+# This host's driver has a reproduced NVLS regression: multi-rank actor-to-rollout
+# synchronization can surface as CUDA illegal memory access. Ray captures the
+# setting when it starts, so establish the safe default before train.py creates it.
+export NCCL_NVLS_ENABLE=${NCCL_NVLS_ENABLE:-0}
 
 # The config logs to tensorboard AND wandb. Without a key, `wandb.init` would abort
 # the run at startup over a *logging* credential, so fall back to offline mode: the
@@ -40,6 +44,7 @@ SPATIALCODE_PARENT=${SPATIALCODE_PARENT:-/workspace}
 export PYTHONPATH=${REPO_PATH}:${MEGATRON_PATH}:${REPO_PATH}/examples:${SPATIALCODE_PARENT}:$PYTHONPATH
 
 CONFIG_NAME=${1:-behavior_grpo_qwen25_7b}
+shift $(( $# > 0 ? 1 : 0 ))
 
 # No env-server pool to start any more: the tool worker holds OmniGibson in process,
 # so there is no servers.yaml to check for. The first rollout pays the Kit boot
@@ -47,4 +52,5 @@ CONFIG_NAME=${1:-behavior_grpo_qwen25_7b}
 
 python ${REPO_PATH}/examples/agent/behavior_qwen/train.py \
     --config-path ${CONFIG_PATH}/config/ \
-    --config-name $CONFIG_NAME
+    --config-name $CONFIG_NAME \
+    "$@"

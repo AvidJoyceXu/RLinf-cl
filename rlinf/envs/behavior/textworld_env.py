@@ -31,10 +31,12 @@ from different sampled instances; here it comes from sampling temperature alone.
 Breadth replaces depth: 703 verified-solvable activities against 50 instance-backed
 ones.
 """
+
 from __future__ import annotations
 
 from uuid import uuid4
 
+from rlinf.envs.behavior.episode_contract import validate_geometry_instance
 from rlinf.envs.behavior.nl_goal import render_goal_nl
 from rlinf.envs.behavior.rft_sample import result_payload
 from rlinf.envs.behavior.sft_build import goal_atoms_to_lines
@@ -55,22 +57,42 @@ class _Atom:
 class BehaviorTextWorld:
     """One activity's symbolic world, behind the ``BehaviorEnv`` interface."""
 
-    def __init__(self, activity: str, obs_mode: str = "full",
-                 instances_per_activity: int = 0, rgb: bool = False,
-                 partial_scene: bool = True, fast_reset: bool = False):
+    def __init__(
+        self,
+        activity: str,
+        obs_mode: str = "full",
+        selection_mode: str = "handle",
+        instance_source_selection: str | None = None,
+        instances_per_activity: int = 0,
+        rgb: bool = False,
+        partial_scene: bool = True,
+        fast_reset: bool = False,
+    ):
         # rgb / partial_scene / fast_reset are accepted and ignored: they are all
         # geometry-loading knobs, and there is no geometry. Kept in the signature so
         # one config block drives either backend, rather than silently rejecting
         # keys the OmniGibson path needs.
         self.activity = activity
         self.obs_mode = obs_mode
-        self.scene = None                  # no scene is loaded; do not invent a name
+        self.selection_mode = selection_mode
+        self.instance_source_selection = instance_source_selection
+        self.scene = None  # no scene is loaded; do not invent a name
 
-        self.world = SymbolicWorld(activity)
-        self.aci = SymbolicACI(self.world, obs_mode=obs_mode)
+        self.world = SymbolicWorld(
+            activity,
+            instance_source_selection=instance_source_selection,
+        )
+        self.aci = SymbolicACI(
+            self.world,
+            obs_mode=obs_mode,
+            selection_mode=selection_mode,
+            layout_source_selection=instance_source_selection,
+        )
         self.goal_lines = goal_atoms_to_lines(
-            [_Atom(a) for a in self.world.ground_goal_atoms()])
+            [_Atom(a) for a in self.world.ground_goal_atoms()]
+        )
         self.goal_nl, self.goal_nl_fallbacks = render_goal_nl(activity)
+        self.initial_goal_progress = self.world.ground_goal_progress()
 
         # BDDL ships one definition per activity, so there is exactly one instance.
         # The list is kept (rather than dropped) because build_rl_dataset writes an
@@ -79,7 +101,12 @@ class BehaviorTextWorld:
         self.session_id: str | None = None
 
     # ------------------------------------------------------------------ #
-    def start(self, instance_id: int | None = None) -> dict:
+    def start(
+        self,
+        instance_id: int | None = None,
+        instance_source: str | None = None,
+        geometry_instance_key: str | None = None,
+    ) -> dict:
         """Reset to the activity's canonical start state and open a session.
 
         Rebuilds the world from the BDDL initial conditions rather than undoing the
@@ -98,7 +125,27 @@ class BehaviorTextWorld:
                 f"`build_rl_dataset --backend textworld`, which emits instance 0."
             )
         self.world.reset()
-        self.aci = SymbolicACI(self.world, obs_mode=self.obs_mode)
+        self.initial_goal_progress = self.world.ground_goal_progress()
+        self.aci = SymbolicACI(
+            self.world,
+            obs_mode=self.obs_mode,
+            selection_mode=self.selection_mode,
+            layout_source_selection=self.instance_source_selection,
+        )
+        actual_source = (
+            self.aci.layout.instance_source
+            if self.aci.layout is not None and self.aci.layout.is_real
+            else None
+        )
+        if instance_source is not None and instance_source != actual_source:
+            raise ValueError(
+                f"manifest requested instance_source={instance_source!r}, but "
+                f"{self.activity!r} resolved to {actual_source!r} under "
+                f"instance_source_selection={self.instance_source_selection!r}"
+            )
+        actual_geometry_key = validate_geometry_instance(
+            self.aci.layout, geometry_instance_key
+        )
         self.session_id = uuid4().hex
         return {
             "session_id": self.session_id,
@@ -106,6 +153,9 @@ class BehaviorTextWorld:
             "scene": self.scene,
             "instance_id": 0,
             "obs_mode": self.obs_mode,
+            "selection_mode": self.selection_mode,
+            "instance_source": actual_source,
+            "geometry_instance_key": actual_geometry_key,
             "goal_lines": self.goal_lines,
             "goal_nl": self.goal_nl,
             "goal_nl_fallbacks": self.goal_nl_fallbacks,
@@ -113,22 +163,31 @@ class BehaviorTextWorld:
             # hand the policy a free success. `audit()` excludes these activities up
             # front, so this should never fire -- which is exactly why it is checked.
             "contaminated": bool(self.world.is_success()),
+            "initial_goal_progress": self.initial_goal_progress,
         }
 
     def call(self, name: str, arguments: dict) -> dict:
         """Dispatch one tool; identical ``{payload, meta, terminal}`` contract."""
         fn = getattr(self.aci, name, None)
         if fn is None or name.startswith("_"):
-            return {"payload": {"ok": False, "reason": f"unknown_tool:{name}"},
-                    "meta": self._meta(), "terminal": False}
+            return {
+                "payload": {"ok": False, "reason": f"unknown_tool:{name}"},
+                "meta": self._meta(),
+                "terminal": False,
+            }
         try:
             res = fn(**(arguments or {}))
-        except TypeError as ex:                       # bad/missing arguments
-            return {"payload": {"ok": False, "reason": f"bad_arguments: {ex}"},
-                    "meta": self._meta(), "terminal": False}
-        return {"payload": result_payload(name, res),
+        except TypeError as ex:  # bad/missing arguments
+            return {
+                "payload": {"ok": False, "reason": f"bad_arguments: {ex}"},
                 "meta": self._meta(),
-                "terminal": name == "end_task"}
+                "terminal": False,
+            }
+        return {
+            "payload": result_payload(name, res),
+            "meta": self._meta(),
+            "terminal": name == "end_task",
+        }
 
     def _meta(self) -> dict:
         """Real BDDL goal evaluation over the literal set -- the same evaluator the
@@ -136,8 +195,14 @@ class BehaviorTextWorld:
         gs = self.world.goal_status()
         n_sat = len(gs["satisfied"])
         n_goal = n_sat + len(gs["unsatisfied"])
-        return {"num_satisfied": n_sat, "num_goal": n_goal,
-                "is_success": (len(gs["unsatisfied"]) == 0 and n_sat > 0)}
+        progress = self.world.ground_goal_progress()
+        return {
+            "num_satisfied": n_sat,
+            "num_goal": n_goal,
+            "is_success": (len(gs["unsatisfied"]) == 0 and n_sat > 0),
+            **progress,
+            "initial_atom_coverage": self.initial_goal_progress["atom_coverage"],
+        }
 
     def end(self) -> dict:
         self.session_id = None
@@ -155,13 +220,34 @@ def _main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--activity", default="picking_up_trash")
-    ap.add_argument("--obs-mode", default="full",
-                    choices=["full", "partial", "object"])
-    ap.add_argument("--expert", action="store_true",
-                    help="run the symbolic expert plan and report BDDL success")
+    ap.add_argument(
+        "--obs-mode",
+        default="full",
+        choices=[
+            "full",
+            "partial",
+            "object",
+            "fov",
+            "fov_distract",
+            "detect",
+            "detect_scope",
+            "detect_scope_scan",
+            "detect_scope_memory",
+        ],
+    )
+    ap.add_argument("--selection-mode", default="handle", choices=["handle", "bbox"])
+    ap.add_argument(
+        "--expert",
+        action="store_true",
+        help="run the symbolic expert plan and report BDDL success",
+    )
     args = ap.parse_args()
 
-    env = BehaviorTextWorld(args.activity, obs_mode=args.obs_mode)
+    env = BehaviorTextWorld(
+        args.activity,
+        obs_mode=args.obs_mode,
+        selection_mode=args.selection_mode,
+    )
     body = env.start()
     print(json.dumps({k: v for k, v in body.items() if k != "session_id"}, indent=1))
 
@@ -170,10 +256,14 @@ def _main() -> None:
 
         out = solve(args.activity, obs_mode=args.obs_mode)
         for step in out["trace"]:
-            print(f"  {'OK ' if step['ok'] else 'REJ'} {step['name']}"
-                  f"({step['arguments']}) -> {step['reason'][:70]}")
-        print(f"success={out['success']} steps={out['n_steps']} "
-              f"rejected={out['n_rejected']}")
+            print(
+                f"  {'OK ' if step['ok'] else 'REJ'} {step['name']}"
+                f"({step['arguments']}) -> {step['reason'][:70]}"
+            )
+        print(
+            f"success={out['success']} steps={out['n_steps']} "
+            f"rejected={out['n_rejected']}"
+        )
     else:
         print(json.dumps(env.call("observe", {}), indent=1))
 

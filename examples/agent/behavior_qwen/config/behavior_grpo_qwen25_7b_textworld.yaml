@@ -1,6 +1,6 @@
-# Turn-level online GRPO on BEHAVIOR-TextWorld -- the SYMBOLIC benchmark, 1 GPU.
+# Online trajectory-return GRPO on BEHAVIOR-TextWorld -- symbolic benchmark, 1 GPU.
 #
-# Same policy, same 17 tools, same turn-level GRPO as
+# Same policy and semantic/viewpoint tools as
 # `behavior_grpo_qwen25_7b_megatron.yaml`. The one thing that differs is the
 # environment: `tools.behavior.backend: textworld` swaps OmniGibson for the symbolic
 # BDDL dynamics layer (rlinf/envs/behavior/symbolic_world.py).
@@ -16,22 +16,17 @@
 # WHAT THE ENVIRONMENT CHANGE BUYS, and it drives most of the settings below:
 #   * reset ~1 ms and a tool call ~50 us, vs 0.5-1.3 s and ~13 ms. Rollout cost is
 #     now entirely LLM decode, so `group_size` is a memory question, not a time one.
-#   * no Kit, so no one-activity-per-process lock: ONE worker rank hosts all 703
+#   * no Kit, so no one-activity-per-process lock: ONE worker rank hosts all 48
 #     activities and `tools.behavior.activity` is left unset.
-#   * S2 (held-out ACTIVITIES) becomes measurable at scale -- 141 held-out
-#     activities instead of 4. That is the primary metric (CLAUDE.md), and it was
-#     previously the least well measured thing in the project.
+#   * S2 is the frozen activity-disjoint 12-row scan subset. Every row stays in
+#     the denominator and carries its exact source, geometry key, and oracle budget.
 #
 # WHAT IT COSTS: no instance variety. BDDL ships exactly one definition per activity
 # (measured 1016/1016), so each activity has ONE start state and within-group
 # variance comes from sampling temperature alone.
 #
-# Init from the SFT cold start, not base weights: the cold start is what makes the
-# policy speak the ACI at all. NOTE it was trained on OmniGibson observations with
-# `goal_format: atoms`; the symbolic `observe()` drops xy and adds support/room, so
-# expect a distribution shift. Measure it first with
-# `python -m rlinf.envs.behavior.textworld_rollout` -- milliseconds per episode --
-# before spending a training run on it.
+# The first baseline intentionally starts from pinned base weights and bypasses the
+# rejected primitive-tour SFT. A future scan-SFT initialization is a separate arm.
 #
 #   python examples/agent/behavior_qwen/train.py \
 #     --config-path config --config-name behavior_grpo_qwen25_7b_textworld
@@ -69,8 +64,8 @@ runner:
 
   max_epochs: 1
   max_steps: -1
-  # Validation is the POINT here, not an afterthought: val_s2 is 141 held-out
-  # activities and an eval pass costs no simulator time at all.
+  # Validation is the POINT here, not an afterthought: val_s2 is 13 held-out
+  # activities and an eval pass costs no simulator time.
   val_check_interval: 10
   save_interval: 10
 
@@ -102,7 +97,7 @@ algorithm:
   # with one start state per activity, sampling temperature is the sole source of
   # within-group variance and a bigger group is how that variance gets estimated.
   group_size: 8
-  n_minibatches: 2
+  n_minibatches: 1
   training_batch_size_per_gpu: 1
   rollout_batch_size_per_gpu: null
 
@@ -125,9 +120,9 @@ algorithm:
   clip_ratio_low: null
   clip_ratio_high: null
 
-  # THE turn-level setting. `grpo_dynamic` is the ragged multi-turn advantage;
-  # loss_scales distributes credit across group / agent / turn. Only MAMegatronActor
-  # implements this path.
+  # `grpo_dynamic` handles ragged multi-turn trajectories. In `trajectory` mode the
+  # trajectory return is broadcast to its turns; `turn_level` below changes weighting
+  # but is NOT causal per-step credit. Only MAMegatronActor implements this path.
   adv_type: grpo_dynamic
   loss_scales: ["group_level", "agent_level", "turn_level"]
   advantage_mode: trajectory
@@ -152,9 +147,12 @@ data:
   type: math                     # generic JSONL prompt/answer loader
   max_prompt_length: 4096        # system + 17 tool schemas + NL goal ~1.8K, grows per turn
   filter_prompt_by_length: True
-  # global_batch_size = rollout_batch_size * group_size / n_minibatches = 4*8/2 = 16
-  rollout_batch_size: 4
-  val_rollout_batch_size: null
+  # global_batch_size = rollout_batch_size * group_size / n_minibatches = 2*8/1 = 16
+  rollout_batch_size: 2
+  # One held-out activity per validation batch keeps 8 sampled trajectories within
+  # the rollout server's concurrency/memory envelope. The runner now honors this
+  # value instead of replacing every non-null value with the full dataset size.
+  val_rollout_batch_size: 1
   num_workers: 2
   prompt_key: prompt
   answer_key: solutions          # carries the episode spec, not an answer
@@ -162,29 +160,36 @@ data:
   shuffle: True
   validation_shuffle: False
   seed: 1234
-  # ALL 562 training activities in one rank -- there is no activity lock to work
-  # around. val_s2 is the 141 held-out activities, disjoint by construction
-  # (build_rl_dataset --backend textworld writes split.json alongside).
-  train_data_paths: ["/data/behavior-data/tw/train.jsonl"]
-  val_data_paths: ["/data/behavior-data/tw/val_s2.jsonl"]
+  # Frozen T2b public-scan rows only: 48 train and 12 activity-disjoint S2.
+  train_data_paths: ["/data/behavior-data/text_detect_scan_v5/rl/train.jsonl"]
+  val_data_paths: ["/data/behavior-data/text_detect_scan_v5/rl/val_s2.jsonl"]
 
 
 agentloop:
   group_name: "AgentLoopGroup"
   toolcall_parser: "eqa-qwen"    # format-level Qwen <tool_call> parser, not EQA-specific
-  # 30: expert episodes average 12.6 turns and the symbolic expert's longest plans
-  # run to ~40 tool calls on multi-object activities. 30 bounds a wandering policy at
-  # ~2.4x the expert while admitting the long tail of real plans.
+  # Compatibility fallback only. Frozen detect rows carry oracle_turns and budget_k
+  # below is authoritative; missing oracle metadata fails closed.
   max_turns: 30
   max_tool_response_length: 3000 # observe() returns up to ~2.5K chars
   tool_response_truncate_side: "right"
   print_outputs: False
   is_dynamic_rollout_batch: True
-  obs_mode: full
+  obs_mode: detect_scope_scan
+  selection_mode: handle
+  # K is an evaluation/training axis, not a hidden flat ceiling. Each dataset row
+  # carries its certified oracle turn count; override K explicitly for K=1/3 curves.
+  budget_k: 2.0
+  budget_cap: null
+  max_nudges: 3
   # nl -> the goal arrives as an English sentence rendered from the UNGROUND BDDL.
   # With ground atoms the policy transliterates inside(a,b) into place_inside(a,b)
   # and never plans.
   goal_format: nl
+  # Base Qwen was pretrained on assistant/tool role boundaries. The historical
+  # flat JSON continuation is available only for checkpoints trained on that old
+  # SFT serialization; using it from base weights causes every second turn to EOS.
+  context_format: native
   trace_dump_dir: ${runner.output_dir}/${runner.experiment_name}/traces
 
 
@@ -192,11 +197,15 @@ tools:
   behavior:
     # THE ONE KEY THAT MAKES THIS THE SYMBOLIC BENCHMARK.
     backend: textworld
-    obs_mode: full
+    obs_mode: detect_scope_scan
+    selection_mode: handle
     # Deliberately unset. On OmniGibson this had to be known at construction time so
     # Kit could boot on the main thread; with no Kit the worker builds a symbolic
     # world per activity on demand and caches it, so one rank serves all 703.
     activity: null
+    # The frozen 48/12 subset is entirely v3.9.1. 2025 and local-v3.7 must not enter
+    # this run; session_start validates source and exact geometry basename per row.
+    instance_sources: 2026-v3.9.1
     # The remaining OmniGibson keys are geometry-loading knobs with nothing to load.
     # BehaviorTextWorld accepts and ignores them so one config block drives either
     # backend; they are left here as an explicit record of what does NOT apply.
@@ -215,6 +224,8 @@ reward:
     success_reward: 1.0
     no_end_penalty: -0.5
     coverage_weight: 0.3
+    format_penalty: -0.05
+    refusal_penalty: -0.02
 
 
 rollout:
@@ -229,8 +240,9 @@ rollout:
   # and the machine is quiet; drop seq_length before raising this if it OOMs again.
   gpu_memory_utilization: 0.22
   model:
-    # The SFT cold start, NOT base weights. Converted to Megatron on the fly.
-    model_path: /data/behavior-data/sft/hf_step120
+    # Direct-RL baseline from the pinned base model. The old matched SFT imitates
+    # hidden-geometry primitive tours and is intentionally not used here.
+    model_path: /data/hf_home/Qwen2.5-7B-Instruct
     model_type: qwen2.5
     precision: ${actor.model.precision}
   enforce_eager: False
@@ -271,6 +283,11 @@ actor:
   training_backend: megatron     # selects MAMegatronActor in train.py
   enable_dp_load_balance: True
   calculate_flops: False
+  # Required acceptance evidence: sample the same dense tensor immediately before
+  # and after optimizer.step. On resume, the prior after fingerprint must equal the
+  # next before fingerprint, and every accepted update must change sampled values.
+  log_parameter_probe: True
+  parameter_probe_samples: 4096
   seed: 1234
 
   pack_traj: True                # drives Megatron ragged packing
@@ -287,6 +304,12 @@ actor:
 
   model:
     precision: bf16
+
+    # TE 2.5 otherwise prefers cuDNN fused attention on Hopper+ even when its
+    # supported flash-attn is installed. cuDNN 9.10.2 has no valid sm_120 engine
+    # for this packed-thd backward, so make the working backend an explicit part
+    # of the training contract rather than relying on TE's hardware heuristic.
+    attention_backend: flash
 
     seq_length: ${runner.seq_length}
     encoder_seq_length: ${runner.seq_length}
@@ -339,7 +362,11 @@ actor:
     fp16: False
 
   lr_sched:
-    lr_warmup_fraction: 0.05
+    # Constant-LR baseline: a nonzero warmup fraction overrides
+    # `lr_warmup_iters: 0` in Megatron and silently shrinks the first updates.
+    # That already invalidated one SFT launch and made the first GRPO diagnostic
+    # step run at 1/50 of its declared rate.
+    lr_warmup_fraction: 0.0
     lr_warmup_init: 0.0
     lr_warmup_iters: 0
     max_lr: 1.0e-06

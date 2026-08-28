@@ -46,6 +46,7 @@ services the request channel; calling them inline would stall the loop and make 
 reset look like a hung worker. The HTTP version got this for free by having the
 simulator in a different process, so it is the one thing that got *harder* here.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -78,8 +79,15 @@ class BehaviorToolWorker(ToolWorker):
         self.backend: str = str(tcfg.get("backend", "omnigibson"))
         assert self.backend in ("omnigibson", "textworld"), self.backend
         self.obs_mode: str = str(tcfg.get("obs_mode", "full"))
+        self.selection_mode: str = str(tcfg.get("selection_mode", "handle"))
+        if self.selection_mode not in ("handle", "bbox"):
+            raise ValueError(
+                "tools.behavior.selection_mode must be 'handle' or 'bbox', got "
+                f"{self.selection_mode!r}"
+            )
         self.instances_per_activity: int = int(tcfg.get("instances_per_activity", 1))
         self.instance_source: str | None = tcfg.get("instance_source", None)
+        self.instance_sources: str | None = tcfg.get("instance_sources", None)
         # Cameras off / partial scene load are the defaults for the same reason as in
         # env_server.py: the semantic ACI reads no pixels, and camera load cost ~13 of
         # ~16 boot minutes on a non-ray-tracing GPU.
@@ -112,7 +120,7 @@ class BehaviorToolWorker(ToolWorker):
         # true. Leave it unset to fall back to the lazy path (fine for a debugging
         # process that is already on the main thread).
         self.activity_cfg: str | None = tcfg.get("activity", None)
-        self._env: Any = None                  # BehaviorEnv | BehaviorTextWorld
+        self._env: Any = None  # BehaviorEnv | BehaviorTextWorld
         # textworld only: activity -> env. There is no Kit to lock a scene, so one
         # rank hosts every activity and the one-activity-per-rank rule below does
         # not apply. This is what makes multi-activity training and the S2
@@ -165,8 +173,9 @@ class BehaviorToolWorker(ToolWorker):
             # here on, which in this process means Kit's. uvloop is a throughput
             # optimisation for Ray, not a requirement, and this worker's job is to host
             # a simulator that cannot tolerate it.
-            if not isinstance(asyncio.get_event_loop_policy(),
-                              asyncio.DefaultEventLoopPolicy):
+            if not isinstance(
+                asyncio.get_event_loop_policy(), asyncio.DefaultEventLoopPolicy
+            ):
                 self.log_info(
                     "BehaviorToolWorker: switching asyncio policy "
                     f"{type(asyncio.get_event_loop_policy()).__module__} -> asyncio "
@@ -177,7 +186,7 @@ class BehaviorToolWorker(ToolWorker):
             box: dict[str, Any] = {}
 
             def _boot_thread():
-                loop = asyncio.SelectorEventLoop()   # NOT new_event_loop(): see (b)
+                loop = asyncio.SelectorEventLoop()  # NOT new_event_loop(): see (b)
                 asyncio.set_event_loop(loop)
                 # BLOCK the job-control signals. Kit touches terminal state during
                 # startup; with SIGTTOU/SIGTTIN neither ignored nor handled, the
@@ -192,15 +201,18 @@ class BehaviorToolWorker(ToolWorker):
                 # `pthread_sigmask` works from ANY thread, and POSIX says a blocked
                 # SIGTTOU lets the terminal operation proceed instead of stopping.
                 import signal as _sig
+
                 _sig.pthread_sigmask(
-                    _sig.SIG_BLOCK, {_sig.SIGTTOU, _sig.SIGTTIN, _sig.SIGTSTP})
+                    _sig.SIG_BLOCK, {_sig.SIGTTOU, _sig.SIGTTIN, _sig.SIGTSTP}
+                )
                 try:
                     box["env"] = self._boot(self.activity_cfg)
-                except BaseException as e:           # noqa: BLE001
+                except BaseException as e:  # noqa: BLE001
                     box["err"] = e
 
-            th = threading.Thread(target=_boot_thread, name="omnigibson-boot",
-                                  daemon=True)
+            th = threading.Thread(
+                target=_boot_thread, name="omnigibson-boot", daemon=True
+            )
             th.start()
             th.join()
             if "err" in box:
@@ -255,8 +267,9 @@ class BehaviorToolWorker(ToolWorker):
     def stop_server(self):
         if self.request_processor_task and not self.request_processor_task.done():
             self.request_processor_task.cancel()
-        for env in ({id(e): e for e in [*self._envs.values(), self._env]
-                     if e is not None}).values():
+        for env in (
+            {id(e): e for e in [*self._envs.values(), self._env] if e is not None}
+        ).values():
             env.close()
         self._envs.clear()
         self._env = None
@@ -290,14 +303,16 @@ class BehaviorToolWorker(ToolWorker):
                 response = await self._execute(request)
             else:
                 response = ToolChannelResponse(
-                    success=False, result=f"unknown_request:{request.request_type}")
-        except Exception as e:                                    # noqa: BLE001
+                    success=False, result=f"unknown_request:{request.request_type}"
+                )
+        except Exception as e:  # noqa: BLE001
             # A failed tool must not wedge the episode: the agent loop sees the
             # failure, the trajectory ends, and the reward module scores it as a
             # non-terminating episode rather than blocking the whole rollout.
             self._release(request.session_id)
             response = ToolChannelResponse(
-                success=False, result=f"{type(e).__name__}:{e}")
+                success=False, result=f"{type(e).__name__}:{e}"
+            )
 
         await self.output_channel.put(
             response, key=request.session_id, async_op=True
@@ -349,7 +364,15 @@ class BehaviorToolWorker(ToolWorker):
                     ),
                 )
 
-            body = await self._run(self._env.start, spec.get("instance_id"))
+            if self.backend == "textworld":
+                body = await self._run(
+                    self._env.start,
+                    spec.get("instance_id"),
+                    spec.get("instance_source"),
+                    spec.get("geometry_instance_key"),
+                )
+            else:
+                body = await self._run(self._env.start, spec.get("instance_id"))
         except BaseException:
             self._session_lock.release()
             raise
@@ -364,7 +387,7 @@ class BehaviorToolWorker(ToolWorker):
         if self._active_session != request.session_id or self._env is None:
             return ToolChannelResponse(success=False, result="unknown_session")
         args = dict(request.tool_args or {})
-        args.pop("_episode_id", None)                 # routing key, not a tool arg
+        args.pop("_episode_id", None)  # routing key, not a tool arg
         body = await self._run(self._env.call, request.tool_name or "", args)
         return ToolChannelResponse(
             success=bool(body.get("payload", {}).get("ok", True)),
@@ -414,7 +437,12 @@ class BehaviorToolWorker(ToolWorker):
             # below apply, so take the short path rather than dressing it up as one.
             from rlinf.envs.behavior.textworld_env import BehaviorTextWorld
 
-            return BehaviorTextWorld(activity, obs_mode=self.obs_mode)
+            return BehaviorTextWorld(
+                activity,
+                obs_mode=self.obs_mode,
+                selection_mode=self.selection_mode,
+                instance_source_selection=self.instance_sources,
+            )
 
         from rlinf.envs.behavior.env_server import BehaviorEnv
 
@@ -461,7 +489,7 @@ class BehaviorToolWorker(ToolWorker):
         return env
 
 
-def tool_names(obs_mode: str = "full") -> list[str]:
+def tool_names(obs_mode: str = "full", selection_mode: str = "handle") -> list[str]:
     """Names the agent loop registers with the tool router.
 
     Sourced from the SFT schema so the RL action space cannot silently drift from
@@ -470,7 +498,7 @@ def tool_names(obs_mode: str = "full") -> list[str]:
     """
     from rlinf.envs.behavior.sft_build import all_schemas
 
-    return [t["name"] for t in all_schemas(obs_mode)]
+    return [t["name"] for t in all_schemas(obs_mode, selection_mode=selection_mode)]
 
 
 __all__ = ["BehaviorToolWorker", "tool_names"]

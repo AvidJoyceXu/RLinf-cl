@@ -26,6 +26,7 @@ class TrajectoryVideoRecorder:
         self.writer = None
         self.video_path: str | None = None
         self.sidecar_path: str | None = None
+        self.frames_dir: str | None = None
         self.metadata: dict = {}
         self.events: list[dict] = []
 
@@ -42,9 +43,18 @@ class TrajectoryVideoRecorder:
         )
         self.video_path = os.path.join(self.output_dir, stem + ".mp4")
         self.sidecar_path = os.path.join(self.output_dir, stem + ".json")
+        self.frames_dir = os.path.join(self.output_dir, stem + "__source_frames")
+        os.makedirs(self.frames_dir, exist_ok=True)
         self.metadata = dict(metadata)
         self.events = []
-        self.writer = imageio.get_writer(self.video_path, fps=self.fps)
+        self.writer = imageio.get_writer(
+            self.video_path,
+            fps=self.fps,
+            codec="libx264",
+            pixelformat="yuv420p",
+            quality=9,
+            macro_block_size=1,
+        )
         return self.video_path
 
     def append(
@@ -68,12 +78,20 @@ class TrajectoryVideoRecorder:
         if ok is not None:
             label += f" ok={bool(ok)}"
         image = Image.fromarray(arr)
+        assert self.frames_dir is not None
+        source_path = os.path.join(self.frames_dir, f"{index:04d}__{_safe(tool)}.png")
+        image.save(source_path, format="PNG")
         draw = ImageDraw.Draw(image)
         box = draw.textbbox((0, 0), label)
         draw.rectangle((0, 0, box[2] + 8, box[3] + 6), fill=(0, 0, 0))
         draw.text((4, 3), label, fill=(255, 255, 255))
         self.writer.append_data(np.asarray(image))
-        event = {"frame": index, "tool": tool, "ok": ok}
+        event = {
+            "frame": index,
+            "tool": tool,
+            "ok": ok,
+            "source_png": source_path,
+        }
         if event_metadata:
             event.update(event_metadata)
         self.events.append(event)
@@ -92,6 +110,7 @@ class TrajectoryVideoRecorder:
             "frames": len(self.events),
             "events": self.events,
             "video_path": self.video_path,
+            "source_frames_dir": self.frames_dir,
         }
         assert self.sidecar_path is not None
         with open(self.sidecar_path, "w") as stream:

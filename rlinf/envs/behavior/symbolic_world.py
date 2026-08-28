@@ -63,11 +63,13 @@ Gaps 4 and 5 are deliberate *parity* with the geometric layer rather than
 improvements, so the two backends stay comparable and SFT data transfers. Gaps 1-3
 are where the symbolic layer is genuinely a different task.
 """
+
 from __future__ import annotations
 
 import dataclasses
 import functools
 import glob
+import hashlib
 import json
 import math
 import os
@@ -84,7 +86,7 @@ from bddl.activity import (
     get_object_scope,
 )
 from bddl.backend_abc import BDDLBackend
-from bddl.logic_base import BinaryAtomicFormula
+from bddl.logic_base import AtomicFormula, BinaryAtomicFormula
 from bddl.trivial_backend import (
     TrivialBackend,
     TrivialGenericObject,
@@ -95,8 +97,21 @@ from bddl.trivial_backend import (
 # makes an activity unsolvable in the symbolic layer, and `audit()` excludes it
 # rather than letting the policy grind against an impossible goal.
 AFFECTABLE_PREDICATES = frozenset(
-    {"ontop", "inside", "open", "closed", "toggled_on", "cooked", "covered",
-     "real", "future", "filled", "contains", "nextto", "grasped"}
+    {
+        "ontop",
+        "inside",
+        "open",
+        "closed",
+        "toggled_on",
+        "cooked",
+        "covered",
+        "real",
+        "future",
+        "filled",
+        "contains",
+        "nextto",
+        "grasped",
+    }
 )
 
 # Relations invalidated when an object is picked up, sliced, or re-placed. `nextto`
@@ -111,8 +126,10 @@ _POSITIONAL = ("ontop", "inside", "under", "touching", "overlaid", "draped")
 @functools.lru_cache(maxsize=1)
 def _property_table() -> dict:
     definition_root = os.environ.get("BEHAVIOR_BDDL_DEFINITION_ROOT")
-    package_root = os.path.dirname(definition_root) if definition_root else os.path.dirname(
-        bddl.__file__
+    package_root = (
+        os.path.dirname(definition_root)
+        if definition_root
+        else os.path.dirname(bddl.__file__)
     )
     path = os.path.join(
         package_root, "generated_data", "propagated_annots_canonical.json"
@@ -147,8 +164,12 @@ def lemma_of(scope_name: str) -> str:
 
 # Prefix -> the tool that produces it. `dice` runs the slice stage itself, so a
 # `diced__` product is reachable from the whole object either way.
-_TRANSFORM_PREFIXES = (("cooked__diced__", "dice"), ("diced__", "dice"),
-                       ("half__", "slice"))
+_TRANSFORM_PREFIXES = (
+    ("cooked__diced__", "dice"),
+    ("diced__", "dice"),
+    ("half__", "slice"),
+    ("cooked__", "cook"),
+)
 
 
 def producer_of(world, product: str):
@@ -162,13 +183,22 @@ def producer_of(world, product: str):
     lemma = lemma_of(product)
     for prefix, tool in _TRANSFORM_PREFIXES:
         if lemma.startswith(prefix):
-            base = lemma[len(prefix):]
+            base = lemma[len(prefix) :]
             break
     else:
         return None
     for name in world.scope_names:
-        if lemma_of(name) == base and world.is_real(name):
-            return name, tool
+        if lemma_of(name) != base or not world.is_real(name):
+            continue
+        if tool == "cook" and "substance" in properties_of(name):
+            # Nonvisual ingredients are selected through their visible host. Example:
+            # popcorn is contained in a popcorn bag; cooking the bag materializes
+            # cooked__popcorn. This is the same host-addressing convention `fill`
+            # uses for substance systems.
+            for host in world.scope_names:
+                if world.holds("contains", [host, name]):
+                    return host, tool
+        return name, tool
     return None
 
 
@@ -190,7 +220,7 @@ def display_names(scope_names) -> tuple[dict, dict]:
     for name in scope_names:
         syn = synset_of(name)
         lemma = _word(syn)
-        idx = name[len(syn) + 1:]
+        idx = name[len(syn) + 1 :]
         disp = name if len(lemma_to_synsets[lemma]) > 1 else f"{lemma}_{idx}"
         to_display[name] = disp
         from_display[disp] = name
@@ -238,21 +268,28 @@ def _quiet(base, predicate_name: str):
     # 27 getters. One authoritative store beats two partially-overlapping ones.
     getter = "get_" + predicate_name
     if issubclass(base, BinaryAtomicFormula):
+
         def _evaluate(self, obj1, obj2):
             return bool(getattr(obj1.simulator, getter)((obj1, obj2)))
     else:
+
         def _evaluate(self, obj):
             return bool(getattr(obj.simulator, getter)((obj,)))
-    return type(f"Quiet{base.__name__}", (base,),
-                {"_evaluate": _evaluate, "STATE_NAME": predicate_name})
+
+    return type(
+        f"Quiet{base.__name__}",
+        (base,),
+        {"_evaluate": _evaluate, "STATE_NAME": predicate_name},
+    )
 
 
 class QuietTrivialBackend(BDDLBackend):
     """bddl's TrivialBackend, silenced and with the STATE_NAME mix-ups corrected."""
 
     def get_predicate_class(self, predicate_name):
-        return _quiet(TrivialBackend().get_predicate_class(predicate_name),
-                      predicate_name)
+        return _quiet(
+            TrivialBackend().get_predicate_class(predicate_name), predicate_name
+        )
 
 
 @dataclass
@@ -280,7 +317,12 @@ class ToolResult:
 class SymbolicWorld:
     """BDDL ground-literal state for one activity, plus the real goal evaluator."""
 
-    def __init__(self, activity: str, definition: int = 0):
+    def __init__(
+        self,
+        activity: str,
+        definition: int = 0,
+        instance_source_selection: str | None = None,
+    ):
         self.activity = activity
         self.definition = definition
         self.definition_source = "installed"
@@ -294,7 +336,8 @@ class SymbolicWorld:
                 raise FileNotFoundError(
                     f"pinned BDDL definition missing: {problem_path}"
                 )
-            predefined_problem = open(problem_path).read()
+            with open(problem_path) as problem_file:
+                predefined_problem = problem_file.read()
             # Resolve v3.9 scene-object selectors against the same versioned
             # template population the layout resolver will use. Without this, the
             # old evaluator treats ``cabinet.n.01_*`` as a literal object and adds a
@@ -306,7 +349,7 @@ class SymbolicWorld:
             from rlinf.envs.behavior.instance_sources import selected_layout_sources
 
             template_probe = None
-            for source in selected_layout_sources():
+            for source in selected_layout_sources(instance_source_selection):
                 candidates = sorted(
                     glob.glob(
                         os.path.join(
@@ -382,9 +425,10 @@ class SymbolicWorld:
                 self.sim.set_real((name,), True)
 
         self.goal_conditions = get_goal_conditions(
-            self.conds, QuietTrivialBackend(), self.scope,
-            generate_ground_options=False)
-        self._ground_atoms: Optional[list] = None
+            self.conds, QuietTrivialBackend(), self.scope, generate_ground_options=False
+        )
+        self._ground_options: Optional[list[list]] = None
+        self._ground_formula_options: Optional[list[list]] = None
 
     # ------------------------------------------------------------------ #
     # queries
@@ -442,8 +486,11 @@ class SymbolicWorld:
                 break
             seen.add(cur)
             pred, parent = sup
-            if (pred == "inside" and "openable" in properties_of(parent)
-                    and not self.sim.get_open((self.scope[parent],))):
+            if (
+                pred == "inside"
+                and "openable" in properties_of(parent)
+                and not self.sim.get_open((self.scope[parent],))
+            ):
                 out.append(parent)
             cur = parent
         return out
@@ -452,8 +499,10 @@ class SymbolicWorld:
         """Objects a substance system fills or covers -- the only location a
         substance has. An empty list means the system is not localized anywhere,
         which is the normal state for a system the task has yet to use."""
-        return sorted({a for a, b in self.sim.filled if b == substance}
-                      | {a for a, b in self.sim.covered if b == substance})
+        return sorted(
+            {a for a, b in self.sim.filled if b == substance}
+            | {a for a, b in self.sim.covered if b == substance}
+        )
 
     def holds(self, predicate: str, args: list) -> bool:
         """Evaluate ONE ground atom against the current literal set.
@@ -476,8 +525,10 @@ class SymbolicWorld:
         if not self.goal_conditions:
             return {"satisfied": [], "unsatisfied": []}
         _, status = evaluate_goal_conditions(self.goal_conditions)
-        return {"satisfied": list(status.get("satisfied", [])),
-                "unsatisfied": list(status.get("unsatisfied", []))}
+        return {
+            "satisfied": list(status.get("satisfied", [])),
+            "unsatisfied": list(status.get("unsatisfied", [])),
+        }
 
     def is_success(self) -> bool:
         gs = self.goal_status()
@@ -499,13 +550,140 @@ class SymbolicWorld:
         Compiled lazily: ``generate_ground_options=True`` enumerates the quantifier
         expansions, and nothing on the rollout path needs it.
         """
-        if self._ground_atoms is None:
-            grounded = get_goal_conditions(self.conds, QuietTrivialBackend(),
-                                           self.scope, generate_ground_options=True)
+        return self.ground_goal_options()[0]
+
+    def ground_goal_options(self) -> list[list]:
+        """Return every accepted fully-ground goal option.
+
+        Quantified BDDL goals frequently admit several equivalent bindings.  The
+        policy prompt deliberately renders only the first option, while the real
+        evaluator accepts any option.  Audits that decide whether two same-category
+        objects are interchangeable must therefore inspect the complete option set;
+        comparing only the rendered option would turn a valid alternative binding
+        into a false identity ambiguity.
+        """
+        if self._ground_options is None:
+            grounded = get_goal_conditions(
+                self.conds,
+                QuietTrivialBackend(),
+                self.scope,
+                generate_ground_options=True,
+            )
             options = get_ground_goal_state_options(
-                self.conds, QuietTrivialBackend(), self.scope, grounded)
-            self._ground_atoms = [list(getattr(a, "body", a)) for a in options[0]]
-        return self._ground_atoms
+                self.conds, QuietTrivialBackend(), self.scope, grounded
+            )
+            self._ground_formula_options = options
+            self._ground_options = [
+                [list(getattr(atom, "body", atom)) for atom in option]
+                for option in options
+            ]
+        return self._ground_options
+
+    def ground_goal_progress(self) -> dict:
+        """Best semantic grounded-atom coverage under the current BDDL state.
+
+        BDDL caps materialized goal options at 20, which omits valid permutations in
+        several tasks. Walk the compiled expression tree instead: conjunctions and
+        universals accumulate atoms, disjunctions/existentials choose their best
+        branch, and pair quantifiers choose the best distinct matching. Atomic
+        predicates still call BDDL's evaluator, preserving negation and entailments.
+        """
+        counts = [
+            self._expression_progress(condition) for condition in self.goal_conditions
+        ]
+        satisfied = sum(value[0] for value in counts)
+        total = sum(value[1] for value in counts)
+        if not total:
+            return {
+                "atom_coverage": 0.0,
+                "atom_satisfied": 0,
+                "atom_goal": 0,
+                "atom_options": 0,
+            }
+        return {
+            "atom_coverage": satisfied / total,
+            "atom_satisfied": satisfied,
+            "atom_goal": total,
+            "atom_options": len(self.ground_goal_options()),
+        }
+
+    @staticmethod
+    def _better_progress(
+        left: tuple[int, int], right: tuple[int, int]
+    ) -> tuple[int, int]:
+        """Choose higher coverage, then more satisfied atoms, then more evidence."""
+        return max(
+            (left, right),
+            key=lambda value: (
+                value[0] / value[1] if value[1] else 0.0,
+                value[0],
+                value[1],
+            ),
+        )
+
+    def _matching_progress(self, matrix: list[list], required: int) -> tuple[int, int]:
+        """Best distinct row/column assignment for a BDDL pair quantifier."""
+        best: tuple[int, int] | None = None
+
+        def visit(
+            row: int, used: frozenset[int], selected: int, score: tuple[int, int]
+        ):
+            nonlocal best
+            if selected == required:
+                best = score if best is None else self._better_progress(best, score)
+                return
+            if row >= len(matrix) or len(matrix) - row < required - selected:
+                return
+            visit(row + 1, used, selected, score)
+            for column, child in enumerate(matrix[row]):
+                if column in used:
+                    continue
+                sat, total = self._expression_progress(child)
+                visit(
+                    row + 1,
+                    used | {column},
+                    selected + 1,
+                    (score[0] + sat, score[1] + total),
+                )
+
+        visit(0, frozenset(), 0, (0, 0))
+        return best or (0, max(required, 1))
+
+    def _expression_progress(self, expression) -> tuple[int, int]:
+        """Return ``(satisfied atoms, atoms in the selected semantic option)``."""
+        if isinstance(expression, AtomicFormula):
+            return int(bool(expression.evaluate())), 1
+        name = type(expression).__name__
+        if name == "HEAD":
+            return self._expression_progress(expression.children[0])
+        if name in {"Conjunction", "Universal"}:
+            parts = [self._expression_progress(child) for child in expression.children]
+            return sum(part[0] for part in parts), sum(part[1] for part in parts)
+        if name in {"Disjunction", "Existential"}:
+            best = (0, 0)
+            for child in expression.children:
+                best = self._better_progress(best, self._expression_progress(child))
+            return best
+        if name == "NQuantifier":
+            parts = sorted(
+                (self._expression_progress(child) for child in expression.children),
+                key=lambda value: (
+                    value[0] / value[1] if value[1] else 0.0,
+                    value[0],
+                ),
+                reverse=True,
+            )[: expression.N]
+            return sum(part[0] for part in parts), sum(part[1] for part in parts)
+        if name in {"ForPairs", "ForNPairs"}:
+            required = (
+                int(expression.N)
+                if name == "ForNPairs"
+                else min(len(expression.children), len(expression.children[0]))
+            )
+            return self._matching_progress(expression.children, required)
+        # Negation and implication are logical requirements rather than additive
+        # positive subgoals. Their own evaluator is the authoritative truth value.
+        return int(bool(expression.evaluate())), 1
 
     def goal_predicates(self) -> set:
         """Predicate names appearing anywhere in the compiled goal."""
@@ -547,19 +725,33 @@ class SymbolicACI:
     # Reading down a column isolates DISTRACTORS; reading across a row isolates
     # REFERENCE RESOLUTION. Occlusion belongs to the detect family only, so it is
     # constant within each row and within each column -- never a difference term.
-    CAMERA_MODES = ("fov", "fov_distract", "detect", "detect_scope")
-    DETECT_MODES = ("detect", "detect_scope")          # handle/box selection
-    DISTRACTOR_MODES = ("fov_distract", "detect")      # furniture is REPORTED
+    PRIMITIVE_CAMERA_MODES = ("fov", "fov_distract", "detect", "detect_scope")
+    EPISODE_SCAN_MODES = ("detect_scope_scan",)
+    MEMORY_SCAN_MODES = ("detect_scope_memory",)
+    SCAN_MODES = EPISODE_SCAN_MODES + MEMORY_SCAN_MODES
+    CAMERA_MODES = PRIMITIVE_CAMERA_MODES + SCAN_MODES
+    DETECT_MODES = ("detect", "detect_scope") + SCAN_MODES
+    DISTRACTOR_MODES = ("fov_distract", "detect")  # furniture is REPORTED
     OBS_MODES = ("full", "partial", "object") + CAMERA_MODES
+    SELECTION_MODES = ("handle", "bbox")
 
-    def __init__(self, world: SymbolicWorld, obs_mode: str = "full",
-                 layout_prefer: str = "sampled", reason_mode: str = "terse"):
+    def __init__(
+        self,
+        world: SymbolicWorld,
+        obs_mode: str = "full",
+        layout_prefer: str = "sampled",
+        reason_mode: str = "terse",
+        selection_mode: str = "handle",
+        layout_source_selection: str | None = None,
+    ):
         assert obs_mode in self.OBS_MODES, obs_mode
         assert reason_mode in ("verbose", "terse", "silent"), reason_mode
+        assert selection_mode in self.SELECTION_MODES, selection_mode
         self.reason_mode = reason_mode
         self.world = world
         self.obs_mode = obs_mode
-        self._held: Optional[str] = None          # scope name
+        self.selection_mode = selection_mode
+        self._held: Optional[str] = None  # scope name
         self._resolve_error: Optional[str] = None  # why the last selection failed
         # Start where the agent's own initial condition puts it, so the first
         # `observe` is not an empty room in partial mode.
@@ -571,18 +763,32 @@ class SymbolicACI:
         # is what keeps the 0801 baselines reproducible.
         self.layout = None
         self.view = None
-        self._dets: list = []          # detect modes: last observation
+        self._dets: list = []  # detect modes: last observation
         self._det_audit: dict[str, set[str]] = {}  # cumulative detector-stage evidence
-        self._view_epoch = 0           # bumped by any camera mutation
-        self._det_epoch = -1           # epoch the handles in `_dets` belong to
-        self._furn: dict = {}          # fov_distract: display name -> SceneObject
+        self._view_epoch = 0  # bumped by any camera mutation
+        self._det_epoch = (-1, -1)  # (view, world) revision of `_dets`
+        self._observation_state = None
+        self._observation_shape_overrides: dict[str, tuple] = {}
+        self._fixed_base_scope: frozenset[str] = frozenset()
+        self._scan_candidates: tuple[str, ...] = ()
+        self._scan_tracks: dict[str, str] = {}
+        self._scene_id: str | None = None
+        self._scene_landmarks: dict[str, object] = {}
+        self._view_landmark: str | None = None
+        self._scan_index = 0
+        self._scan_last: int | None = None
+        self._scan_cycle = 0
+        self._furn: dict = {}  # fov_distract: display name -> SceneObject
         if obs_mode in self.CAMERA_MODES:
+            from rlinf.envs.behavior.dynamic_observation import DynamicObservationState
             from rlinf.envs.behavior.layout import build_layout
             from rlinf.envs.behavior.viewpoint import Viewpoint
+
             self.layout = build_layout(
                 world.activity,
                 world,
                 prefer=layout_prefer,
+                source_selection=layout_source_selection,
                 # Detect needs the paired template to recover the concrete asset
                 # model for each scope name. Local tro_state-only samples cannot
                 # satisfy that contract and must not fall back to category medians.
@@ -601,8 +807,54 @@ class SymbolicACI:
                 raise ValueError(
                     f"obs_mode={obs_mode} requires a sampled instance for "
                     f"{world.activity!r}; none found. Generate one with "
-                    f"rlinf/envs/behavior/instance_generator.py.")
+                    f"rlinf/envs/behavior/instance_generator.py."
+                )
+            self._observation_state = DynamicObservationState(
+                self.layout.xyz,
+                self.layout.orientation,
+            )
+            from rlinf.envs.behavior.detect import scope_fixed_base
+
+            self._fixed_base_scope = scope_fixed_base(self.layout.instance_path)
             self.view = Viewpoint(x=self.layout.robot_xy[0], y=self.layout.robot_xy[1])
+            if obs_mode in self.SCAN_MODES:
+                # Freeze a target-independent discovery route once at reset.  Scope
+                # names select oracle viewpoints internally but are never returned;
+                # sorting makes the route independent of the goal atom currently
+                # being pursued.  Objects without sampled visual geometry (normally
+                # substances/future products) cannot define a camera waypoint.
+                track_names = sorted(
+                    name for name in world.scope_names if name != world.agent
+                )
+                self._scan_tracks = {
+                    name: f"s{index + 1}" for index, name in enumerate(track_names)
+                }
+                self._scan_candidates = tuple(
+                    name
+                    for name in track_names
+                    if self._observation_bbox(name, include_hidden=True) is not None
+                )
+            if obs_mode in self.MEMORY_SCAN_MODES:
+                from rlinf.envs.behavior.detect import scene_furniture
+
+                self._scene_id = (
+                    "scene-"
+                    + hashlib.sha256((self.layout.scene or "").encode()).hexdigest()[
+                        :10
+                    ]
+                )
+                self._scene_landmarks = {
+                    f"l{index + 1}": item
+                    for index, item in enumerate(
+                        sorted(
+                            scene_furniture(self.layout.scene or ""),
+                            key=lambda x: x.name,
+                        )
+                    )
+                }
+                self._view_landmark = self._nearest_landmark(
+                    (self.view.x, self.view.y, 0.0)
+                )
             if obs_mode == "fov_distract":
                 self._furn = self._name_furniture()
 
@@ -638,7 +890,58 @@ class SymbolicACI:
             out[disp] = so
         return out
 
-    def _resolve(self, name) -> Optional[str]:
+    def _nearest_landmark(self, position: tuple | None) -> str | None:
+        """Scene-stable public landmark nearest to a sampled position.
+
+        Landmark order is derived only from the immutable scene registry, never the
+        activity scope or goal. Raw registry names and asset model ids stay private;
+        the policy receives only an anonymous scene-local ``lN`` identifier.
+        """
+        if position is None or not self._scene_landmarks:
+            return None
+        return min(
+            self._scene_landmarks,
+            key=lambda key: math.hypot(
+                self._scene_landmarks[key].pos[0] - position[0],
+                self._scene_landmarks[key].pos[1] - position[1],
+            ),
+        )
+
+    def _landmark_payload(self, landmark: str | None) -> dict | None:
+        if landmark is None or landmark not in self._scene_landmarks:
+            return None
+        item = self._scene_landmarks[landmark]
+        return {
+            "id": landmark,
+            "category": item.category,
+            "room": item.room,
+        }
+
+    def _observation_epoch(self) -> tuple[int, int]:
+        world_revision = (
+            self._observation_state.revision
+            if self._observation_state is not None
+            else 0
+        )
+        return self._view_epoch, world_revision
+
+    def _pos(self, name: str) -> Optional[tuple]:
+        """Current observation pose, including post-action symbolic overrides."""
+        if self._observation_state is None:
+            return None
+        return self._observation_state.position(name)
+
+    def _orientation(self, name: str) -> tuple:
+        if self._observation_state is None:
+            return (0.0, 0.0, 0.0, 1.0)
+        return self._observation_state.orientation(name)
+
+    def _commit_visual_mutation(self) -> None:
+        """Invalidate detections after one successful visual world transition."""
+        if self._observation_state is not None:
+            self._observation_state.commit()
+
+    def _resolve(self, name, *, allow_held: bool = False) -> Optional[str]:
         """Selection -> scope name, or None.
 
         In the `detect` family the argument is a view-local handle (`"d3"`) or a box
@@ -656,9 +959,33 @@ class SymbolicACI:
             return None
         if self.obs_mode in self.DETECT_MODES:
             from rlinf.envs.behavior.detect import resolve as _resolve_det
-            if self._det_epoch != self._view_epoch:
-                self._resolve_error = ("your last observation is stale; "
-                                       "observe again before selecting")
+
+            if name == "held":
+                if allow_held and self._held is not None:
+                    return self._held
+                self._resolve_error = (
+                    "held is only valid for the movable argument while holding an object"
+                    if self._held is not None
+                    else "not holding anything"
+                )
+                return None
+            if self._det_epoch != self._observation_epoch():
+                self._resolve_error = (
+                    "your last observation is stale; observe again before selecting"
+                )
+                return None
+            is_handle = name.startswith("d") and name[1:].isdigit()
+            if self.selection_mode == "handle" and not is_handle:
+                self._resolve_error = (
+                    "selection_mode=handle requires a dN reference from the current "
+                    "observation"
+                )
+                return None
+            if self.selection_mode == "bbox" and is_handle:
+                self._resolve_error = (
+                    "selection_mode=bbox requires a point or box from the current "
+                    "observation"
+                )
                 return None
             det, err = _resolve_det(name, self._dets)
             if det is None:
@@ -670,10 +997,12 @@ class SymbolicACI:
             # Unreachable under `detect_scope`, which reports no furniture -- kept
             # anyway so the two modes differ in what is REPORTED and nothing else.
             if not det.key.startswith("scope:"):
-                self._resolve_error = (f"that is a {det.category}; it is scene furniture "
-                                       f"and no tool applies to it")
+                self._resolve_error = (
+                    f"that is a {det.category}; it is scene furniture "
+                    f"and no tool applies to it"
+                )
                 return None
-            return det.key[len("scope:"):]
+            return det.key[len("scope:") :]
         if name in self.world.from_display:
             return self.world.from_display[name]
         if name in self.world.scope:
@@ -683,8 +1012,10 @@ class SymbolicACI:
         # end in both. Checked AFTER the scope, so a name the scope claims is never
         # shadowed.
         if name in self._furn:
-            self._resolve_error = (f"that is a {self._furn[name].category}; it is scene "
-                                   f"furniture and no tool applies to it")
+            self._resolve_error = (
+                f"that is a {self._furn[name].category}; it is scene "
+                f"furniture and no tool applies to it"
+            )
             return None
         return None
 
@@ -711,6 +1042,109 @@ class SymbolicACI:
         sup_at = self.world.support_of(self._at)
         return bool(sup_at and sup_at[1] == name)
 
+    def _observation_shape(self, name: str):
+        """Return ``(bbox-centre offset, world AABB half-extent)`` for @name.
+
+        The position stored by BEHAVIOR is the root link, while projection uses the
+        native bbox centre.  Transition-created poses must preserve that distinction
+        or every moved object receives its model offset twice.
+        """
+        if name in self._observation_shape_overrides:
+            return self._observation_shape_overrides[name]
+        if self.layout is None:
+            return None
+        from rlinf.envs.behavior.detect import (
+            extent_for_category,
+            extent_for_model,
+            offset_for_model,
+            scope_assets,
+            scope_models,
+            world_bbox,
+        )
+
+        assets = (
+            scope_assets(self.layout.instance_path) if self.layout.instance_path else {}
+        )
+        models = (
+            scope_models(self.layout.instance_path) if self.layout.instance_path else {}
+        )
+        asset = assets.get(name)
+        model = models.get(name)
+        category = _word(synset_of(name))
+        scale = asset["scale"] if asset else (1.0, 1.0, 1.0)
+        extent = (extent_for_model(model) if model else None) or extent_for_category(
+            category
+        )
+        if extent is None:
+            return None
+        offset = offset_for_model(model) if model else (0.0, 0.0, 0.0)
+        centre_offset, world_extent = world_bbox(
+            (0.0, 0.0, 0.0),
+            extent,
+            local_offset=offset,
+            scale=scale,
+            orientation=self._orientation(name),
+        )
+        return centre_offset, world_extent
+
+    def _observation_bbox(self, name: str, *, include_hidden: bool = False):
+        if self._observation_state is None:
+            return None
+        root = (
+            self._observation_state.last_position(name)
+            if include_hidden
+            else self._observation_state.position(name)
+        )
+        shape = self._observation_shape(name)
+        if root is None or shape is None:
+            return None
+        offset, extent = shape
+        centre = tuple(float(root[i]) + float(offset[i]) for i in range(3))
+        return centre, extent
+
+    def _root_for_bbox_center(self, name: str, centre) -> Optional[tuple]:
+        shape = self._observation_shape(name)
+        if shape is None:
+            return None
+        offset, _ = shape
+        return tuple(float(centre[i]) - float(offset[i]) for i in range(3))
+
+    def _placement_root(self, name: str, target: str, relation: str) -> Optional[tuple]:
+        """Prepare a deterministic post-action root pose without publishing it."""
+        if self._observation_state is None:
+            return None
+        target_box = self._observation_bbox(target)
+        object_shape = self._observation_shape(name)
+        if target_box is None or object_shape is None:
+            return None
+        target_center, target_extent = target_box
+        _, object_extent = object_shape
+        desired_center = self._observation_state.target_relative_center(
+            name,
+            target,
+            relation,
+            target_center=target_center,
+            target_extent=target_extent,
+            object_extent=object_extent,
+            slot=self._observation_state.next_placement_slot(target, relation),
+        )
+        return self._root_for_bbox_center(name, desired_center)
+
+    def _release_root(self, name: str, ground: Optional[str]) -> Optional[tuple]:
+        if self._observation_state is None:
+            return None
+        if ground is not None:
+            root = self._placement_root(name, ground, "ontop")
+            if root is not None:
+                return root
+        last = self._observation_state.last_position(name)
+        z = float(last[2]) if last is not None else 0.1
+        return (
+            float(self.view.x) + 0.6 * math.cos(float(self.view.yaw)),
+            float(self.view.y) + 0.6 * math.sin(float(self.view.yaw)),
+            z,
+        )
+
     # `SemanticACI` exposes these directly, and callers such as
     # `rft_sample.rollout_once` reach for them on the ACI rather than the world.
     # Delegating keeps the two ACIs substitutable.
@@ -727,9 +1161,13 @@ class SymbolicACI:
         # re-running `observe()` here silently re-issued the view-local handles, so
         # `turn_left` refreshed the very handles it was supposed to invalidate.
         obs = None if self.obs_mode in self.DETECT_MODES else self.observe()
-        return ToolResult(ok=ok, tool=tool, args=args,
-                          reason=reason if ok else self._refusal(reason),
-                          observation=obs)
+        return ToolResult(
+            ok=ok,
+            tool=tool,
+            args=args,
+            reason=reason if ok else self._refusal(reason),
+            observation=obs,
+        )
 
     def _refusal(self, reason: str) -> str:
         """Apply `reason_mode` to a refusal. Every refusal funnels through here.
@@ -768,11 +1206,20 @@ class SymbolicACI:
         """
         made = producer_of(self.world, scope_name)
         if made is None:
-            return (f"{name} does not exist yet (it is a future object) and no tool "
-                    f"in this environment creates it")
+            return (
+                f"{name} does not exist yet (it is a future object) and no tool "
+                f"in this environment creates it"
+            )
         whole, how = made
-        return (f"{name} does not exist yet (it is a future object); "
-                f"{how}({self._disp(whole)}) creates it")
+        if self.obs_mode in self.DETECT_MODES:
+            return (
+                "selected object does not exist yet (it is a future object); "
+                f"the {how} transform creates it from its source object"
+            )
+        return (
+            f"{name} does not exist yet (it is a future object); "
+            f"{how}({self._disp(whole)}) creates it"
+        )
 
     def _require(self, tool, args, name, prop=None, prop_msg=""):
         """Resolve @name and check existence / realness / proximity / property.
@@ -784,28 +1231,44 @@ class SymbolicACI:
         scope_name = self._resolve(name)
         if scope_name is None:
             return None, self._result(
-                False, tool, args,
-                self._resolve_error or f"no such object {name!r}")
+                False, tool, args, self._resolve_error or f"no such object {name!r}"
+            )
         if not self.world.is_real(scope_name):
-            return None, self._result(False, tool, args, self._future_reason(name,
-                                                                            scope_name))
+            return None, self._result(
+                False, tool, args, self._future_reason(name, scope_name)
+            )
         if not self._is_near(scope_name):
             return None, self._result(
-                False, tool, args,
-                f"precondition failed: not near {name}; go_to({name}) first")
+                False,
+                tool,
+                args,
+                f"precondition failed: not near {name}; go_to({name}) first",
+            )
         # You cannot reach through a shut door. Without this the `object` obs mode is
         # decorative: an `atoms` goal names the object, so a policy could grasp it out
         # of a closed fridge it was never shown. This is a DYNAMICS change and applies
         # in every obs mode -- observability and reachability must not disagree.
         shut = self.world.enclosing_closed(scope_name)
         if shut:
+            if self.obs_mode in self.DETECT_MODES:
+                return None, self._result(
+                    False,
+                    tool,
+                    args,
+                    "precondition failed: selected object is shut inside an "
+                    "enclosing container; observe and open that container first",
+                )
             return None, self._result(
-                False, tool, args,
+                False,
+                tool,
+                args,
                 f"precondition failed: {name} is shut inside "
-                f"{self._disp(shut[0])}; open({self._disp(shut[0])}) first")
+                f"{self._disp(shut[0])}; open({self._disp(shut[0])}) first",
+            )
         if prop is not None and prop not in properties_of(scope_name):
-            return None, self._result(False, tool, args,
-                                      f"precondition failed: {name} is not {prop_msg}")
+            return None, self._result(
+                False, tool, args, f"precondition failed: {name} is not {prop_msg}"
+            )
         return scope_name, None
 
     # ------------------------------------------------------------------ #
@@ -838,7 +1301,9 @@ class SymbolicACI:
         # support relation is the real spatial information this layer has.
         sup = self.world.support_of(name)
         if sup:
-            report["on_top_of" if sup[0] == "ontop" else "inside_of"] = self._disp(sup[1])
+            report["on_top_of" if sup[0] == "ontop" else "inside_of"] = self._disp(
+                sup[1]
+            )
         room = self.world.room_of(name)
         if room:
             report["room"] = room
@@ -872,7 +1337,7 @@ class SymbolicACI:
             # through a closed fridge door any more than `object` mode can.
             if self.world.enclosing_closed(name):
                 return False
-            pos = self.layout.pos(name)
+            pos = self._pos(name)
             if pos is None:
                 # No coordinates -- substances with no host. They are scene-global in
                 # BEHAVIOR rather than objects sitting somewhere, so a viewpoint gate
@@ -889,7 +1354,8 @@ class SymbolicACI:
                 # failure mode this file refuses to leave reachable.
                 hosts = [h for h in self.world.hosts_of(name) if h not in seen]
                 return (not self.world.hosts_of(name)) or any(
-                    self._visible(h, here, (*seen, name)) for h in hosts)
+                    self._visible(h, here, (*seen, name)) for h in hosts
+                )
         return self.world.room_of(name) == here
 
     def observe(self) -> dict:
@@ -901,9 +1367,14 @@ class SymbolicACI:
         if self.obs_mode in self.DETECT_MODES:
             return self._observe_detect()
         here = self.world.room_of(self._at) if self._at else None
-        names = [n for n in self.world.scope_names
-                 if n != self.world.agent and self.world.is_real(n)
-                 and self._visible(n, here)]
+        names = [
+            n
+            for n in self.world.scope_names
+            if n != self.world.agent
+            and self.world.is_real(n)
+            and not (self.obs_mode in self.CAMERA_MODES and n == self._held)
+            and self._visible(n, here)
+        ]
         objs = [self._obj_report(name) for name in names]
         out = {
             "obs_mode": self.obs_mode,
@@ -920,13 +1391,16 @@ class SymbolicACI:
             out["view"] = self.view.state()
             metric = self.layout.is_real
             for rep, name in zip(objs, names):
-                pos = self.layout.pos(name)
+                pos = self._pos(name)
                 if pos is not None:
                     rep["where"] = self.view.describe(pos, metric)
             # Say which it is. A policy reading "2.3 m" off a generated layout would
             # be reading an invention; under `generated` no metre value is emitted at
             # all, and this field says why.
-            out["geometry"] = "measured" if metric else "schematic"
+            geometry = "measured" if metric else "schematic"
+            if self._observation_state.has_symbolic_geometry:
+                geometry += "+symbolic_transition"
+            out["geometry"] = geometry
             if self.obs_mode == "fov_distract":
                 out["objects"] = self._merge_furniture(objs, names)
         return out
@@ -956,18 +1430,26 @@ class SymbolicACI:
             # `in_rooms` loses its index below: the scope side reports `living_room`
             # from the BDDL annotation, and `living_room_0` would be a giveaway of a
             # different kind. Both are presentation, and neither changes a fact.
-            rep = {"name": name, "category": so.category, "is_near": False,
-                   "states": ({"Open": so.is_open} if so.openable else {})}
+            rep = {
+                "name": name,
+                "category": so.category,
+                "is_near": False,
+                "states": ({"Open": so.is_open} if so.openable else {}),
+            }
             if so.room:
-                rep["room"] = so.room.rsplit("_", 1)[0] if so.room[-1].isdigit() \
-                    else so.room
+                rep["room"] = (
+                    so.room.rsplit("_", 1)[0] if so.room[-1].isdigit() else so.room
+                )
             rep["where"] = self.view.describe(so.pos, self.layout.is_real)
             rows.append(rep)
-        pos_of = {n: self.layout.pos(n) for n in names}
+        pos_of = {n: self._pos(n) for n in names}
 
         def _key(rep):
-            p = (self._furn[rep["name"]].pos if rep["name"] in self._furn
-                 else pos_of.get(self.world.from_display.get(rep["name"])))
+            p = (
+                self._furn[rep["name"]].pos
+                if rep["name"] in self._furn
+                else pos_of.get(self.world.from_display.get(rep["name"]))
+            )
             # No coordinates (an unlocalized substance) sorts last rather than
             # crashing or being given an invented distance.
             return (1, 0.0) if p is None else (0, self.view.range_to(p))
@@ -995,18 +1477,10 @@ class SymbolicACI:
         """
         from rlinf.envs.behavior.detect import (
             detect,
-            extent_for_category,
-            extent_for_model,
-            offset_for_model,
             scene_furniture,
-            scope_assets,
-            scope_models,
             scope_scene_names,
-            world_bbox,
         )
 
-        assets = scope_assets(self.layout.instance_path or "")
-        models = scope_models(self.layout.instance_path or "")
         bound_scene_names = scope_scene_names(self.layout.instance_path or "")
 
         entries = []
@@ -1017,42 +1491,21 @@ class SymbolicACI:
             self._det_audit.setdefault(audit_key, set()).add("target")
             if self.world.enclosing_closed(name):
                 self._det_audit[audit_key].add("closed_container")
-                continue                  # a shut container hides its contents
-            pos = self.layout.pos(name)
-            if pos is None:
+                continue  # a shut container hides its contents
+            bbox = self._observation_bbox(name)
+            if bbox is None:
                 event = (
                     "nonvisual_substance"
                     if "substance" in properties_of(name)
-                    else "missing_pose"
+                    else "missing_pose_or_extent"
                 )
                 self._det_audit[audit_key].add(event)
-                continue                  # substances have no location by construction
-            cat = _word(synset_of(name))
-            # Size comes from the asset, per MODEL where the instance recorded one and
-            # per category otherwise -- never from a hand-written table. An object we
-            # cannot size is omitted rather than guessed, because a wrong size is
-            # silently wrong: it changes what occludes what and what is visible from
-            # where.
-            asset = assets.get(name)
-            scale = asset["scale"] if asset else (1.0, 1.0, 1.0)
-            ext = (extent_for_model(models[name]) if name in models else None) \
-                or extent_for_category(cat)
-            if ext is None:
-                self._det_audit[audit_key].add("missing_extent")
                 continue
-            # The instance file records the BASE LINK pose; the bbox is centred at
-            # pose + the ROTATED ig:offsetBaseLink. Its local extents must likewise
-            # be rotated into a conservative world AABB.
-            off = offset_for_model(models[name]) if name in models else (0.0, 0.0, 0.0)
-            centre, ext = world_bbox(
-                pos,
-                ext,
-                local_offset=off,
-                scale=scale,
-                orientation=self.layout.orientation.get(name, (0.0, 0.0, 0.0, 1.0)),
-            )
+            cat = _word(synset_of(name))
+            centre, ext = bbox
             entries.append((f"scope:{name}", cat, centre, ext))
-        for i, so in enumerate(scene_furniture(self.layout.scene or "")):
+        furniture = scene_furniture(self.layout.scene or "")
+        for i, so in enumerate(furniture):
             if so.name in bound_scene_names:
                 # The same physical object is already represented by its scope
                 # entry. Keeping both boxes makes an exact self-occluder and can
@@ -1084,26 +1537,167 @@ class SymbolicACI:
             audit=self._det_audit,
             occlusion_exempt_pairs=frozenset(exempt_pairs),
         )
-        if self.obs_mode == "detect_scope":
+        if self.obs_mode in ("detect_scope", *self.SCAN_MODES):
             kept = [d for d in dets if d.key.startswith("scope:")]
             # Renumber, or the handles carry gaps (d2, d5, d9) that leak how many
             # detections were withheld -- and the count of hidden furniture is a
             # signal `detect` does not give either.
-            dets = [dataclasses.replace(d, det=f"d{i + 1}")
-                    for i, d in enumerate(kept)]
+            dets = [dataclasses.replace(d, det=f"d{i + 1}") for i, d in enumerate(kept)]
         self._dets = dets
-        self._det_epoch = self._view_epoch
-        return {
+        self._det_epoch = self._observation_epoch()
+
+        def policy_detection(det):
+            states = {}
+            if det.key.startswith("scope:"):
+                scope_name = det.key[len("scope:") :]
+                if "openable" in properties_of(scope_name):
+                    states["Open"] = bool(
+                        self.world.sim.get_open((self.world.scope[scope_name],))
+                    )
+            elif det.key.startswith("scene:"):
+                index = int(det.key[len("scene:") :])
+                if furniture[index].openable:
+                    states["Open"] = bool(furniture[index].is_open)
+            row = {
+                "category": det.category,
+                "score": det.score,
+                "states": states,
+            }
+            if self.obs_mode in self.SCAN_MODES and det.key.startswith("scope:"):
+                row["track"] = self._scan_tracks[scope_name]
+            if self.obs_mode in self.MEMORY_SCAN_MODES and det.key.startswith("scope:"):
+                row["landmark"] = self._nearest_landmark(self._pos(scope_name))
+            if self.selection_mode == "handle":
+                row = {"det": det.det, **row}
+            else:
+                row = {"bbox": list(det.bbox), **row}
+            return row
+
+        geometry = "sampled_initial" if self.layout.is_real else "generated_initial"
+        if self._observation_state.has_symbolic_geometry:
+            geometry += "+symbolic_transition"
+        view = self.view.state()
+        if self.obs_mode in self.SCAN_MODES:
+            view["scan"] = {
+                "last": self._scan_last,
+                "next": self._scan_index + 1 if self._scan_candidates else None,
+                "total": len(self._scan_candidates),
+                "cycle": self._scan_cycle,
+            }
+        if self.obs_mode in self.MEMORY_SCAN_MODES:
+            view["scene_id"] = self._scene_id
+            view["landmark"] = self._landmark_payload(self._view_landmark)
+        observation = {
             "obs_mode": self.obs_mode,
-            "view": self.view.state(),
-            "held": bool(self._held),
-            "geometry": "measured" if self.layout.is_real else "schematic",
-            "detections": [
-                {"det": d.det, "bbox": list(d.bbox), "category": d.category,
-                 "score": d.score}
-                for d in self._dets
-            ],
+            "selection_mode": self.selection_mode,
+            "view": view,
+            "held": (
+                {"ref": "held", "category": _word(synset_of(self._held))}
+                if self._held is not None
+                else None
+            ),
+            "geometry": geometry,
+            "detections": [policy_detection(d) for d in self._dets],
         }
+        if self.obs_mode in self.MEMORY_SCAN_MODES:
+            observation["identity"] = {
+                "scene_scope": "session",
+                "object_track_scope": "activity",
+            }
+        return observation
+
+    def _choose_detect_approach(self, scope_name: str) -> None:
+        """Place oracle navigation at a view that can reacquire its selected target.
+
+        ``go_to`` is already an oracle navigation primitive. Its postcondition must
+        therefore be stronger than geometric proximity: the selected object should
+        be observable again, otherwise every legal handle expires on arrival with no
+        way to continue. For an open container, prefer a view exposing more current
+        descendants, which models standing in front of its opening without claiming
+        articulated door geometry.
+
+        Candidate projection is internal route planning. Detections are discarded;
+        the policy must call ``observe`` and receives no hidden handle or identity.
+        """
+        if self.obs_mode not in self.DETECT_MODES:
+            return
+        bbox = self._observation_bbox(scope_name)
+        if bbox is None:
+            return
+        centre, extent = bbox
+        fallback = (
+            self.view.x,
+            self.view.y,
+            self.view.yaw,
+            self.view.pitch,
+        )
+        descendants = set()
+        for candidate in self.world.scope_names:
+            child = candidate
+            seen = set()
+            while child not in seen:
+                seen.add(child)
+                support = self.world.support_of(child)
+                if support is None:
+                    break
+                if support[1] == scope_name:
+                    descendants.add(candidate)
+                    break
+                child = support[1]
+
+        prefer_descendants = "openable" in properties_of(scope_name) and bool(
+            self.world.sim.get_open((self.world.scope[scope_name],))
+        )
+        scored_descendants = descendants if prefer_descendants else set()
+
+        origin = (self.view.x, self.view.y)
+        radius = max(1.2, math.hypot(extent[0], extent[1]) + 0.6)
+        best = None
+        for ring_offset in (0.0, 1.0, 2.0):
+            for angle_index in range(16):
+                angle = angle_index * math.pi / 8.0
+                x = centre[0] + (radius + ring_offset) * math.cos(angle)
+                y = centre[1] + (radius + ring_offset) * math.sin(angle)
+                yaw = math.atan2(centre[1] - y, centre[0] - x)
+                for pitch_deg in (0, -30, -60, 30, 60):
+                    self.view.teleport(x, y, yaw)
+                    self.view.pitch = math.radians(pitch_deg)
+                    self._observe_detect()
+                    visible = {
+                        item.key[len("scope:") :]
+                        for item in self._dets
+                        if item.key.startswith("scope:")
+                    }
+                    if scope_name not in visible:
+                        continue
+                    score = (
+                        len(visible & scored_descendants),
+                        -((x - origin[0]) ** 2 + (y - origin[1]) ** 2),
+                    )
+                    if best is None or score > best[0]:
+                        best = (score, x, y, yaw, math.radians(pitch_deg))
+                    if not scored_descendants:
+                        break
+                if best is not None and not scored_descendants:
+                    break
+            if best is not None and not scored_descendants:
+                break
+        if best is not None:
+            _, x, y, yaw, pitch = best
+            self.view.teleport(x, y, yaw)
+            self.view.pitch = pitch
+        else:
+            x, y, yaw, pitch = fallback
+            self.view.teleport(x, y, yaw)
+            self.view.pitch = pitch
+        if self.obs_mode in self.MEMORY_SCAN_MODES:
+            self._view_landmark = self._nearest_landmark(centre)
+        # Never publish the route planner's internal probes. One revision bump makes
+        # every pre-navigation handle stale; only a subsequent public observe can
+        # populate a selectable frame.
+        self._view_epoch += 1
+        self._dets = []
+        self._det_epoch = (-1, -1)
 
     # ------------------------------------------------------------------ #
     # navigation
@@ -1112,20 +1706,28 @@ class SymbolicACI:
         args = {"name": name}
         scope_name = self._resolve(name)
         if scope_name is None:
-            return self._result(False, "go_to", args,
-                                self._resolve_error or f"no such object {name!r}")
+            return self._result(
+                False, "go_to", args, self._resolve_error or f"no such object {name!r}"
+            )
         if not self.world.is_real(scope_name):
-            return self._result(False, "go_to", args,
-                                self._future_reason(name, scope_name))
-        if self.obs_mode in ("fov", "fov_distract") and scope_name not in self.view.seen:
+            return self._result(
+                False, "go_to", args, self._future_reason(name, scope_name)
+            )
+        if (
+            self.obs_mode in ("fov", "fov_distract")
+            and scope_name not in self.view.seen
+        ):
             # You cannot navigate to what you have not found. This is the whole point
             # of the mode: navigation stays an oracle, DISCOVERY does not. Without it
             # the policy reads a name out of the goal and teleports to it, and the
             # camera is decoration.
             return self._result(
-                False, "go_to", args,
+                False,
+                "go_to",
+                args,
                 f"you have not seen {name} yet; look around first "
-                f"(turn_left / turn_right / move_ahead / look_down, then observe)")
+                f"(turn_left / turn_right / move_ahead / look_down, then observe)",
+            )
         self._at = scope_name
         # Keep the agent's own literal coherent with `_at`; nothing reads it today,
         # but a state dump that disagrees with the robot's position is a trap.
@@ -1146,7 +1748,7 @@ class SymbolicACI:
             # navigation model, which is what makes a cross-family comparison mean
             # anything. It also supersedes the `detect` = 0.194 of 0816; that arm is
             # re-run rather than quoted.
-            pos = self.layout.pos(scope_name)
+            pos = self._pos(scope_name)
             if pos is not None:
                 # Stop in front of the object, not at its bbox centre. The old
                 # exact-centre teleport put the camera inside cabinets/fridges and
@@ -1176,9 +1778,7 @@ class SymbolicACI:
                 yaw = math.atan2(pos[1] - camera_y, pos[0] - camera_x)
                 self.view.teleport(camera_x, camera_y, yaw)
                 if self.obs_mode in self.DETECT_MODES:
-                    # The camera moved, so every handle in the last observation
-                    # refers to a frame that no longer exists.
-                    self._view_epoch += 1
+                    self._choose_detect_approach(scope_name)
         return self._result(True, "go_to", args, f"now at {name}")
 
     # ------------------------------------------------------------------ #
@@ -1191,16 +1791,22 @@ class SymbolicACI:
         expert plan stays valid and the 17 semantic tools keep their meaning. The only
         effect is on what the next `observe()` reports -- which is the point.
         """
-        if self.obs_mode not in self.CAMERA_MODES:
-            return self._result(False, tool, {},
-                                f"{tool} needs obs_mode="
-                                f"{'|'.join(self.CAMERA_MODES)}")
+        if self.obs_mode not in self.PRIMITIVE_CAMERA_MODES:
+            return self._result(
+                False,
+                tool,
+                {},
+                f"{tool} needs obs_mode={'|'.join(self.PRIMITIVE_CAMERA_MODES)}",
+            )
         getattr(self.view, tool)()
-        self._view_epoch += 1          # every det handle just went stale
+        self._view_epoch += 1  # every det handle just went stale
         st = self.view.state()
-        return self._result(True, tool, {},
-                            f"facing {st['facing_deg']} deg, "
-                            f"pitch {st['pitch_deg']} deg")
+        return self._result(
+            True,
+            tool,
+            {},
+            f"facing {st['facing_deg']} deg, pitch {st['pitch_deg']} deg",
+        )
 
     def turn_left(self) -> ToolResult:
         return self._camera("turn_left")
@@ -1229,78 +1835,232 @@ class SymbolicACI:
     def look_down(self) -> ToolResult:
         return self._camera("look_down")
 
+    def scan_next(self) -> ToolResult:
+        """Advance a fixed public cursor and return its oracle-selected view.
+
+        The policy cannot provide a target, bearing, or hidden object identity.  The
+        controller visits every frozen visual scope waypoint in a deterministic
+        cycle and publishes the cursor in the returned view.  This deliberately
+        prices semantic planning rather than primitive camera control.
+        """
+        if self.obs_mode not in self.SCAN_MODES:
+            return self._result(
+                False,
+                "scan_next",
+                {},
+                f"scan_next needs obs_mode={'|'.join(self.SCAN_MODES)}",
+            )
+        if not self._scan_candidates:
+            return self._result(
+                False,
+                "scan_next",
+                {},
+                "no visual waypoints are available for this activity",
+            )
+        cursor = self._scan_index
+        self._choose_detect_approach(self._scan_candidates[cursor])
+        self._scan_last = cursor + 1
+        self._scan_index += 1
+        if self._scan_index == len(self._scan_candidates):
+            self._scan_index = 0
+            self._scan_cycle += 1
+        observation = self._observe_detect()
+        return ToolResult(
+            ok=True,
+            tool="scan_next",
+            args={},
+            reason=(
+                f"scan cursor {self._scan_last}/{len(self._scan_candidates)} "
+                f"(cycle {self._scan_cycle})"
+            ),
+            observation=observation,
+        )
+
+    def scan_at(self, landmark: str) -> ToolResult:
+        """Revisit one scene-stable landmark learned in this scene.
+
+        ``lN`` identifiers are functions of immutable scene furniture and therefore
+        retain their meaning across activity resets in the same scene. The chosen
+        camera pose depends only on that landmark's recorded geometry, not on the
+        current activity scope, goal, or detected task objects.
+        """
+        args = {"landmark": landmark}
+        if self.obs_mode not in self.MEMORY_SCAN_MODES:
+            return self._result(
+                False,
+                "scan_at",
+                args,
+                f"scan_at needs obs_mode={'|'.join(self.MEMORY_SCAN_MODES)}",
+            )
+        item = self._scene_landmarks.get(landmark)
+        if item is None:
+            return self._result(
+                False,
+                "scan_at",
+                args,
+                "unknown scene landmark; use an lN id observed in this scene",
+            )
+
+        index = int(landmark[1:]) - 1
+        angle = (index % 8) * math.pi / 4.0
+        radius = max(1.2, math.hypot(item.extent[0], item.extent[1]) + 0.6)
+        x = item.pos[0] + radius * math.cos(angle)
+        y = item.pos[1] + radius * math.sin(angle)
+        yaw = math.atan2(item.pos[1] - y, item.pos[0] - x)
+        pitch = math.atan2(item.pos[2] - 1.2, radius)
+        self.view.teleport(x, y, yaw)
+        self.view.pitch = max(-math.pi / 3.0, min(math.pi / 3.0, pitch))
+        self._view_epoch += 1
+        self._dets = []
+        self._det_epoch = (-1, -1)
+        self._view_landmark = landmark
+        observation = self._observe_detect()
+        return ToolResult(
+            ok=True,
+            tool="scan_at",
+            args=args,
+            reason=f"revisited {landmark} in {self._scene_id}",
+            observation=observation,
+        )
+
     # ------------------------------------------------------------------ #
     # manipulation
     # ------------------------------------------------------------------ #
     def grasp(self, name: str) -> ToolResult:
         args = {"name": name}
         if self._held is not None:
-            return self._result(False, "grasp", args,
-                                f"precondition failed: already holding "
-                                f"{self._disp(self._held)}")
+            held_description = (
+                _word(synset_of(self._held))
+                if self.obs_mode in self.DETECT_MODES
+                else self._disp(self._held)
+            )
+            return self._result(
+                False,
+                "grasp",
+                args,
+                f"precondition failed: already holding {held_description}",
+            )
         scope_name, rej = self._require("grasp", args, name)
         if rej is not None:
             return rej
         props = properties_of(scope_name)
-        # The geometric ACI would happily `set_position_orientation` a fixed-base
-        # table; refusing is stricter, not looser, so it cannot manufacture success.
-        if "sceneObject" in props:
-            return self._result(False, "grasp", args,
-                                f"precondition failed: {name} is fixed scene furniture")
+        # `sceneObject` is a BDDL taxonomy property, NOT a mobility flag: official
+        # templates use it for movable glasses and food processors too. Only the
+        # paired sampler template's instance-level fixed_base=True is authoritative.
+        if scope_name in self._fixed_base_scope:
+            return self._result(
+                False,
+                "grasp",
+                args,
+                f"precondition failed: {name} is fixed scene furniture",
+            )
         if "substance" in props:
-            return self._result(False, "grasp", args,
-                                f"precondition failed: {name} is a substance, not a "
-                                f"graspable object")
+            return self._result(
+                False,
+                "grasp",
+                args,
+                f"precondition failed: {name} is a substance, not a graspable object",
+            )
         self.world.clear_position(scope_name)
         self.world.sim.set_grasped((self.world.agent, scope_name), True)
         self._held = scope_name
+        if self._observation_state is not None:
+            self._observation_state.hide(scope_name)
+            self._commit_visual_mutation()
         return self._result(True, "grasp", args, f"holding {name}")
 
     def release(self, name: str | None = None) -> ToolResult:
         if self._held is None:
-            return self._result(False, "release", {},
-                                "precondition failed: not holding anything")
+            return self._result(
+                False, "release", {}, "precondition failed: not holding anything"
+            )
         held = self._held
         ground = self._ground()
+        release_root = self._release_root(held, ground)
+        if self._observation_state is not None and release_root is None:
+            return self._result(
+                False,
+                "release",
+                {},
+                "cannot derive post-release observation geometry",
+            )
         self.world.sim.set_grasped((self.world.agent, held), False)
         if ground is not None and ground != held:
             self.world.sim.set_ontop((held, ground), True)
         self._held = None
-        return self._result(True, "release", {"name": self._disp(held)},
-                            f"released {self._disp(held)} onto {self._disp(ground)}")
+        if self._observation_state is not None:
+            self._observation_state.show_at(held, release_root)
+            if ground is not None:
+                self._observation_state.record_placement(ground, "ontop")
+            self._commit_visual_mutation()
+        ref = "held" if self.obs_mode in self.DETECT_MODES else self._disp(held)
+        reason = (
+            "released held object"
+            if self.obs_mode in self.DETECT_MODES
+            else f"released {self._disp(held)} onto {self._disp(ground)}"
+        )
+        return self._result(True, "release", {"name": ref}, reason)
 
     def _place(self, tool, name, target, pred) -> ToolResult:
         args = {"name": name, "surface" if pred == "ontop" else "container": target}
-        movable = self._resolve(name)
+        movable = self._resolve(name, allow_held=True)
         if movable is None or movable != self._held:
-            return self._result(False, tool, args,
-                                f"precondition failed: not holding {name} "
-                                f"(held={self._disp(self._held)})")
+            held_description = (
+                _word(synset_of(self._held))
+                if self._held is not None and self.obs_mode in self.DETECT_MODES
+                else self._disp(self._held)
+            )
+            return self._result(
+                False,
+                tool,
+                args,
+                f"precondition failed: not holding {name} (held={held_description})",
+            )
         scope_target, rej = self._require(tool, args, target)
         if rej is not None:
             return rej
         if movable == scope_target:
-            return self._result(False, tool, args,
-                                f"cannot place {name} on/in itself")
+            return self._result(False, tool, args, f"cannot place {name} on/in itself")
         tprops = properties_of(scope_target)
         if "substance" in tprops:
-            return self._result(False, tool, args,
-                                f"precondition failed: {target} is a substance, "
-                                f"not a support")
+            return self._result(
+                False,
+                tool,
+                args,
+                f"precondition failed: {target} is a substance, not a support",
+            )
         # An openable container must be open. The geometric layer got this for free
         # (a closed fridge has no interior volume to sample into); symbolically it
         # has to be stated, and it is what forces open-then-place plans.
-        if pred == "inside" and "openable" in tprops and not self.world.sim.get_open(
-                (self.world.scope[scope_target],)):
-            return self._result(False, tool, args,
-                                f"precondition failed: {target} is closed; "
-                                f"open({target}) first")
+        if (
+            pred == "inside"
+            and "openable" in tprops
+            and not self.world.sim.get_open((self.world.scope[scope_target],))
+        ):
+            return self._result(
+                False,
+                tool,
+                args,
+                f"precondition failed: {target} is closed; open({target}) first",
+            )
+        placement_root = self._placement_root(movable, scope_target, pred)
+        if self._observation_state is not None and placement_root is None:
+            return self._result(
+                False,
+                tool,
+                args,
+                "cannot derive post-placement observation geometry",
+            )
         self.world.clear_position(movable)
         self.world.sim.set_grasped((self.world.agent, movable), False)
         self.world.sim.predicate_to_setters[pred]((movable, scope_target), True)
         if pred == "ontop":
             self.world.sim.set_nextto((movable, scope_target), True)
         self._held = None
+        if self._observation_state is not None:
+            self._observation_state.show_at(movable, placement_root)
+            self._observation_state.record_placement(scope_target, pred)
+            self._commit_visual_mutation()
         return self._result(True, tool, args, f"{pred}({name}, {target})=True")
 
     def place_on(self, name: str, surface: str) -> ToolResult:
@@ -1321,6 +2081,7 @@ class SymbolicACI:
         # only one leaves the other stale and a `not closed` goal atom reads wrong.
         self.world.sim.set_open((scope_name,), value)
         self.world.sim.set_closed((scope_name,), not value)
+        self._commit_visual_mutation()
         return self._result(True, tool, args, f"Open={value}")
 
     def open(self, name: str) -> ToolResult:
@@ -1345,11 +2106,53 @@ class SymbolicACI:
 
     def cook(self, name: str) -> ToolResult:
         args = {"name": name}
-        scope_name, rej = self._require("cook", args, name, "cookable", "cookable")
+        scope_name, rej = self._require("cook", args, name)
         if rej is not None:
             return rej
-        self.world.sim.set_cooked((scope_name,), True)
-        return self._result(True, "cook", args, "Cooked=True")
+        if "cookable" in properties_of(scope_name):
+            self.world.sim.set_cooked((scope_name,), True)
+            return self._result(True, "cook", args, "Cooked=True")
+
+        contained_sources = [
+            candidate
+            for candidate in self.world.scope_names
+            if self.world.is_real(candidate)
+            and "cookable" in properties_of(candidate)
+            and self.world.holds("contains", [scope_name, candidate])
+        ]
+        made = []
+        for source in contained_sources:
+            target_lemma = f"cooked__{lemma_of(source)}"
+            product = next(
+                (
+                    candidate
+                    for candidate in self.world.scope_names
+                    if not self.world.is_real(candidate)
+                    and lemma_of(candidate) == target_lemma
+                ),
+                None,
+            )
+            if product is None:
+                continue
+            self.world.sim.set_real((source,), False)
+            self.world.sim.set_real((product,), True)
+            self.world.sim.set_future((product,), False)
+            self.world.sim.set_contains((scope_name, product), True)
+            made.append(product)
+        if not made:
+            return self._result(
+                False,
+                "cook",
+                args,
+                f"precondition failed: {name} is not cookable and contains no "
+                "cookable transform source",
+            )
+        reason = (
+            f"materialized {len(made)} cooked product(s) in selected container"
+            if self.obs_mode in self.DETECT_MODES
+            else f"materialized {[self._disp(product) for product in made]}"
+        )
+        return self._result(True, "cook", args, reason)
 
     # ------------------------------------------------------------------ #
     # substances
@@ -1369,21 +2172,29 @@ class SymbolicACI:
         """
         scope_name = self._resolve(system_name)
         if scope_name is None:
-            matches = [n for n in self.world.scope_names
-                       if lemma_of(n) == system_name
-                       and "substance" in properties_of(n)]
+            matches = [
+                n
+                for n in self.world.scope_names
+                if lemma_of(n) == system_name and "substance" in properties_of(n)
+            ]
             if len(matches) > 1:
+                ambiguity = (
+                    f"{len(matches)} matching systems; category alone is ambiguous"
+                    if self.obs_mode in self.DETECT_MODES
+                    else f"{[self._disp(m) for m in matches]}; name one exactly"
+                )
                 return None, self._result(
-                    False, tool, args,
-                    f"ambiguous system {system_name!r}: "
-                    f"{[self._disp(m) for m in matches]}; name one exactly")
+                    False, tool, args, f"ambiguous system {system_name!r}: {ambiguity}"
+                )
             if not matches:
-                return None, self._result(False, tool, args,
-                                          f"no such system {system_name!r}")
+                return None, self._result(
+                    False, tool, args, f"no such system {system_name!r}"
+                )
             scope_name = matches[0]
         if "substance" not in properties_of(scope_name):
             return None, self._result(
-                False, tool, args, f"{system_name} is not a substance system")
+                False, tool, args, f"{system_name} is not a substance system"
+            )
         return scope_name, None
 
     def _set_covered(self, tool, name, system_name, value) -> ToolResult:
@@ -1400,8 +2211,7 @@ class SymbolicACI:
             # what flips `real(...)` goals on substance-producing activities.
             self.world.sim.set_real((system,), True)
             self.world.sim.set_future((system,), False)
-        return self._result(True, tool, args,
-                            f"Covered({name}, {system_name})={value}")
+        return self._result(True, tool, args, f"Covered({name}, {system_name})={value}")
 
     def spray(self, name: str, system_name: str) -> ToolResult:
         return self._set_covered("spray", name, system_name, True)
@@ -1428,28 +2238,41 @@ class SymbolicACI:
     # ------------------------------------------------------------------ #
     # product-creating transforms
     # ------------------------------------------------------------------ #
-    def _materialise(self, prefix: str, base_synset: str, support, limit: int) -> list:
-        """Turn up to @limit ``<prefix><base_synset>`` future entries real, seated on
-        @support. This is the symbolic stand-in for OmniGibson's SlicingRule /
-        DicingRule spawning objects that the BDDL scope then rebinds.
-
-        Matched on the LEMMA, not the full synset: BEHAVIOR does not preserve the
-        WordNet sense number across a transform, so ``bell_pepper.n.02`` dices into
-        ``diced__bell_pepper.n.01``. Requiring an exact synset match silently
-        produced nothing on every such activity.
-        """
+    def _candidate_products(
+        self, prefix: str, base_synset: str, limit: int
+    ) -> list[str]:
+        """Future product scope names, found without mutating BDDL state."""
         target_lemma = f"{prefix}{_word(base_synset)}"
-        made = []
+        candidates = []
         for name in self.world.scope_names:
-            if len(made) >= limit:
+            if len(candidates) >= limit:
                 break
             if _word(synset_of(name)) != target_lemma or self.world.is_real(name):
                 continue
+            candidates.append(name)
+        return candidates
+
+    def _materialise(
+        self,
+        products: list[str],
+        support,
+        relation: str,
+        roots: list,
+        shape_overrides: dict[str, tuple],
+    ) -> list[str]:
+        """Make prevalidated products real and publish their observation poses."""
+        made = []
+        for index, name in enumerate(products):
             self.world.sim.set_real((name,), True)
             self.world.sim.set_future((name,), False)
             if support is not None:
-                self.world.sim.set_ontop((name, support), True)
-            made.append(self._disp(name))
+                self.world.sim.predicate_to_setters[relation]((name, support), True)
+            if self._observation_state is not None:
+                self._observation_shape_overrides[name] = shape_overrides[name]
+                self._observation_state.show_at(name, roots[index])
+                if support is not None:
+                    self._observation_state.record_placement(support, relation)
+            made.append(name)
         return made
 
     def _consume(self, scope_name: str):
@@ -1461,7 +2284,48 @@ class SymbolicACI:
             self.world.sim.set_grasped((self.world.agent, scope_name), False)
             self._held = None
         self.world.sim.set_real((scope_name,), False)
+        if self._observation_state is not None:
+            self._observation_state.hide(scope_name)
         return support
+
+    @staticmethod
+    def _product_shapes(products: list[str], source_shape, transform: str) -> dict:
+        """Deterministic shapes derived from measured source geometry.
+
+        Future transform products have no sampler asset binding.  The approximation
+        is explicit: halves split the source's longest axis; diced matter occupies a
+        half-scale pile.  It is therefore transition geometry, never measured RGB or
+        simulator geometry.
+        """
+        offset, source_extent = source_shape
+        extent = list(source_extent)
+        if transform == "slice":
+            cut_axis = max(range(3), key=extent.__getitem__)
+            extent[cut_axis] = max(0.025, extent[cut_axis] / 2.0)
+        else:
+            extent = [max(0.025, value / 2.0) for value in extent]
+        return {product: ((0.0, 0.0, 0.0), tuple(extent)) for product in products}
+
+    def _product_roots(
+        self, products: list[str], support, source_root
+    ) -> Optional[list]:
+        if self._observation_state is None:
+            return [None] * len(products)
+        roots = []
+        for index, product in enumerate(products):
+            if source_root is not None:
+                centred_index = index - (len(products) - 1) / 2.0
+                root = (
+                    float(source_root[0]) + 0.08 * centred_index,
+                    float(source_root[1]),
+                    float(source_root[2]),
+                )
+            else:
+                root = None
+            if root is None:
+                return None
+            roots.append(root)
+        return roots
 
     def slice(self, name: str) -> ToolResult:
         args = {"name": name}
@@ -1469,12 +2333,63 @@ class SymbolicACI:
         if rej is not None:
             return rej
         base = synset_of(scope_name)
-        support = self._consume(scope_name)
+        products = self._candidate_products("half__", base, limit=2)
+        if not products:
+            return self._result(
+                False,
+                "slice",
+                args,
+                f"{name} has no half__ products in this activity's scope",
+            )
+        support_info = self.world.support_of(scope_name)
+        support = support_info[1] if support_info else self._ground()
+        relation = support_info[0] if support_info else "ontop"
+        source_shape = self._observation_shape(scope_name)
+        if self._observation_state is not None and source_shape is None:
+            return self._result(
+                False,
+                "slice",
+                args,
+                "cannot derive product shape from source observation geometry",
+            )
+        product_shapes = (
+            self._product_shapes(products, source_shape, "slice")
+            if source_shape is not None
+            else {}
+        )
+        source_root = (
+            self._observation_state.last_position(scope_name)
+            if self._observation_state is not None
+            else None
+        )
+        roots = self._product_roots(products, support, source_root)
+        if roots is None:
+            return self._result(
+                False,
+                "slice",
+                args,
+                "cannot derive product observation geometry",
+            )
+        self._consume(scope_name)
         # BEHAVIOR slices one object into exactly two annotated halves.
-        made = self._materialise("half__", base, support, limit=2)
-        return self._result(bool(made), "slice", args,
-                            f"sliced {name} into {made}" if made else
-                            f"{name} has no half__ products in this activity's scope")
+        made = self._materialise(
+            products,
+            support,
+            relation,
+            roots,
+            product_shapes,
+        )
+        self._commit_visual_mutation()
+        return self._result(
+            True,
+            "slice",
+            args,
+            (
+                f"sliced selected object into {len(made)} products"
+                if self.obs_mode in self.DETECT_MODES
+                else f"sliced {name} into {[self._disp(product) for product in made]}"
+            ),
+        )
 
     def dice(self, name: str) -> ToolResult:
         args = {"name": name}
@@ -1483,26 +2398,89 @@ class SymbolicACI:
             return self._result(False, "dice", args, f"no such object {name!r}")
         props = properties_of(scope_name)
         prop = "diceable" if "diceable" in props else "sliceable"
-        scope_name, rej = self._require("dice", args, name, prop,
-                                        "diceable or sliceable")
+        scope_name, rej = self._require(
+            "dice", args, name, prop, "diceable or sliceable"
+        )
         if rej is not None:
             return rej
         # `diced__X` is named after the WHOLE object even when a half is diced
         # (BEHAVIOR models chopping as slice-then-dice, and the geometric ACI runs
         # both stages), so strip the half__ prefix before looking up the product.
         base = synset_of(scope_name)
-        whole = base[len("half__"):] if base.startswith("half__") else base
-        support = self._consume(scope_name)
-        made = self._materialise("diced__", whole, support, limit=1)
-        return self._result(bool(made), "dice", args,
-                            f"diced {name} into {made}" if made else
-                            f"{name} has no diced__ product in this activity's scope")
+        whole = base[len("half__") :] if base.startswith("half__") else base
+        # Some activities declare only the post-cooking particle product
+        # (`cooked__diced__head_cabbage`) rather than an intermediate `diced__*`.
+        # `producer_of` already classifies both as dice outputs; execution must
+        # honour the same mapping.
+        products = self._candidate_products("cooked__diced__", whole, limit=1)
+        if not products:
+            products = self._candidate_products("diced__", whole, limit=1)
+        if not products:
+            return self._result(
+                False,
+                "dice",
+                args,
+                f"{name} has no diced__ product in this activity's scope",
+            )
+        support_info = self.world.support_of(scope_name)
+        support = support_info[1] if support_info else self._ground()
+        relation = support_info[0] if support_info else "ontop"
+        source_shape = self._observation_shape(scope_name)
+        if self._observation_state is not None and source_shape is None:
+            return self._result(
+                False,
+                "dice",
+                args,
+                "cannot derive product shape from source observation geometry",
+            )
+        product_shapes = (
+            self._product_shapes(products, source_shape, "dice")
+            if source_shape is not None
+            else {}
+        )
+        source_root = (
+            self._observation_state.last_position(scope_name)
+            if self._observation_state is not None
+            else None
+        )
+        roots = self._product_roots(products, support, source_root)
+        if roots is None:
+            return self._result(
+                False,
+                "dice",
+                args,
+                "cannot derive product observation geometry",
+            )
+        self._consume(scope_name)
+        made = self._materialise(
+            products,
+            support,
+            relation,
+            roots,
+            product_shapes,
+        )
+        self._commit_visual_mutation()
+        return self._result(
+            True,
+            "dice",
+            args,
+            (
+                "diced selected object into 1 product"
+                if self.obs_mode in self.DETECT_MODES
+                else f"diced {name} into {[self._disp(product) for product in made]}"
+            ),
+        )
 
     # ------------------------------------------------------------------ #
     def end_task(self) -> ToolResult:
         gs = self.world.goal_status()
-        return ToolResult(ok=self.world.is_success(), tool="end_task", args={},
-                          reason=f"goal_status={gs}", observation=self.observe())
+        return ToolResult(
+            ok=self.world.is_success(),
+            tool="end_task",
+            args={},
+            reason=f"goal_status={gs}",
+            observation=self.observe(),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1532,11 +2510,15 @@ def audit(activities=None) -> dict:
                 contaminated.append(act)
             else:
                 solvable.append(act)
-        except Exception as ex:                                    # noqa: BLE001
+        except Exception as ex:  # noqa: BLE001
             errors[act] = f"{type(ex).__name__}: {ex}"
-    return {"solvable": solvable, "blocked": blocked,
-            "contaminated": contaminated, "errors": errors,
-            "n_total": len(activities)}
+    return {
+        "solvable": solvable,
+        "blocked": blocked,
+        "contaminated": contaminated,
+        "errors": errors,
+        "n_total": len(activities),
+    }
 
 
 def _main() -> None:
@@ -1544,8 +2526,11 @@ def _main() -> None:
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("activity", nargs="?", help="print one activity's start state")
-    ap.add_argument("--audit", action="store_true",
-                    help="classify all 1016 activities; writes --out if given")
+    ap.add_argument(
+        "--audit",
+        action="store_true",
+        help="classify all 1016 activities; writes --out if given",
+    )
     ap.add_argument("--out", help="write the solvable activity list as JSON")
     args = ap.parse_args()
 

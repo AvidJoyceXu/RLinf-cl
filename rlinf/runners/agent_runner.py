@@ -88,6 +88,8 @@ class AgentRunner(ReasoningRunner):
         self.solid_rollouts = solid_rollouts
         self.generate_input_channel = Channel.create("GenerateInput")
         self.generate_output_channel = Channel.create("GenerateOutput")
+        # Validation rollouts must never leak into the actor-training channel.
+        self.eval_rollout_channel = Channel.create("EvalRollout")
         self.solid_generate_input_channels = {}
         for solid_rollout_name in self.solid_rollouts:
             self.solid_generate_input_channels[solid_rollout_name] = Channel.create(
@@ -162,6 +164,53 @@ class AgentRunner(ReasoningRunner):
                 onload_handles.append(solid_rollout.onload_engine())
             for handle in onload_handles:
                 handle.wait()
+
+    def _run_validation(self) -> dict[str, float]:
+        """Run held-out agent episodes without feeding them to actor training."""
+        if self.val_dataset is None or not hasattr(self, "val_dataloader"):
+            raise RuntimeError(
+                "validation was scheduled but no validation dataset is configured"
+            )
+
+        weighted_sums: dict[str, float] = {}
+        total_rows = 0
+        self._sync_weights()
+        try:
+            for batch in self.val_dataloader:
+                answers = batch["answer"]
+                batch_rows = len(answers)
+                self._put_batch(batch, self.batch_split_num)
+                handle: Handle = self.agent_loop.run_agentloop_rollout(
+                    input_channel=self.dataloader_channel,
+                    output_channel=self.eval_rollout_channel,
+                )
+                worker_metrics = handle.wait()
+                metrics = next((item for item in worker_metrics if item), {})
+
+                # One DynamicRolloutResult is emitted per dataset row. Drain the
+                # dedicated channel so validation cannot accumulate unconsumed
+                # trajectories across intervals.
+                for _ in range(batch_rows):
+                    self.eval_rollout_channel.get()
+
+                for key, value in metrics.items():
+                    weighted_sums[key] = (
+                        weighted_sums.get(key, 0.0) + float(value) * batch_rows
+                    )
+                total_rows += batch_rows
+        finally:
+            offload_handles = [self.rollout.offload_engine()]
+            offload_handles.extend(
+                rollout.offload_engine() for rollout in self.solid_rollouts.values()
+            )
+            for handle in offload_handles:
+                handle.wait()
+
+        if total_rows == 0:
+            raise RuntimeError("validation dataloader produced zero rows")
+        return {key: value / total_rows for key, value in weighted_sums.items()} | {
+            "num_rows": float(total_rows)
+        }
 
     def run(self):
         epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
@@ -246,7 +295,7 @@ class AgentRunner(ReasoningRunner):
                         self.global_steps += 1
 
                         run_time_exceeded = self.run_timer.is_finished()
-                        _, save_model, is_train_end = check_progress(
+                        run_val, save_model, is_train_end = check_progress(
                             self.global_steps,
                             self.max_steps,
                             self.cfg.runner.val_check_interval,
@@ -257,18 +306,6 @@ class AgentRunner(ReasoningRunner):
 
                         if save_model:
                             self._save_checkpoint()
-
-                        if is_train_end:
-                            logging.info(
-                                f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
-                            )
-                            return
-
-                        if run_time_exceeded:
-                            logging.info(
-                                f"Time limit given by run_timer={self.run_timer} reached. Stopping run"
-                            )
-                            return
 
                     time_metrics = self.timer.consume_durations()
                     time_metrics["training"] = actor_handle.consume_duration()
@@ -312,6 +349,33 @@ class AgentRunner(ReasoningRunner):
 
                     global_pbar.set_postfix(logging_metrics, refresh=False)
                     global_pbar.update(1)
+
+                    if run_val:
+                        eval_metrics = {
+                            f"eval/{key}": value
+                            for key, value in self._run_validation().items()
+                        }
+                        self.metric_logger.log(eval_metrics, logging_steps)
+                        logging.info(
+                            "Validation at global step %s: %s",
+                            self.global_steps,
+                            eval_metrics,
+                        )
+
+                    # Stop only after the final training metrics and scheduled
+                    # validation have been emitted. Previously this return sat
+                    # above metric_logger.log(), silently dropping the last step.
+                    if is_train_end:
+                        logging.info(
+                            f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
+                        )
+                        return
+
+                    if run_time_exceeded:
+                        logging.info(
+                            f"Time limit given by run_timer={self.run_timer} reached. Stopping run"
+                        )
+                        return
         finally:
             for tool_worker in self.tool_workers:
                 tool_worker.stop_server()

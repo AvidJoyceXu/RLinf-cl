@@ -1282,6 +1282,7 @@ def build_transformer_config(cfg) -> "TransformerConfig":
     as the megatron core TransformerConfig, we will use the value from the RLinf model config.
     For attributes in TransformerConfig that are not in the RLinf model config, we add custom logic.
     """
+    from megatron.core.transformer.enums import AttnBackend
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.utils import (
         init_method_normal,
@@ -1446,6 +1447,26 @@ def build_transformer_config(cfg) -> "TransformerConfig":
         "moe_token_dropping": cfg.get("moe_token_dropping", False),
         "enable_cuda_graph": cfg.get("enable_cuda_graph", False),
     }
+
+    # OmegaConf cannot materialize Enum values from YAML on its own.  Passing the
+    # raw string through happens to construct TransformerConfig, but Megatron's
+    # backend dispatcher then matches no AttnBackend branch and leaves TE in its
+    # implicit `auto` mode.  That is especially dangerous on Blackwell, where TE
+    # 2.5 prefers a cuDNN fused backward that has no valid engine on our pinned
+    # stack.  Normalize an explicit user choice while preserving the dataclass
+    # default when the key is absent.
+    if "attention_backend" in cfg:
+        attention_backend = cfg["attention_backend"]
+        if isinstance(attention_backend, str):
+            try:
+                attention_backend = AttnBackend[attention_backend.lower()]
+            except KeyError as exc:
+                choices = ", ".join(backend.name for backend in AttnBackend)
+                raise ValueError(
+                    f"unknown Megatron attention_backend {attention_backend!r}; "
+                    f"expected one of: {choices}"
+                ) from exc
+        config_mapping["attention_backend"] = attention_backend
 
     # populate the transformer config dict
     for field in dataclasses.fields(TransformerConfig):

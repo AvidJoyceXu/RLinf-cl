@@ -188,19 +188,18 @@ class ReasoningRunner:
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         logging.info(f"Size of train dataloader: {len(self.train_dataloader)}")
 
-        val_batch_size = (
-            self.cfg.data.val_rollout_batch_size
-        )  # Prefer config value if set
-        if val_batch_size is not None:
-            assert self.val_dataset is not None, (
-                "Validation dataset must be provided if val_rollout_batch_size is set!"
-            )
-            val_batch_size = len(self.val_dataset)
-
         if self.val_dataset is not None:
+            val_batch_size = self.cfg.data.val_rollout_batch_size
+            if val_batch_size is None:
+                val_batch_size = len(self.val_dataset)
+            if int(val_batch_size) <= 0:
+                raise ValueError(
+                    "data.val_rollout_batch_size must be positive or null, got "
+                    f"{val_batch_size!r}"
+                )
             self.val_dataloader = StatefulDataLoader(
                 dataset=self.val_dataset,
-                batch_size=val_batch_size,
+                batch_size=int(val_batch_size),
                 num_workers=num_workers,
                 shuffle=self.cfg.data.get("validation_shuffle", True),
                 drop_last=False,

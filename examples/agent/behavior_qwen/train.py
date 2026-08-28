@@ -16,6 +16,7 @@ training path. ``env_server.py`` remains a debugging surface only.
     python examples/agent/behavior_qwen/train.py \\
         --config-path config --config-name behavior_grpo_qwen25_7b_1gpu
 """
+
 import json
 
 import hydra
@@ -52,6 +53,19 @@ def main(cfg) -> None:
             f"renders the policy schema ({agent_obs_mode!r}) while the latter "
             f"constructs the environment ({tool_obs_mode!r})"
         )
+    agent_selection_mode = str(cfg.agentloop.get("selection_mode", "handle"))
+    tool_selection_mode = str(cfg.tools.behavior.get("selection_mode", "handle"))
+    if agent_selection_mode != tool_selection_mode:
+        raise ValueError(
+            "agentloop.selection_mode and tools.behavior.selection_mode must match: "
+            "the former renders the policy schema "
+            f"({agent_selection_mode!r}) while the latter configures selection "
+            f"resolution ({tool_selection_mode!r})"
+        )
+    if str(cfg.tools.behavior.get("backend", "omnigibson")) == "textworld":
+        from rlinf.envs.behavior.episode_contract import validate_detect_runtime
+
+        validate_detect_runtime(agent_obs_mode)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))
 
     cluster = Cluster(cluster_cfg=cfg.cluster)
@@ -100,7 +114,8 @@ def main(cfg) -> None:
     # Megatron keeps the MA actor (loss_scales over group/agent/turn); the FSDP
     # path has no MA analog yet, so it falls back to the plain factory worker.
     actor_worker_cls = (
-        MAMegatronActor if cfg.actor.training_backend == "megatron"
+        MAMegatronActor
+        if cfg.actor.training_backend == "megatron"
         else get_actor_worker(cfg)
     )
     actor_group = actor_worker_cls.create_group(cfg, component_placement).launch(
@@ -118,7 +133,10 @@ def main(cfg) -> None:
     tool_workers = {
         BehaviorToolWorker.create_group(cfg).launch(
             cluster, name="behavior", placement_strategy=NodePlacementStrategy([0])
-        ): ToolWorkerInfo(tool_names=tool_names(agent_obs_mode), has_session=True),
+        ): ToolWorkerInfo(
+            tool_names=tool_names(agent_obs_mode, agent_selection_mode),
+            has_session=True,
+        ),
     }
 
     runner = AgentRunner(

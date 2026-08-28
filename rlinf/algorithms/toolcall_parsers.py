@@ -138,6 +138,29 @@ class EQAQwenToolCallParser:
         self.tool_call_end_token: str = "</tool_call>"
         self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
+    @staticmethod
+    def _decode_calls(payload: str) -> list[dict]:
+        """Decode one or more JSON objects from a single tool-call block.
+
+        Base Qwen sometimes emits newline-separated calls inside one pair of
+        ``<tool_call>`` tags. They remain format violations at the agent-loop
+        layer, but recovering the first valid call gives the policy actionable
+        feedback instead of misclassifying the whole turn as no-tool output.
+        """
+        decoder = json.JSONDecoder()
+        calls: list[dict] = []
+        cursor = 0
+        while cursor < len(payload):
+            while cursor < len(payload) and payload[cursor].isspace():
+                cursor += 1
+            if cursor >= len(payload):
+                break
+            call, cursor = decoder.raw_decode(payload, cursor)
+            if not isinstance(call, dict):
+                raise TypeError("tool call must decode to an object")
+            calls.append(call)
+        return calls
+
     async def __call__(self, response_text: str) -> tuple[str, list[ToolRequest]]:
         if (
             self.tool_call_start_token not in response_text
@@ -148,12 +171,12 @@ class EQAQwenToolCallParser:
         function_calls: list[ToolRequest] = []
         for match in matches:
             try:
-                call = json.loads(match)
-                name = call["name"]
-                arguments = call.get("arguments", {})
-                if not isinstance(arguments, dict):
-                    arguments = {}
-                function_calls.append(ToolRequest(name=name, arguments=arguments))
+                for call in self._decode_calls(match):
+                    name = call["name"]
+                    arguments = call.get("arguments", {})
+                    if not isinstance(arguments, dict):
+                        arguments = {}
+                    function_calls.append(ToolRequest(name=name, arguments=arguments))
             except Exception as e:
                 logging.error(f"eqa-qwen: failed to decode tool call: {e}")
         content = self.tool_call_regex.sub("", response_text)

@@ -1,0 +1,18 @@
+defaults:
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+convertor:
+  ckpt_path: /path/to/actor/model_state_dict/full_weights.pt
+  save_path: /path/to/huggingface/export
+  merge_lora_weighs: false
+
+model:
+  model_type: qwen2.5
+  model_path: /data/hf_home/Qwen2.5-7B-Instruct
+  precision: bf16
+  is_lora: false

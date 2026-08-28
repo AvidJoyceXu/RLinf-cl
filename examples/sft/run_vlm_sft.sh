@@ -1,4 +1,6 @@
 #! /bin/bash
+set -o pipefail
+
 # clear
 export VLM_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$VLM_PATH"))
@@ -14,6 +16,7 @@ if [ -z "$1" ]; then
     CONFIG_NAME="qwen2_5_sft_vlm"
 else
     CONFIG_NAME=$1
+    shift
 fi
 
 # behavior_sft_qwen25_7b logs to tensorboard AND wandb. Without a key, `wandb.init`
@@ -28,6 +31,7 @@ echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')" #/$(date +'%Y%m%d-%H:%M:%S')" d
 MEGA_LOG_FILE="${LOG_DIR}/run_vlm_sft.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${VLM_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
-echo ${CMD} > ${MEGA_LOG_FILE}
-${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
+CMD=(python "${SRC_FILE}" --config-path "${VLM_PATH}/config/" --config-name "${CONFIG_NAME}" "runner.logger.log_path=${LOG_DIR}" "$@")
+printf '%q ' "${CMD[@]}" > "${MEGA_LOG_FILE}"
+printf '\n' >> "${MEGA_LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee -a "${MEGA_LOG_FILE}"

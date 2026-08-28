@@ -741,7 +741,12 @@ class EqaToolCallSftDataset(VLMBaseDataset):
         return self._eqa_tools
 
     def _process_raw_record(self, raw: dict[str, Any], idx: int) -> DatasetItem:
-        from spatialcode.sft_format import format_tool_call, truncate_keeping_final
+        from spatialcode.sft_format import (
+            assemble_flat_sequence,
+            format_tool_call,
+            include_toolcall_targets,
+            truncate_keeping_final,
+        )
 
         messages = raw["prompt_messages"]
         prompt_text = self.tokenizer.apply_chat_template(
@@ -753,7 +758,11 @@ class EqaToolCallSftDataset(VLMBaseDataset):
         # add_special_tokens=False mirrors EQAAgentLoopWorker.pre_process_query.
         prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
 
-        if self.eval_dataset:
+        include_targets = include_toolcall_targets(
+            self.eval_dataset,
+            self.cfg.data.get("toolcall_eval_mode", "generation"),
+        )
+        if not include_targets:
             # Held-out agentic accuracy is measured by the agent loop in
             # reasoning_eval mode (code-doc/0607 §6), not the SFT worker's
             # single-shot generation. Here we just expose the prompt so the
@@ -761,6 +770,7 @@ class EqaToolCallSftDataset(VLMBaseDataset):
             input_ids, label_mask = list(prompt_ids), [True] * len(prompt_ids)
         else:
             turns = []
+            trainable = []
             for step in raw["tool_steps"]:
                 call = format_tool_call(
                     step["name"], step.get("arguments") or {}, step.get("reasoning")
@@ -770,9 +780,25 @@ class EqaToolCallSftDataset(VLMBaseDataset):
                     step.get("result_text", ""), add_special_tokens=False
                 )
                 turns.append((call_ids, resp_ids))
-            input_ids, label_mask = truncate_keeping_final(
-                prompt_ids, turns, self.max_seq_length
-            )
+                trainable.append(bool(step.get("trainable", True)))
+            explicit_window = any("trainable" in step for step in raw["tool_steps"])
+            if explicit_window:
+                input_ids, label_mask = assemble_flat_sequence(
+                    prompt_ids, turns, trainable=trainable
+                )
+                if len(input_ids) > self.max_seq_length:
+                    raise ValueError(
+                        f"explicit SFT window {idx} has {len(input_ids)} tokens, "
+                        f"above max_length={self.max_seq_length}; refusing to truncate"
+                    )
+                if all(label_mask):
+                    raise ValueError(
+                        f"explicit SFT window {idx} has no trainable tokens"
+                    )
+            else:
+                input_ids, label_mask = truncate_keeping_final(
+                    prompt_ids, turns, self.max_seq_length
+                )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.long)
         attention_mask = torch.ones(len(input_ids), dtype=torch.long)
@@ -787,6 +813,11 @@ class EqaToolCallSftDataset(VLMBaseDataset):
             prompt_text=prompt_text,
             attention_mask=attention_mask,
             label_mask=label_mask_t,
-            meta={"scene_id": raw.get("scene_id"), "num_turns": raw.get("num_turns")},
+            meta={
+                "scene_id": raw.get("scene_id"),
+                "num_turns": raw.get("num_turns"),
+                "activity": raw.get("activity"),
+                "target_step": raw.get("target_step"),
+            },
             multi_modal_inputs={},
         )

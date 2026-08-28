@@ -166,7 +166,8 @@ def _scene_of_path(path: str) -> str:
 
 
 def _from_instance(activity: str, path: str, source: InstanceSource) -> Layout:
-    raw = json.load(open(path))
+    with open(path) as instance_file:
+        raw = json.load(instance_file)
     lay = Layout(
         activity=activity,
         source="sampled",
@@ -249,7 +250,8 @@ def _scene_room_centroids(scene_model: str) -> dict:
     )
     if not hits:
         return {}
-    d = json.load(open(hits[0]))
+    with open(hits[0]) as scene_file:
+        d = json.load(scene_file)
     reg = d.get("state", {}).get("registry", {}).get("object_registry", {})
     acc: dict = defaultdict(list)
     for name, info in d.get("objects_info", {}).get("init_info", {}).items():
