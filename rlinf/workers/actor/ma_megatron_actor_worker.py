@@ -63,6 +63,11 @@ from rlinf.workers.actor.megatron_actor_worker import (
 )
 
 
+def _shift_logprobs_right(logprobs: torch.Tensor) -> torch.Tensor:
+    """Align next-token log probabilities with their input-token positions."""
+    return torch.cat((torch.zeros_like(logprobs[:, :1]), logprobs[:, :-1]), dim=1)
+
+
 class MAMegatronActor(MegatronActor):
     """The class for running the actor training using Megatron."""
 
@@ -183,18 +188,13 @@ class MAMegatronActor(MegatronActor):
 
                 # in last stage need to get the log_probs from the output
                 if unwrap_model(model).post_process:
-                    output = output["log_probs"]
-                    output = output.clone()
-                    output[:, 1:] = output[:, :-1].clone()
-                    output[:, 0] = 0.0  # first token has no previous token
+                    output = _shift_logprobs_right(output["log_probs"])
 
                 return output, id_func
 
             def loss_func(output):
                 curr_logprobs_ori = output["log_probs"]
-                curr_logprobs = curr_logprobs_ori.clone()
-                curr_logprobs[:, 1:] = curr_logprobs_ori[:, :-1].clone()
-                curr_logprobs[:, 0] = 0.0  # first token has no previous token
+                curr_logprobs = _shift_logprobs_right(curr_logprobs_ori)
 
                 advantages = batch["advantages"]
                 advantages *= batch["loss_scales"]

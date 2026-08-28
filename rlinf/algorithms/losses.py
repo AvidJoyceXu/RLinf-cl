@@ -202,11 +202,10 @@ def compute_ppo_actor_loss(
         loss_mask is not None and loss_mask[0].sum() == 0.0
     ):
         return torch.tensor(0.0, device=logprobs.device), {
-            "actor/token_num": torch.tensor(0.0, device=logprobs.device),
             "actor/policy_loss": torch.tensor(0.0, device=logprobs.device),
-            "actor/policy_loss_mbs_mean": torch.tensor(0.0, device=logprobs.device),
             "actor/policy_loss_abs": torch.tensor(0.0, device=logprobs.device),
             "actor/ratio": torch.tensor(0.0, device=logprobs.device),
+            "actor/ratio_abs": torch.tensor(0.0, device=logprobs.device),
             "actor/clipped_ratio": torch.tensor(0.0, device=logprobs.device),
             "actor/dual_cliped_ratio": torch.tensor(0.0, device=logprobs.device),
             "actor/approx_kl": torch.tensor(0.0, device=logprobs.device),

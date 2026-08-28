@@ -1,0 +1,24 @@
+# Eight-GPU variant of the exact two-update TextWorld machinery gate.
+# Qwen2.5-7B has 28 attention heads, so eight physical GPUs use TP4 x DP2.
+# Experiment semantics live in the smoke parent; this file changes only placement.
+defaults:
+  - behavior_grpo_qwen25_7b_textworld_smoke
+  - _self_
+
+runner:
+  experiment_name: behavior-grpo-textworld-tp8-gate
+
+cluster:
+  component_placement:
+    actor,rollout,reward: 0-7
+
+rollout:
+  tensor_parallel_size: 4
+
+actor:
+  model:
+    tensor_model_parallel_size: 4
+
+inference:
+  model:
+    tensor_model_parallel_size: 4
