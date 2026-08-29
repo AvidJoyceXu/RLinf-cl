@@ -21,11 +21,15 @@ from spatialcode.sft_format import (
     compact_complete_turns,
     include_toolcall_targets,
 )
+from torch.utils.data import SequentialSampler, TensorDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.agents.behavior.behavior_agent_loop import _native_feedback_ids
 from rlinf.algorithms.advantages import compute_grpo_dynamic_advantages
 from rlinf.algorithms.toolcall_parsers import EQAQwenToolCallParser
 from rlinf.envs.behavior.textworld_api_rollout import load_episode_specs
+from rlinf.utils.distributed import _dynamic_ending_rates
+from rlinf.utils.runner_utils import check_progress
 
 
 def _load_pure_module(name: str, filename: str):
@@ -116,6 +120,10 @@ _api_eval_launcher_source = (
 _reasoning_runner_source = (
     Path(__file__).resolve().parents[2] / "rlinf/runners/reasoning_runner.py"
 ).read_text()
+_sglang_worker_source = (
+    Path(__file__).resolve().parents[2]
+    / "rlinf/workers/rollout/sglang/sglang_worker.py"
+).read_text()
 _megatron_worker_source = (
     Path(__file__).resolve().parents[2] / "rlinf/workers/megatron_worker.py"
 ).read_text()
@@ -189,6 +197,14 @@ class AgentRunnerClosureTest(unittest.TestCase):
         self.assertIn('"n_steps": generate_context["turn"]', source)
         self.assertIn('**generate_context["budget"]', source)
 
+    def test_hf_evaluator_uses_native_feedback_boundaries(self):
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "rlinf/envs/behavior/textworld_rollout.py"
+        ).read_text()
+        self.assertIn('_native_feedback_ids(tokenizer, "tool", response_text)', source)
+        self.assertIn('_native_feedback_ids(tokenizer, "user", NUDGE)', source)
+
     def test_final_step_metrics_and_validation_precede_stop(self):
         tree = ast.parse(_agent_runner_source)
         runner = next(
@@ -226,6 +242,86 @@ class AgentRunnerClosureTest(unittest.TestCase):
         self.assertEqual(len(validation_calls), 1)
         self.assertLess(max(node.lineno for node in metric_logs), final_stop.lineno)
         self.assertLess(validation_calls[0].lineno, final_stop.lineno)
+
+    def test_runner_allows_epoch_boundary_resume_reset_pass(self):
+        tree = ast.parse(_agent_runner_source)
+        epoch_ranges = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "range"
+            and any(
+                isinstance(arg, ast.BinOp)
+                and isinstance(arg.op, ast.Add)
+                and isinstance(arg.right, ast.Constant)
+                and arg.right.value == 1
+                for arg in node.args
+            )
+        ]
+        self.assertTrue(epoch_ranges)
+        self.assertIn("self.global_steps >= self.max_steps", _agent_runner_source)
+
+    def test_stateful_dataloader_boundary_resume_reaches_exact_step_limit(self):
+        dataset = TensorDataset(torch.arange(4))
+
+        def loader():
+            return StatefulDataLoader(
+                dataset,
+                batch_size=2,
+                drop_last=True,
+                sampler=SequentialSampler(dataset),
+            )
+
+        original = loader()
+        iterator = iter(original)
+        next(iterator)
+        next(iterator)
+        boundary_state = original.state_dict()
+
+        resumed = loader()
+        resumed.load_state_dict(boundary_state)
+        self.assertEqual(list(resumed), [])
+
+        global_steps = 2
+        max_steps = 10
+        max_epochs = 5
+        for _ in range(global_steps // len(resumed), max_epochs + 1):
+            for _batch in resumed:
+                global_steps += 1
+                if global_steps == max_steps:
+                    break
+            if global_steps == max_steps:
+                break
+        self.assertEqual(global_steps, max_steps)
+
+    def test_final_step_is_saved_and_declared_terminal(self):
+        self.assertEqual(
+            check_progress(
+                step=23,
+                max_steps=24,
+                val_check_interval=-1,
+                save_interval=24,
+                limit_val_batches=1.0,
+            ),
+            (False, False, False),
+        )
+        self.assertEqual(
+            check_progress(
+                step=24,
+                max_steps=24,
+                val_check_interval=-1,
+                save_interval=24,
+                limit_val_batches=1.0,
+            ),
+            (False, True, True),
+        )
+
+    def test_sglang_engine_seed_is_explicit(self):
+        self.assertIn(
+            'random_seed=int(self._cfg_rollout.get("seed", self._cfg.actor.seed))',
+            _sglang_worker_source,
+        )
 
     def test_validation_has_a_dedicated_drained_rollout_channel(self):
         tree = ast.parse(_agent_runner_source)
@@ -1031,11 +1127,26 @@ class BehaviorRewardTest(unittest.TestCase):
             self._turn("end_task", initial=0.0, final=0.5, ok=False, success=False)
         ]
         self.assertAlmostEqual(sum(compute_behavior_staged_rewards(proper)), 1.225)
-        self.assertAlmostEqual(sum(compute_behavior_staged_rewards(premature)), 0.13)
-        self.assertGreater(
-            sum(compute_behavior_staged_rewards(proper)),
-            sum(compute_behavior_staged_rewards(premature)),
+        fixed = {"premature_end_penalty": -0.5}
+        self.assertAlmostEqual(
+            sum(compute_behavior_staged_rewards(premature, **fixed)), -0.37
         )
+        self.assertGreater(
+            sum(compute_behavior_staged_rewards(proper, **fixed)),
+            sum(compute_behavior_staged_rewards(premature, **fixed)),
+        )
+
+    def test_fixed_reward_ranks_partial_progress_above_zero_progress_stop(self):
+        partial = [self._turn("observe", initial=0.0, final=0.5)]
+        premature = [
+            self._turn("end_task", initial=0.0, final=0.0, ok=False, success=False)
+        ]
+        shaping = {"premature_end_penalty": -0.5}
+        partial_reward = sum(compute_behavior_staged_rewards(partial, **shaping))
+        premature_reward = sum(compute_behavior_staged_rewards(premature, **shaping))
+        self.assertAlmostEqual(partial_reward, -0.35)
+        self.assertAlmostEqual(premature_reward, -0.52)
+        self.assertGreater(partial_reward, premature_reward)
 
     def test_format_and_refusal_penalties_are_separate(self):
         trace = [
@@ -1109,6 +1220,28 @@ class BehaviorRewardTest(unittest.TestCase):
             ]
             values = advantages[0, columns]
             self.assertTrue(torch.allclose(values, values[0].expand_as(values)))
+
+    def test_ragged_grpo_exact_values_and_zero_variance(self):
+        rewards = torch.tensor([1.0, 1.0, 3.0, 10.0, 10.0, 10.0, 10.0])[:, None]
+        idx_to_traj = [0, 0, 1, 2, 2, 3, 3]
+        loss_mask = torch.ones((3, len(idx_to_traj)), dtype=torch.bool)
+
+        advantages, _ = compute_grpo_dynamic_advantages(
+            rewards,
+            loss_mask,
+            group_size=2,
+            idx_to_traj=idx_to_traj,
+            advantage_mode="trajectory",
+        )
+
+        expected = torch.tensor([-(2**-0.5), -(2**-0.5), 2**-0.5, 0.0, 0.0, 0.0, 0.0])
+        torch.testing.assert_close(advantages[0], expected, atol=2e-6, rtol=0.0)
+        self.assertTrue((advantages[:, 3:] == 0).all())
+
+    def test_dynamic_end_metric_uses_trajectory_denominator(self):
+        ended_rate, terminal_turn_fraction = _dynamic_ending_rates(8, 80, 16)
+        self.assertEqual(ended_rate, 0.5)
+        self.assertEqual(terminal_turn_fraction, 0.1)
 
 
 class InstanceSourcePolicyTest(unittest.TestCase):

@@ -213,10 +213,12 @@ class AgentRunner(ReasoningRunner):
         }
 
     def run(self):
-        epoch_iter = range(self.epoch, self.cfg.runner.max_epochs)
-        if len(epoch_iter) <= 0:
-            # epoch done
+        if self.global_steps >= self.max_steps:
             return
+        # A StatefulDataLoader restored exactly at an epoch boundary yields one
+        # empty pass before resetting. Allow one additional outer pass and let the
+        # authoritative max_steps check stop at the exact requested update.
+        epoch_iter = range(self.epoch, self.cfg.runner.max_epochs + 1)
 
         global_pbar = tqdm(
             initial=self.global_steps,

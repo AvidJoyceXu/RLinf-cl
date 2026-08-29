@@ -142,9 +142,6 @@ class Scheduler(_Scheduler):
         assert self.weight_reload == "sync", (
             "only sglang with 'sync' can run 'sync_hf_weight'"
         )
-        use_cudagraph = not self.cfg.rollout.enforce_eager
-        assert use_cudagraph, "use_cudagraph must be True now."
-
         state_dict = self._rlinf_worker.recv(
             src_group_name=self._actor_group_name,
             src_rank=self.actor_weight_rank,

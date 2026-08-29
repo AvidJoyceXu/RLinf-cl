@@ -1,0 +1,16 @@
+# Corrected-infrastructure control for the 2026-08-29 reward ablation.
+defaults:
+  - behavior_grpo_qwen25_7b_textworld_8gpu
+  - _self_
+
+runner:
+  experiment_name: behavior-grpo-textworld-control-v2-20260829
+  max_epochs: 1
+  max_steps: 24
+  val_check_interval: -1
+  save_interval: 24
+
+reward:
+  shaping:
+    # Preserve the archived unsuccessful-end semantics for the control arm.
+    premature_end_penalty: null

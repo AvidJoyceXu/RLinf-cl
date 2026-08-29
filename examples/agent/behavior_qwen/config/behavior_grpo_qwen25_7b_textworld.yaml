@@ -64,7 +64,7 @@ runner:
 
   max_epochs: 1
   max_steps: -1
-  # Validation is the POINT here, not an afterthought: val_s2 is 13 held-out
+  # Validation is the POINT here, not an afterthought: val_s2 is 12 held-out
   # activities and an eval pass costs no simulator time.
   val_check_interval: 10
   save_interval: 10
@@ -223,6 +223,11 @@ reward:
   shaping:
     success_reward: 1.0
     no_end_penalty: -0.5
+    # Archived v1 gave an unsuccessful end_task terminal=0, so abandoning the
+    # task (-0.02 after refusal) beat every budget-exhausted partial trajectory
+    # (at most -0.20). Put both unsuccessful endpoints on the same failure floor;
+    # net coverage then makes valid partial progress rank above zero-progress stop.
+    premature_end_penalty: -0.5
     coverage_weight: 0.3
     format_penalty: -0.05
     refusal_penalty: -0.02
@@ -230,6 +235,9 @@ reward:
 
 rollout:
   group_name: "RolloutGroup"
+  # SGLang otherwise chooses an unrecorded random engine seed at startup. Rank
+  # offset avoids identical streams across the two rollout-DP engines.
+  seed: 1234
   # 0.35, not 0.5. This is a fraction of TOTAL GPU memory, not free memory, so 0.5
   # reserves ~72 GB of the H20's 143 GB and leaves ~42 GB -- against a Megatron actor
   # that needs ~43 GB (28.37 GB DDP grad buffer for 7.6B params + ~15 GB bf16

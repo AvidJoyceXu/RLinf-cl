@@ -46,6 +46,44 @@ export PYTHONPATH=${REPO_PATH}:${MEGATRON_PATH}:${REPO_PATH}/examples:${SPATIALC
 CONFIG_NAME=${1:-behavior_grpo_qwen25_7b}
 shift $(( $# > 0 ? 1 : 0 ))
 
+# The frozen TextWorld detect manifests are v3.9.1 contracts, not merely lists of
+# activity names. Without these roots SymbolicWorld silently falls back to the
+# installed legacy BDDL and can no longer match some 2026 geometry scopes. Fail
+# before Ray/model startup instead of crashing halfway through the first batch.
+require_behavior_path() {
+    local variable_name=$1
+    local expected_kind=$2
+    local value=${!variable_name:-}
+    if [ -z "$value" ]; then
+        echo "ERROR: $variable_name is required for TextWorld training" >&2
+        exit 2
+    fi
+    if [ "$expected_kind" = directory ] && [ ! -d "$value" ]; then
+        echo "ERROR: $variable_name is not a directory: $value" >&2
+        exit 2
+    fi
+    if [ "$expected_kind" = file ] && [ ! -f "$value" ]; then
+        echo "ERROR: $variable_name is not a file: $value" >&2
+        exit 2
+    fi
+}
+
+require_behavior_value() {
+    local variable_name=$1
+    local value=${!variable_name:-}
+    if [ -z "$value" ]; then
+        echo "ERROR: $variable_name is required for TextWorld training" >&2
+        exit 2
+    fi
+}
+
+if [[ "$CONFIG_NAME" == *textworld* ]]; then
+    require_behavior_value BEHAVIOR_INSTANCE_SOURCES
+    require_behavior_path BEHAVIOR_BDDL_DEFINITION_ROOT directory
+    require_behavior_path BEHAVIOR_NATIVE_BBOX_PATH file
+    require_behavior_path BEHAVIOR_ASSET_SCENE_ROOT directory
+fi
+
 # No env-server pool to start any more: the tool worker holds OmniGibson in process,
 # so there is no servers.yaml to check for. The first rollout pays the Kit boot
 # (~3-4 min with cameras off) inside the worker instead.

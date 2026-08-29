@@ -163,6 +163,8 @@ class SGLangWorker(Worker):
 
         server_args = ServerArgs(
             model_path=self._cfg_rollout.model.model_path,
+            random_seed=int(self._cfg_rollout.get("seed", self._cfg.actor.seed))
+            + self._rank,
             disable_cuda_graph=not use_cudagraph,
             cuda_graph_max_bs=min(
                 self._cfg_rollout.cuda_graph_max_bs,
@@ -170,7 +172,10 @@ class SGLangWorker(Worker):
             ),
             tp_size=self._cfg_rollout.tensor_parallel_size,
             mem_fraction_static=self._cfg_rollout.gpu_memory_utilization,
-            enable_memory_saver=use_cudagraph,
+            # Collocated actor/rollout needs tagged weight/KV offload even when
+            # CUDA graphs are disabled.  Keep the existing graph-mode behavior,
+            # while allowing the Blackwell eager weight-reload path.
+            enable_memory_saver=use_cudagraph or self._placement.is_collocated,
             enable_torch_compile=self._cfg_rollout.sglang.use_torch_compile,
             torch_compile_max_bs=min(
                 self._cfg_rollout.sglang.torch_compile_max_bs,

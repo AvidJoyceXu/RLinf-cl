@@ -1,0 +1,23 @@
+# Blackwell-eager control for the 2026-08-29 reward ablation.
+defaults:
+  - behavior_grpo_qwen25_7b_textworld_8gpu
+  - _self_
+
+runner:
+  experiment_name: behavior-grpo-textworld-control-v3-eager-20260829
+  max_epochs: 1
+  max_steps: 24
+  val_check_interval: -1
+  # Attempt v2 faulted during the sync before step 6. Preserve the latest
+  # completed update if the runtime fails at the same boundary again.
+  save_interval: 5
+
+rollout:
+  # SGLang CUDA-graph weight reload is not stable on this sm_120 runtime.
+  # Eager mode retains collocated torch-memory-saver offload and bucket sync.
+  enforce_eager: True
+
+reward:
+  shaping:
+    # Preserve the archived unsuccessful-end semantics for the control arm.
+    premature_end_penalty: null

@@ -21,11 +21,9 @@ turn carries a ``meta`` dict shaped by BehaviorToolWorker:
 Two shaping modes (config ``reward.type``):
 
 * ``terminal`` — one scalar: +success_reward if the episode ended by calling
-  ``end_task`` on a satisfied goal; a small negative if it never called
-  ``end_task`` (budget-exhausted); 0 for a wrong/incomplete end. Mirrors the EQA
-  terminal reward, and has the same failure mode under sampling (a cautious
-  policy that rarely satisfies the full goal floors every group sample -> zero
-  advantage variance), which is exactly what ``staged`` fixes.
+  ``end_task`` on a satisfied goal; a negative failure floor if it never called
+  ``end_task``. ``premature_end_penalty`` opts wrong/incomplete ``end_task`` into
+  that same floor; ``None`` retains the historical 0 used by archived runs.
 
 * ``staged`` — dominant terminal plus net grounded-atom progress, with small
   penalties for policy-format errors and refused well-formed calls. Initial-state
@@ -74,24 +72,28 @@ def compute_score(
     tool_trace: list[dict],
     success_reward: float = 1.0,
     no_end_penalty: float = -0.5,
+    premature_end_penalty: float | None = None,
 ) -> float:
     """Terminal BDDL reward.
 
     +success_reward  : ended via end_task AND the goal is satisfied.
-     0.0             : ended via end_task but goal NOT satisfied (wrong stop).
+     premature_end_penalty or 0.0: ended via end_task but goal NOT satisfied.
      no_end_penalty  : never called end_task (ran out of turn budget).
     """
     meta = _final_meta(tool_trace)
     ended = _ended_with_end_task(tool_trace)
     if not ended:
         return float(no_end_penalty)
-    return float(success_reward) if bool(meta.get("is_success")) else 0.0
+    if bool(meta.get("is_success")):
+        return float(success_reward)
+    return float(premature_end_penalty or 0.0)
 
 
 def compute_staged_rewards(
     tool_trace: list[dict],
     success_reward: float = 1.0,
     no_end_penalty: float = -0.5,
+    premature_end_penalty: float | None = None,
     coverage_weight: float = 0.3,
     format_penalty: float = -0.05,
     refusal_penalty: float = -0.02,
@@ -105,7 +107,29 @@ def compute_staged_rewards(
     later config flip, not a rewrite.
     """
     rewards = [0.0 for _ in (tool_trace or [])] or [0.0]
+    breakdown = reward_breakdown(
+        tool_trace,
+        success_reward=success_reward,
+        no_end_penalty=no_end_penalty,
+        premature_end_penalty=premature_end_penalty,
+        coverage_weight=coverage_weight,
+        format_penalty=format_penalty,
+        refusal_penalty=refusal_penalty,
+    )
+    rewards[-1] = breakdown["total"]
+    return rewards
 
+
+def reward_breakdown(
+    tool_trace: list[dict],
+    success_reward: float = 1.0,
+    no_end_penalty: float = -0.5,
+    premature_end_penalty: float | None = None,
+    coverage_weight: float = 0.3,
+    format_penalty: float = -0.05,
+    refusal_penalty: float = -0.02,
+) -> dict[str, float | int]:
+    """Return the exact scalar components used by staged reward."""
     meta = _final_meta(tool_trace)
     initial_coverage = float(meta.get("initial_atom_coverage", 0.0) or 0.0)
     if "atom_coverage" in meta:
@@ -115,16 +139,28 @@ def compute_staged_rewards(
         num_satisfied = int(meta.get("num_satisfied", 0) or 0)
         final_coverage = (num_satisfied / num_goal) if num_goal > 0 else 0.0
     format_errors, refused_calls = _policy_error_counts(tool_trace)
-
-    rewards[-1] += float(coverage_weight) * (final_coverage - initial_coverage)
-    rewards[-1] += float(format_penalty) * format_errors
-    rewards[-1] += float(refusal_penalty) * refused_calls
-
-    # Terminal (dominant), on the last turn.
-    rewards[-1] += compute_score(
-        tool_trace, success_reward=success_reward, no_end_penalty=no_end_penalty
+    terminal = compute_score(
+        tool_trace,
+        success_reward=success_reward,
+        no_end_penalty=no_end_penalty,
+        premature_end_penalty=premature_end_penalty,
     )
-    return rewards
+    coverage_delta = final_coverage - initial_coverage
+    coverage_reward = float(coverage_weight) * coverage_delta
+    format_reward = float(format_penalty) * format_errors
+    refusal_reward = float(refusal_penalty) * refused_calls
+    return {
+        "initial_coverage": initial_coverage,
+        "final_coverage": final_coverage,
+        "coverage_delta": coverage_delta,
+        "terminal": terminal,
+        "coverage_reward": coverage_reward,
+        "format_errors": format_errors,
+        "format_reward": format_reward,
+        "refused_calls": refused_calls,
+        "refusal_reward": refusal_reward,
+        "total": terminal + coverage_reward + format_reward + refusal_reward,
+    }
 
 
 def episode_is_success(tool_trace: list[dict]) -> bool:
@@ -138,6 +174,7 @@ def episode_properly_ended(tool_trace: list[dict]) -> bool:
 __all__ = [
     "compute_score",
     "compute_staged_rewards",
+    "reward_breakdown",
     "episode_is_success",
     "episode_properly_ended",
 ]

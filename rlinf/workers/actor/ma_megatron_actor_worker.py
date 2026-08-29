@@ -68,6 +68,15 @@ def _shift_logprobs_right(logprobs: torch.Tensor) -> torch.Tensor:
     return torch.cat((torch.zeros_like(logprobs[:, :1]), logprobs[:, :-1]), dim=1)
 
 
+def _dynamic_group_balance_factor(
+    *, local_training_sequences: int, balanced_training_sequences: int
+) -> float:
+    """Correct a local group factor after DP sequence-count balancing."""
+    if min(local_training_sequences, balanced_training_sequences) <= 0:
+        raise ValueError("dynamic training sequence counts must be positive")
+    return balanced_training_sequences / local_training_sequences
+
+
 class MAMegatronActor(MegatronActor):
     """The class for running the actor training using Megatron."""
 
@@ -426,6 +435,16 @@ class MAMegatronActor(MegatronActor):
             batch = loss_scale_fn(scale_context, batch)
         if self.pack_traj:
             batch = DynamicRolloutResult.pack_traj_batch(scale_context, batch)
+
+        uses_group_scale = "group_level" in scale_context["folding_scale"]
+        local_training_sequences = batch["input_ids"].shape[0]
+        if uses_group_scale:
+            if local_training_sequences <= 0:
+                raise ValueError("group-scaled dynamic actor batch cannot be empty")
+            # The packer has converted the pre-pack group factor to one based on
+            # this rank's packed count. Remove that local denominator before
+            # sequences from different DP ranks are redistributed.
+            batch["loss_scales"].div_(local_training_sequences)
         for key in list(batch.keys()):
             if key == "idx_to_traj" or key.startswith("extra:"):
                 batch.pop(key, None)
@@ -442,6 +461,18 @@ class MAMegatronActor(MegatronActor):
             )
             batch = self._dp_load_balance_dynamic(
                 batch, batch_pad, self.cfg.actor.micro_batch_size
+            )
+
+        if uses_group_scale:
+            # Megatron now averages the same (possibly zero-padded) sequence
+            # count on every rank. Apply that common count after redistribution;
+            # together with the division above this is P_balanced / P_local.
+            batch["loss_scales"].mul_(
+                _dynamic_group_balance_factor(
+                    local_training_sequences=local_training_sequences,
+                    balanced_training_sequences=batch["input_ids"].shape[0],
+                )
+                * local_training_sequences
             )
 
         global_batches = get_iterator_k_split(

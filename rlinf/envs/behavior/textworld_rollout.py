@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import glob
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ from spatialcode.sft_format import (
     format_tool_response,
 )
 
+from rlinf.agents.behavior.behavior_agent_loop import _native_feedback_ids
 from rlinf.envs.behavior import sft_build as sb
 from rlinf.envs.behavior.episode_contract import (
     MAX_NUDGES,
@@ -48,6 +50,19 @@ def _sha256(path: str) -> str:
     return digest.hexdigest()
 
 
+def _sha256_files(paths: list[str]) -> str:
+    """Hash file names and contents into one model identity."""
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        name = os.path.basename(path).encode()
+        digest.update(len(name).to_bytes(8, "big"))
+        digest.update(name)
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _run_provenance(args) -> dict:
     activities_path = (
         os.path.abspath(args.activities[1:])
@@ -57,18 +72,21 @@ def _run_provenance(args) -> dict:
     model_path = os.path.abspath(args.model)
     model_manifest = os.path.join(model_path, "EXPORT_MANIFEST.sha256")
     model_config = os.path.join(model_path, "config.json")
-    identity_path = (
-        model_manifest
-        if os.path.isfile(model_manifest)
-        else model_config
-        if os.path.isfile(model_config)
-        else None
-    )
+    if os.path.isfile(model_manifest):
+        identity_paths = [model_manifest]
+    else:
+        identity_paths = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+        if os.path.isfile(model_config):
+            identity_paths.append(model_config)
+    identity_path = model_manifest if os.path.isfile(model_manifest) else None
     return {
         "adapter": "standalone_hf",
         "model_id": args.model,
         "model_identity_file": identity_path,
-        "model_identity_sha256": _sha256(identity_path) if identity_path else None,
+        "model_identity_files": identity_paths,
+        "model_identity_sha256": (
+            _sha256_files(identity_paths) if identity_paths else None
+        ),
         "activities_path": activities_path,
         "activities_sha256": _sha256(activities_path) if activities_path else None,
         "replicate_id": str(args.replicate_id),
@@ -78,6 +96,7 @@ def _run_provenance(args) -> dict:
         "harness_file_sha256": _sha256(__file__),
         "prompt_mode": "guided",
         "reason_mode": "terse",
+        "context_format": "native",
         "decoding": {
             "temperature": args.temperature,
             "top_p": args.top_p,
@@ -108,7 +127,7 @@ def _tool_call_stopping_criteria(tokenizer):
     return StoppingCriteriaList([StopOnToolCallClose()])
 
 
-def _generate(model, tokenizer, prompt_ids: list[int], args) -> tuple[str, int]:
+def _generate(model, tokenizer, prompt_ids: list[int], args) -> tuple[str, list[int]]:
     import torch
 
     ids = torch.tensor([prompt_ids], dtype=torch.long, device=model.device)
@@ -129,10 +148,10 @@ def _generate(model, tokenizer, prompt_ids: list[int], args) -> tuple[str, int]:
         kwargs["top_k"] = 50
     with torch.no_grad():
         output = model.generate(ids, attention_mask=attention_mask, **kwargs)
-    generated_ids = output[0, ids.shape[1] :]
+    generated_ids = output[0, ids.shape[1] :].tolist()
     return (
         tokenizer.decode(generated_ids, skip_special_tokens=True),
-        int(generated_ids.numel()),
+        generated_ids,
     )
 
 
@@ -151,6 +170,7 @@ def run_episode(model, tokenizer, spec: dict, args, budget, provenance=None) -> 
         source,
         spec.get("geometry_instance_key"),
     )
+    initial_outcome = outcome_from_goal_status(env.world.goal_status(), False)
     aci = env.aci
     messages = sb.build_prompt_messages(
         activity,
@@ -192,8 +212,8 @@ def run_episode(model, tokenizer, spec: dict, args, budget, provenance=None) -> 
         context_compactions += int(first_kept > 0)
         model_turns += 1
         prompt_tokens += len(context_ids)
-        generated, generated_tokens = _generate(model, tokenizer, context_ids, args)
-        completion_tokens += generated_tokens
+        generated, generated_ids = _generate(model, tokenizer, context_ids, args)
+        completion_tokens += len(generated_ids)
         match = TOOL_CALL_RE.search(generated)
         if not match:
             consecutive_nudges += 1
@@ -203,14 +223,16 @@ def run_episode(model, tokenizer, spec: dict, args, budget, provenance=None) -> 
                 break
             encoded_turns.append(
                 (
-                    tokenizer.encode(generated, add_special_tokens=False),
-                    tokenizer.encode(NUDGE, add_special_tokens=False),
+                    generated_ids,
+                    _native_feedback_ids(tokenizer, "user", NUDGE),
                 )
             )
             continue
 
         consecutive_nudges = 0
         model_out = generated[: match.end()]
+        if match.end() != len(generated):
+            raise RuntimeError("generation continued after the first tool call")
         try:
             call = json.loads(match.group(1))
             name = call["name"]
@@ -232,8 +254,8 @@ def run_episode(model, tokenizer, spec: dict, args, budget, provenance=None) -> 
         response_text = format_tool_response(payload)
         encoded_turns.append(
             (
-                tokenizer.encode(model_out, add_special_tokens=False),
-                tokenizer.encode(response_text, add_special_tokens=False),
+                generated_ids,
+                _native_feedback_ids(tokenizer, "tool", response_text),
             )
         )
         steps.append(
@@ -269,6 +291,7 @@ def run_episode(model, tokenizer, spec: dict, args, budget, provenance=None) -> 
         "ended": ended,
         "stop_reason": stop_reason,
         "error": error,
+        "initial_coverage": float(initial_outcome["coverage"]),
         **outcome,
         "tools": [step["name"] for step in steps],
         "tool_trace": steps,
@@ -301,6 +324,7 @@ def failure_record(spec: dict, args, budget, error: Exception, provenance=None) 
         "ended": False,
         "stop_reason": f"harness_error:{type(error).__name__}",
         "error": str(error)[:400],
+        "initial_coverage": 0.0,
         "num_satisfied": 0,
         "num_goal": 0,
         "coverage": 0.0,
@@ -463,6 +487,12 @@ def main() -> None:
 
     records = store.records(require_complete=True)
     denominator = max(len(records), 1)
+    premature_ends = [bool(r["ended"] and not r["success"]) for r in records]
+    zero_progress_premature_ends = [
+        premature
+        and float(r["coverage"]) <= float(r.get("initial_coverage", 0.0)) + 1e-12
+        for r, premature in zip(records, premature_ends)
+    ]
     summary = {
         **provenance,
         "base_seed": args.seed,
@@ -471,7 +501,16 @@ def main() -> None:
         / denominator,
         "goal_satisfied_rate": sum(r["success"] for r in records) / denominator,
         "goal_coverage": sum(r["coverage"] for r in records) / denominator,
+        "initial_goal_coverage": sum(r.get("initial_coverage", 0.0) for r in records)
+        / denominator,
+        "goal_coverage_delta": sum(
+            r["coverage"] - r.get("initial_coverage", 0.0) for r in records
+        )
+        / denominator,
         "end_task_rate": sum(r["ended"] for r in records) / denominator,
+        "premature_end_rate": sum(premature_ends) / denominator,
+        "zero_progress_premature_end_rate": sum(zero_progress_premature_ends)
+        / denominator,
         "mean_action_turns": sum(r["n_steps"] for r in records) / denominator,
         "mean_model_turns": sum(r["model_turns"] for r in records) / denominator,
         "tool_call_rate": sum(r["n_steps"] for r in records)

@@ -1,0 +1,18 @@
+# Blackwell-eager single-factor premature-end treatment.
+defaults:
+  - behavior_grpo_qwen25_7b_textworld_8gpu
+  - _self_
+
+runner:
+  experiment_name: behavior-grpo-textworld-treatment-v3-eager-20260829
+  max_epochs: 1
+  max_steps: 24
+  val_check_interval: -1
+  save_interval: 5
+
+rollout:
+  enforce_eager: True
+
+reward:
+  shaping:
+    premature_end_penalty: -0.5

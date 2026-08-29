@@ -31,6 +31,15 @@ from rlinf.scheduler import Worker
 from rlinf.utils.timers import NamedTimer
 
 
+def _dynamic_ending_rates(
+    sum_end: float, num_sequences: float, num_trajectories: float
+) -> tuple[float, float]:
+    """Return trajectory-ending and terminal-turn fractions respectively."""
+    if num_sequences <= 0 or num_trajectories <= 0:
+        raise ValueError("dynamic rollout denominators must be positive")
+    return sum_end / num_trajectories, sum_end / num_sequences
+
+
 def compute_rollout_metrics_dynamic(
     rollout_batch: dict[str, torch.Tensor],
     max_prompt_len: int,
@@ -164,6 +173,9 @@ def compute_rollout_metrics_dynamic(
     )
 
     # Build final metrics dict
+    properly_ended_rate, terminal_turn_fraction = _dynamic_ending_rates(
+        sum_end, num_seq, num_trajectories
+    )
     rollout_metrics = {
         "total_num_sequence": num_seq,
         "prompt_length": sum_plen / num_seq,
@@ -175,7 +187,8 @@ def compute_rollout_metrics_dynamic(
         "reward_scores_traj": sum_traj_rewards / num_trajectories,
         "reward_scores_turn": sum_turn_rewards / num_seq,
         "avg_turns_per_traj": num_seq / num_trajectories,
-        "fraction_of_samples_properly_ended": sum_end / num_seq,
+        "fraction_of_samples_properly_ended": properly_ended_rate,
+        "fraction_of_turns_marked_end": terminal_turn_fraction,
         "advantages_mean": sum_adv / n_valid_token,
         "advantages_max": adv_max,
         "advantages_min": -adv_min,
